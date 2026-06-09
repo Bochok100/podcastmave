@@ -89,16 +89,22 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    enhanced_path = mp3_path.with_stem(mp3_path.stem + "_studio")
+    # Имя файла всегда с .mp3 — Whisper определяет формат по расширению
+    enhanced_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(
             "https://auphonic.com/api/simple/productions.json",
             auth=(AUPHONIC_USER, AUPHONIC_PASS),
-            data={"action": "start", "output_basename": enhanced_path.stem},
+            data={
+                "action": "start",
+                "output_basename": mp3_path.stem + "_studio",
+                "output_formats": '[{"format": "mp3", "bitrate": "128"}]',
+            },
             files={"input_file": open(mp3_path, "rb")},
         )
         resp.raise_for_status()
         uuid = resp.json()["data"]["uuid"]
+
         for _ in range(60):
             await asyncio.sleep(5)
             s = await client.get(
@@ -107,22 +113,37 @@ async def enhance_audio(mp3_path: Path) -> Path:
             )
             status = s.json()["data"]["status_string"]
             if status == "Done":
-                url = s.json()["data"]["output_files"][0]["download_url"]
+                output_files = s.json()["data"]["output_files"]
+                if not output_files:
+                    # Auphonic не вернул файл — возвращаем исходный
+                    print("Auphonic: нет output_files, используем исходный MP3")
+                    return mp3_path
+                url = output_files[0]["download_url"]
                 r = await client.get(url, auth=(AUPHONIC_USER, AUPHONIC_PASS))
                 enhanced_path.write_bytes(r.content)
+                # Проверяем что файл реально скачался
+                if enhanced_path.stat().st_size < 1000:
+                    print("Auphonic: файл слишком маленький, используем исходный")
+                    return mp3_path
                 return enhanced_path
             if status in ("Error", "Failed"):
-                raise RuntimeError(f"Auphonic: {status}")
+                print(f"Auphonic статус: {status}, используем исходный MP3")
+                return mp3_path  # не падаем — просто используем исходный
+
+    print("Auphonic: таймаут, используем исходный MP3")
     return mp3_path
 
 def transcribe(mp3_path: Path) -> str:
-    # Whisper требует имя файла с правильным расширением
     client = openai.OpenAI(api_key=OPENAI_KEY)
-    with open(mp3_path, "rb") as f:
-        # Передаём кортеж (имя, данные, тип) — Whisper определяет формат по имени
+    # Копируем файл с явным именем .mp3 — Whisper определяет формат строго по имени файла
+    safe_path = mp3_path.parent / (mp3_path.stem + ".mp3")
+    if safe_path != mp3_path:
+        import shutil
+        shutil.copy2(mp3_path, safe_path)
+    with open(safe_path, "rb") as f:
         return client.audio.transcriptions.create(
             model="whisper-1",
-            file=(mp3_path.name, f, "audio/mpeg"),
+            file=f,
             language="ru"
         ).text
 
@@ -317,6 +338,8 @@ def main():
             EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
         },
         fallbacks=[CallbackQueryHandler(button_cancel, pattern="^cancel$")],
+        per_message=False,
+        per_chat=True,
     )
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
