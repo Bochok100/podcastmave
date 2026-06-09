@@ -1,6 +1,6 @@
 """
 Podcast Bot v2 — автоматизация подкаста
-- Студийная обработка аудио через ElevenLabs (с выводом ошибок в Telegram)
+- Студийная обработка аудио через ElevenLabs (Фиксированный MP3 битрейт)
 - Загрузка в mave.digital с ФОТООТЧЕТОМ после публикации
 """
 
@@ -77,9 +77,10 @@ async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def convert_to_mp3(input_path: Path) -> Path:
     mp3_path = input_path.with_suffix(".mp3")
+    # Жестко задаем 128k битрейт, 44100Hz и 1 канал (моно) для совместимости с ElevenLabs
     result = subprocess.run(
         ["ffmpeg", "-y", "-i", str(input_path),
-         "-ar", "44100", "-ac", "1", "-q:a", "4", str(mp3_path)],
+         "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(mp3_path)],
         capture_output=True, text=True
     )
     if result.returncode != 0:
@@ -89,7 +90,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    """ Нейросетевое улучшение звука. Выдает жесткую ошибку, если что-то не так. """
+    """ Студийная обработка аудио через ElevenLabs Voice Isolation """
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Ключ ELEVENLABS_API_KEY не найден в настройках Render!")
 
@@ -106,7 +107,6 @@ async def enhance_audio(mp3_path: Path) -> Path:
                 files={"audio": (mp3_path.name, f, "audio/mpeg")},
             )
 
-        # Если ElevenLabs недоволен, прерываем всё и выводим ошибку в Telegram
         if resp.status_code != 200:
             error_msg = f"Отказ ElevenLabs (Код {resp.status_code}): {resp.text}"
             raise RuntimeError(error_msg)
@@ -249,7 +249,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🎙️ Улучшаю звук (ElevenLabs Студия)...")
         studio_mp3 = await enhance_audio(mp3)
 
-        await msg.edit_text("📝 Транскрибирую (Whisper)...")
+        await msg.edit_text("📝 Траскрибирую (Whisper)...")
         transcript = transcribe(studio_mp3)
 
         await msg.edit_text("✍️ Генерирую заголовок и описание (ChatGPT)...")
@@ -287,7 +287,6 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         
     await query.edit_message_text("⏳ Загружаю в mave.digital (это займет около минуты)...")
     try:
-        # Удаляем старые скрины
         if os.path.exists("/tmp/mave_error.png"): os.remove("/tmp/mave_error.png")
         if os.path.exists("/tmp/mave_done.png"): os.remove("/tmp/mave_done.png")
             
@@ -297,7 +296,7 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         success_text = f"✅ *Действие завершено!*\n\n_{data['title']}_\n\nПосмотри на скриншот ниже, чтобы увидеть результат на сайте."
         if os.path.exists("/tmp/mave_done.png"):
             await query.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"), caption=success_text, parse_mode=ParseMode.MARKDOWN)
-            await query.delete() # удаляем старое сообщение "Загружаю..."
+            await query.delete()
         else:
             await query.edit_message_text(success_text, parse_mode=ParseMode.MARKDOWN)
             
@@ -374,7 +373,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
     
-    print("Бот v2 запущен (ElevenLabs Проверка + Фотоотчет Mave)...")
+    print("Бот v2 запущен (ElevenLabs Фикс формата + Фотоотчет Mave)...")
     app.run_polling()
 
 if __name__ == "__main__":
