@@ -7,7 +7,6 @@ import os
 import asyncio
 import tempfile
 import subprocess
-import json
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,31 +36,34 @@ ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 EDIT_TITLE, EDIT_DESC = range(2)
 
 STYLE_PROMPT = """
-Ты помощник подкастера Василия. Он ведёт короткие подкасты про крипту и ИИ.
-Аудитория: люди 40+, практики, хотят разобраться — без академизма и без воды.
+Ты — профессиональный редактор и автор подкастов про криптовалюту, инвестиции и технологии. 
+Я отправляю тебе черновую текстовую расшифровку аудиосообщения. 
 
-ПРИМЕРЫ ЕГО ЗАГОЛОВКОВ (учись у них):
+ТВОЯ ЗАДАЧА:
+1. Внимательно изучить смысл текста.
+2. Придумать цепляющий Заголовок.
+3. Написать краткое Описание подкаста.
+
+=== ПРАВИЛА ДЛЯ ЗАГОЛОВКА ===
+Он должен быть интригующим, коротким и понятным новичкам. Избегай дешевого кликбейта.
+Ориентируйся на этот стиль (это ТОЛЬКО примеры стиля, не копируй их!):
 - Как на самом деле работают сделки
 - RWA: почему реальные активы — самый спокойный рост в крипте
-- Агенты ИИ: почему без них уже нельзя
-- Структура портфеля в крипте: почему без неё вы всегда теряете
+- Что такое Long и Short на самом деле
+- Кто такие «киты» в криптовалюте — мифические богачи или нечто иное?
+- Будущие тренды в крипте: куда смотреть до хайпа
+- Стейкинг и фарминг: объясняю на пальцах
 
-ЗАКОНОМЕРНОСТИ В ЕГО СТИЛЕ:
-- Часто использует "на самом деле" — снимает мифы, говорит правду
-- Формула: [Понятие] + [неожиданный угол зрения или польза]
-- Никогда не пишет "топ", "секреты", "как стать богатым"
+=== ПРАВИЛА ДЛЯ ОПИСАНИЯ ===
+Описание должно состоять из 2-3 предложений. Раскрой суть подкаста, задай интригующий вопрос или укажи, какую пользу получит слушатель. 
 
-ОПИСАНИЕ — стиль:
-- 2 предложения максимум
-- Первое: суть выпуска одной фразой
-- Второе: зачем слушать / что поймёшь после
-- Разговорный тон, не рекламный
+=== ФОРМАТ ОТВЕТА (СТРОГО!) ===
+Твой ответ должен содержать только две строки, без лишних приветствий, символов и кавычек. Строго в таком виде:
 
-Ответь строго в формате (без лишних слов):
-ЗАГОЛОВОК: [текст]
-ОПИСАНИЕ: [текст]
+ЗАГОЛОВОК: [Твой придуманный заголовок]
+ОПИСАНИЕ: [Твое придуманное описание]
 
-Транскрипт:
+ТРАНСКРИПЦИЯ АУДИО ДЛЯ ОБРАБОТКИ:
 """
 
 pending = {}
@@ -125,28 +127,36 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
     )
     text = response.choices[0].message.content
     title = description = ""
+    
+    # Защита от маркдауна и парсинг строк
     for line in text.splitlines():
-        if line.startswith("ЗАГОЛОВОК:"):
-            title = line.replace("ЗАГОЛОВОК:", "").strip()
-        elif line.startswith("ОПИСАНИЕ:"):
-            description = line.replace("ОПИСАНИЕ:", "").strip()
+        clean_line = line.strip().replace("**", "")
+        if clean_line.upper().startswith("ЗАГОЛОВОК:"):
+            title = clean_line[10:].strip()
+        elif clean_line.upper().startswith("ОПИСАНИЕ:"):
+            description = clean_line[9:].strip()
+            
     return title, description
 
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        # Устанавливаем глобальный таймаут 60 секунд для всех действий браузера
+        context = await browser.new_context()
+        context.set_default_timeout(60000) 
+        page = await context.new_page()
         try:
             await page.goto("https://app.mave.digital/login")
             await page.fill('input[type="email"]', MAVE_EMAIL)
             await page.fill('input[type="password"]', MAVE_PASSWORD)
             await page.click('button[type="submit"]')
-            await page.wait_for_url("**/podcasts**", timeout=15000)
+            await page.wait_for_url("**/podcasts**")
 
             await page.goto(f"https://app.mave.digital/podcasts/{MAVE_PODCAST_ID}/episodes/new")
             await page.wait_for_load_state("networkidle")
 
             await page.set_input_files('input[type="file"]', str(mp3_path))
+            # Для загрузки самого аудиофайла даем целых 2 минуты
             await page.wait_for_selector(".upload-progress-done, .audio-player", timeout=120000)
 
             title_input = page.locator('input[name="title"], input[placeholder*="название"], input[placeholder*="Название"]').first
@@ -157,7 +167,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
 
             publish_btn = page.locator('button:has-text("Опубликовать"), button:has-text("Сохранить")').first
             await publish_btn.click()
-            await page.wait_for_url("**/episodes**", timeout=30000)
+            await page.wait_for_url("**/episodes**")
             return True
         except Exception as e:
             print(f"Ошибка mave: {e}")
@@ -165,14 +175,14 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
         finally:
             await browser.close()
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
         return
 
     msg = await update.message.reply_text("⏳ Обрабатываю...")
     try:
-        ogg = await download_voice(update, context)
+        ogg = await download_voice(update, tg_context)
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
@@ -205,7 +215,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-async def button_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -221,7 +231,7 @@ async def button_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка загрузки: {e}\n\nПопробуй залить вручную.")
 
-async def button_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_edit(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -229,7 +239,7 @@ async def button_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"✏️ Текущий заголовок:\n*{data['title']}*\n\nНапиши новый заголовок (или /skip):", parse_mode=ParseMode.MARKDOWN)
     return EDIT_TITLE
 
-async def edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def edit_title(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if update.message.text != "/skip":
         pending[user_id]["title"] = update.message.text
@@ -237,7 +247,7 @@ async def edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📝 Текущее описание:\n_{data['description']}_\n\nНапиши новое описание (или /skip):", parse_mode=ParseMode.MARKDOWN)
     return EDIT_DESC
 
-async def edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def edit_desc(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if update.message.text != "/skip":
         pending[user_id]["description"] = update.message.text
@@ -246,7 +256,7 @@ async def edit_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎙 *Обновлено:*\n\n*Заголовок:* {data['title']}\n*Описание:* {data['description']}\n\nПубликуем?", parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     return ConversationHandler.END
 
-async def button_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
