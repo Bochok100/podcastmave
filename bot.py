@@ -1,6 +1,6 @@
 """
-Podcast Bot v2 — автоматизация подкаста
-- Студийная обработка звука через FFmpeg (без внешних API)
+Podcast Bot v2
+- ElevenLabs Audio Isolation + FFmpeg мастеринг (студийный звук)
 - Загрузка в mave.digital с фотоотчётом
 """
 
@@ -26,12 +26,13 @@ from playwright.async_api import async_playwright
 # ──────────────────────────────────────────────
 # Настройки
 # ──────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
-OPENAI_KEY      = os.getenv("OPENAI_API_KEY")
-MAVE_EMAIL      = os.getenv("MAVE_EMAIL")
-MAVE_PASSWORD   = os.getenv("MAVE_PASSWORD")
-MAVE_PODCAST_ID = os.getenv("MAVE_PODCAST_ID")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+OPENAI_KEY         = os.getenv("OPENAI_API_KEY")
+MAVE_EMAIL         = os.getenv("MAVE_EMAIL")
+MAVE_PASSWORD      = os.getenv("MAVE_PASSWORD")
+MAVE_PODCAST_ID    = os.getenv("MAVE_PODCAST_ID")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 EDIT_TITLE, EDIT_DESC = range(2)
 
@@ -93,52 +94,83 @@ def convert_to_mp3(input_path: Path) -> Path:
         capture_output=True, text=True
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg конвертация: {result.stderr[-300:]}")
+        raise RuntimeError(f"ffmpeg: {result.stderr[-300:]}")
     if not mp3_path.exists() or mp3_path.stat().st_size < 1000:
         raise RuntimeError("ffmpeg не создал MP3")
     return mp3_path
 
 
 # ──────────────────────────────────────────────
-# 3. Студийная обработка звука (только FFmpeg)
-#
-# Цепочка фильтров:
-#   highpass=80Гц       — срезаем гул/рокот микрофона
-#   lowpass=14000Гц     — убираем лишние высокочастотные шипы
-#   afftdn              — нейросетевой шумодав FFmpeg (встроенный)
-#   eq 300Гц -5dB       — убираем «картонный» призвук
-#   eq 3500Гц +3dB      — добавляем ясность и присутствие голоса
-#   acompressor         — компрессор: голос становится плотным и ровным
-#   loudnorm -16 LUFS   — стандарт громкости подкастов (Spotify/Apple)
+# 3. Улучшение звука
+#    Шаг 1: ElevenLabs Audio Isolation — убирает ВСЁ кроме голоса
+#    Шаг 2: FFmpeg мастеринг — делает голос радийным/студийным
 # ──────────────────────────────────────────────
-def enhance_audio(mp3_path: Path) -> Path:
-    studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
+async def enhance_audio(mp3_path: Path) -> Path:
+    isolated_path = mp3_path.parent / (mp3_path.stem + "_isolated.mp3")
+    studio_path   = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
 
-    filters = ",".join([
-        "highpass=f=80",
-        "lowpass=f=14000",
-        "afftdn=nf=-25",
-        "equalizer=f=300:width_type=o:width=2:g=-5",
-        "equalizer=f=3500:width_type=o:width=2:g=3",
-        "acompressor=threshold=-18dB:ratio=3:attack=5:release=100:makeup=2",
+    # ── ШАГ 1: ElevenLabs — нейросетевая изоляция голоса ──
+    if ELEVENLABS_API_KEY:
+        print("ElevenLabs: отправляем файл на изоляцию...")
+        async with httpx.AsyncClient(timeout=300) as client:
+            with open(mp3_path, "rb") as f:
+                resp = await client.post(
+                    "https://api.elevenlabs.io/v1/audio-isolation",
+                    headers={
+                        "xi-api-key": ELEVENLABS_API_KEY,
+                        "Accept":     "audio/mpeg",
+                    },
+                    files={"audio": (mp3_path.name, f, "audio/mpeg")},
+                )
+        print(f"ElevenLabs: HTTP {resp.status_code}, размер ответа {len(resp.content)} байт")
+
+        if resp.status_code == 200 and len(resp.content) > 10000:
+            isolated_path.write_bytes(resp.content)
+            print(f"ElevenLabs: изоляция готова → {isolated_path.name}")
+            source = isolated_path
+        else:
+            print(f"ElevenLabs: ошибка или пустой ответ, мастерим исходный файл")
+            source = mp3_path
+    else:
+        print("ElevenLabs: ключ не задан, пропускаем изоляцию")
+        source = mp3_path
+
+    # ── ШАГ 2: FFmpeg мастеринг (Adobe Podcast-style) ──
+    #
+    # ElevenLabs уже убрал ФОН — теперь делаем голос КРАСИВЫМ:
+    #   highpass 100Гц     — добиваем остатки низкочастотного гула
+    #   eq 300Гц -4dB      — убираем "картонный" телефонный призвук
+    #   eq 1200Гц +2dB     — тело голоса, тёплость
+    #   eq 3500Гц +4dB     — ясность, присутствие (как Adobe Podcast)
+    #   eq 10000Гц +2dB    — воздух, профессиональный блеск
+    #   acompressor        — выравниваем динамику, голос становится плотным
+    #   loudnorm -16 LUFS  — стандарт громкости Spotify/Apple Podcasts
+    #
+    audio_filters = ",".join([
+        "highpass=f=100",
+        "equalizer=f=300:width_type=o:width=1.5:g=-4",
+        "equalizer=f=1200:width_type=o:width=1.5:g=2",
+        "equalizer=f=3500:width_type=o:width=1.5:g=4",
+        "equalizer=f=10000:width_type=o:width=1.5:g=2",
+        "acompressor=threshold=-20dB:ratio=4:attack=5:release=80:makeup=3",
         "loudnorm=I=-16:TP=-1.5:LRA=11",
     ])
 
+    print(f"FFmpeg мастеринг: обрабатываем {source.name}...")
     result = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(mp3_path),
-         "-af", filters,
+        ["ffmpeg", "-y", "-i", str(source),
+         "-af", audio_filters,
          "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
          str(studio_path)],
         capture_output=True, text=True
     )
 
     if result.returncode != 0 or not studio_path.exists():
-        print(f"enhance_audio ffmpeg stderr: {result.stderr[-500:]}")
-        print("Обработка не удалась — используем исходный MP3")
-        return mp3_path
+        print(f"FFmpeg мастеринг: ошибка — {result.stderr[-300:]}")
+        return source  # возвращаем хотя бы изолированный
 
     size = studio_path.stat().st_size
-    print(f"enhance_audio: готово, {size} байт → {studio_path.name}")
+    print(f"FFmpeg мастеринг: готово, {size} байт → {studio_path.name}")
     return studio_path
 
 
@@ -147,15 +179,11 @@ def enhance_audio(mp3_path: Path) -> Path:
 # ──────────────────────────────────────────────
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
-    # Гарантируем имя файла с расширением .mp3
-    safe_path = mp3_path.parent / (mp3_path.stem + "_ready.mp3")
-    if safe_path != mp3_path:
-        shutil.copy2(mp3_path, safe_path)
+    safe_path = mp3_path.parent / (mp3_path.stem + "_w.mp3")
+    shutil.copy2(mp3_path, safe_path)
     with open(safe_path, "rb") as f:
         return client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language="ru"
+            model="whisper-1", file=f, language="ru"
         ).text
 
 
@@ -191,7 +219,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
         context.set_default_timeout(60000)
         page = await context.new_page()
         try:
-            # Логин
+            # 1. Логин
             await page.goto("https://app.mave.digital/login")
             await page.fill('input[type="email"]', MAVE_EMAIL)
             await page.fill('input[type="password"]', MAVE_PASSWORD)
@@ -201,47 +229,71 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await asyncio.sleep(3)
             print("mave: залогинились")
 
-            # Убиваем модальное окно через JS
+            # 2. Убиваем welcome-модалку через JS
             await page.evaluate("""() => {
                 document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e => e.remove());
                 document.querySelectorAll('.q-overlay, .q-dialog__backdrop').forEach(e => e.remove());
                 document.body.classList.remove('q-body--prevent-scroll', 'q-body--force-scrollbar-x');
             }""")
             await asyncio.sleep(1)
-            await page.screenshot(path="/tmp/mave_01.png")
 
-            # Клик "Добавить выпуск"
+            # 3. Открываем форму нового выпуска
             await page.locator('text=Добавить выпуск').first.click()
             await asyncio.sleep(3)
             await page.wait_for_load_state("networkidle")
-            await page.screenshot(path="/tmp/mave_02.png")
-            print(f"mave: после клика URL={page.url}")
+            await page.screenshot(path="/tmp/mave_01_form.png")
+            print(f"mave: форма открыта, URL={page.url}")
 
-            # Загрузка файла
+            # 4. Выбираем файл через скрытый input
             await page.wait_for_selector('input[type="file"]', timeout=15000)
             await page.set_input_files('input[type="file"]', str(mp3_path))
-            print(f"mave: файл отправлен {mp3_path.name}")
-            await asyncio.sleep(5)
+            print(f"mave: файл выбран: {mp3_path.name}")
+            await asyncio.sleep(2)
+            await page.screenshot(path="/tmp/mave_02_file_selected.png")
 
-            # Ждём признаков что загрузка завершена
-            print("mave: ждём завершения загрузки файла...")
-            for i in range(24):
+            # 5. Нажимаем кнопку "Загрузить файл" — это ключевой шаг!
+            print("mave: ищем кнопку 'Загрузить файл'...")
+            upload_btn_selectors = [
+                'button:has-text("Загрузить файл")',
+                'button:has-text("Загрузить")',
+                'button[type="submit"]',
+                '.upload-btn',
+                'button.q-btn:has-text("Загруз")',
+            ]
+            for sel in upload_btn_selectors:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        await btn.click()
+                        print(f"mave: кнопка загрузки нажата → '{sel}'")
+                        break
+                except Exception:
+                    continue
+
+            await asyncio.sleep(3)
+            await page.screenshot(path="/tmp/mave_03_uploading.png")
+
+            # 6. Ждём завершения загрузки файла на сервер (до 3 минут)
+            print("mave: ждём загрузки файла на сервер...")
+            for i in range(36):
                 await asyncio.sleep(5)
                 html = await page.content()
                 if any(x in html for x in [
-                    "audio-player", "waveform", "upload-progress-done",
-                    "Название выпуска", "episode-title", "Опубликовать", "Сохранить"
+                    "Название выпуска", "episode-title", "audio-player",
+                    "waveform", "Опубликовать", "Сохранить выпуск",
+                    "Описание выпуска", "upload-progress-done",
                 ]):
-                    print(f"mave: загрузка завершена (шаг {i+1})")
+                    print(f"mave: файл загружен, форма появилась (шаг {i+1})")
                     break
-                print(f"mave: ждём... ({i+1}/24)")
+                print(f"mave: ждём... ({i+1}/36)")
 
-            await page.screenshot(path="/tmp/mave_03.png")
+            await page.screenshot(path="/tmp/mave_04_after_upload.png")
             html = await page.content()
-            print(f"mave: HTML фрагмент: {html[1000:2500]}")
+            print(f"mave: HTML[1000:3000] = {html[1000:3000]}")
 
-            # Заголовок
+            # 7. Заголовок
             for sel in [
+                'input[placeholder*="Название выпуска"]',
                 'input[placeholder*="Название"]',
                 'input[placeholder*="название"]',
                 'input[name="title"]',
@@ -257,11 +309,12 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
                 except Exception:
                     continue
 
-            # Описание
+            # 8. Описание
             for sel in [
                 '.ProseMirror',
                 'div[contenteditable="true"]',
-                'textarea[placeholder*="писание"]',
+                'textarea[placeholder*="Описание"]',
+                'textarea[placeholder*="описание"]',
                 'textarea[name="description"]',
             ]:
                 try:
@@ -274,11 +327,11 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
                 except Exception:
                     continue
 
-            await page.screenshot(path="/tmp/mave_04.png")
+            await page.screenshot(path="/tmp/mave_05_filled.png")
 
-            # Публикуем
+            # 9. Публикуем
             published = False
-            for btn_text in ["Опубликовать", "Сохранить", "Publish", "Save"]:
+            for btn_text in ["Опубликовать", "Сохранить выпуск", "Сохранить", "Publish"]:
                 try:
                     btn = page.locator(f'button:has-text("{btn_text}")').first
                     if await btn.count() > 0:
@@ -290,11 +343,11 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
                     continue
 
             if not published:
-                raise RuntimeError("Не найдена кнопка публикации")
+                raise RuntimeError("Не найдена кнопка публикации — смотри скриншот")
 
             await asyncio.sleep(5)
             await page.screenshot(path="/tmp/mave_done.png")
-            print(f"mave: готово, URL={page.url}")
+            print(f"mave: готово, финальный URL={page.url}")
             return True
 
         except Exception as e:
@@ -306,7 +359,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
 
 
 # ──────────────────────────────────────────────
-# 7. Обработчик голосового сообщения
+# 7. Обработчик голосового
 # ──────────────────────────────────────────────
 async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -320,8 +373,8 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Обрабатываю звук (шумодав + компрессор + нормализация)...")
-        studio_mp3 = enhance_audio(mp3)  # синхронная функция
+        await msg.edit_text("🎙️ ElevenLabs изоляция + студийный мастеринг...")
+        studio_mp3 = await enhance_audio(mp3)
 
         await msg.edit_text("📝 Транскрибирую (Whisper)...")
         transcript = transcribe(studio_mp3)
@@ -329,11 +382,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("✍️ Генерирую заголовок и описание (GPT-4o)...")
         title, description = generate_metadata(transcript)
 
-        pending[user_id] = {
-            "mp3": studio_mp3,
-            "title": title,
-            "description": description,
-        }
+        pending[user_id] = {"mp3": studio_mp3, "title": title, "description": description}
         await msg.delete()
 
         keyboard = InlineKeyboardMarkup([
@@ -353,9 +402,8 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
             document=open(studio_mp3, "rb"),
             filename=f"{title[:40]}.mp3"
         )
-        await update.message.reply_text(
-            preview, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-        )
+        await update.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
@@ -373,7 +421,7 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Данные устарели. Запиши заново.")
         return
 
-    await query.edit_message_text("⏳ Загружаю в mave.digital (~1 минута)...")
+    await query.edit_message_text("⏳ Загружаю в mave.digital (~1-2 минуты)...")
     try:
         for f in ["/tmp/mave_error.png", "/tmp/mave_done.png"]:
             if os.path.exists(f): os.remove(f)
@@ -393,9 +441,16 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         pending.pop(user_id, None)
 
     except Exception as e:
-        if os.path.exists("/tmp/mave_error.png"):
+        screenshot = "/tmp/mave_error.png"
+        # Отправляем самый информативный скриншот
+        for s in ["/tmp/mave_05_filled.png", "/tmp/mave_04_after_upload.png",
+                  "/tmp/mave_03_uploading.png", "/tmp/mave_error.png"]:
+            if os.path.exists(s):
+                screenshot = s
+                break
+        if os.path.exists(screenshot):
             await query.message.reply_photo(
-                photo=open("/tmp/mave_error.png", "rb"),
+                photo=open(screenshot, "rb"),
                 caption=f"❌ Ошибка: {e}\n\nСкриншот момента сбоя прикреплён."
             )
             await query.delete()
@@ -406,8 +461,7 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
 async def button_edit(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    data = pending.get(user_id)
+    data = pending.get(query.from_user.id)
     await query.edit_message_text(
         f"✏️ Текущий заголовок:\n*{data['title']}*\n\nНапиши новый (или /skip):",
         parse_mode=ParseMode.MARKDOWN
@@ -483,7 +537,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
 
-    print("Бот v2 запущен (FFmpeg студийная обработка + фотоотчёт)...")
+    print("Бот v2 запущен (ElevenLabs + FFmpeg мастеринг + фотоотчёт)...")
     app.run_polling()
 
 
