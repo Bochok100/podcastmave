@@ -117,27 +117,33 @@ async def enhance_audio(mp3_path: Path) -> Path:
 
             if status == "Done":
                 output_files = data.get("output_files", [])
-                print(f"Auphonic output_files: {output_files}")
+                output_file  = data.get("output_file", {})
+                print(f"Auphonic DONE. output_files={output_files}")
+                print(f"Auphonic DONE. output_file={output_file}")
 
-                if not output_files:
-                    print("Auphonic: нет output_files, используем исходный")
-                    return mp3_path
-
-                download_url = output_files[0].get("download_url", "")
+                download_url = ""
+                if output_files and isinstance(output_files, list):
+                    download_url = output_files[0].get("download_url", "")
+                if not download_url and isinstance(output_file, dict):
+                    download_url = output_file.get("download_url", "")
                 if not download_url:
-                    print("Auphonic: нет download_url, используем исходный")
-                    return mp3_path
+                    download_url = f"https://auphonic.com/api/production/{uuid}/download/output_files/default.mp3"
+                    print(f"Auphonic: fallback URL")
 
-                print(f"Auphonic: скачиваем {download_url}")
+                print(f"Auphonic: скачиваем файл...")
                 r = await client.get(download_url, auth=(AUPHONIC_USER, AUPHONIC_PASS))
-                r.raise_for_status()
+                print(f"Auphonic: HTTP {r.status_code}, размер: {len(r.content)} байт")
+
+                if r.status_code != 200:
+                    print("Auphonic: ошибка скачивания, используем исходный")
+                    return mp3_path
 
                 enhanced_path.write_bytes(r.content)
                 size = enhanced_path.stat().st_size
-                print(f"Auphonic: скачан файл {size} байт")
+                print(f"Auphonic: файл сохранён {size} байт")
 
                 if size < 10000:
-                    print("Auphonic: файл подозрительно маленький, используем исходный")
+                    print("Auphonic: файл слишком маленький, используем исходный")
                     return mp3_path
 
                 return enhanced_path
@@ -201,28 +207,21 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await page.wait_for_url("**/dashboard**")
             await page.wait_for_load_state("networkidle")
 
-            # 3. Закрываем приветственное модальное окно если оно есть
-            try:
-                modal = page.locator('div.plus-welcome-modal__content, div.q-dialog, [id^="q-portal--dialog"]').first
-                close_btn = page.locator('button[aria-label="Close"], button.q-btn--flat, .q-dialog button:has-text("×"), .q-dialog button:has-text("Закрыть"), .q-dialog button:has-text("Понятно"), .q-dialog button:has-text("OK")').first
-                if await close_btn.count() > 0:
-                    await close_btn.click(timeout=3000)
-                    await asyncio.sleep(1)
-                else:
-                    # Пробуем нажать Escape
-                    await page.keyboard.press("Escape")
-                    await asyncio.sleep(1)
-            except Exception:
-                pass
-
-            # 4. Ждём пока модалка закроется, потом кликаем "Добавить выпуск"
-            try:
-                await page.wait_for_selector(
-                    '[id^="q-portal--dialog"]', state="hidden", timeout=5000
-                )
-            except Exception:
-                pass
+            # 3. Убиваем модальное окно через JS — надёжнее чем искать кнопку
+            await asyncio.sleep(2)
+            await page.evaluate("""
+                () => {
+                    // Удаляем все portal-диалоги (plus-welcome-modal и др.)
+                    document.querySelectorAll('[id^="q-portal--dialog"]').forEach(el => el.remove());
+                    // Убираем overlay/backdrop
+                    document.querySelectorAll('.q-overlay, .q-dialog__backdrop, .modal-backdrop').forEach(el => el.remove());
+                    // Убираем body-классы которые блокируют скролл
+                    document.body.classList.remove('q-body--prevent-scroll', 'q-body--force-scrollbar-x');
+                }
+            """)
             await asyncio.sleep(1)
+
+            # 4. Кликаем "Добавить выпуск"
             await page.locator('text=Добавить выпуск').first.click()
 
             # 4. Ждём всплывающее окно с полем загрузки файла
