@@ -141,34 +141,58 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # Устанавливаем глобальный таймаут 60 секунд для всех действий браузера
         context = await browser.new_context()
-        context.set_default_timeout(60000) 
+        context.set_default_timeout(60000)
         page = await context.new_page()
         try:
+            # 1. Логинимся
             await page.goto("https://app.mave.digital/login")
             await page.fill('input[type="email"]', MAVE_EMAIL)
             await page.fill('input[type="password"]', MAVE_PASSWORD)
             await page.click('button[type="submit"]')
-            await page.wait_for_url("**/podcasts**")
 
-            await page.goto(f"https://app.mave.digital/podcasts/{MAVE_PODCAST_ID}/episodes/new")
+            # 2. Ждём dashboard (новый интерфейс mave)
+            await page.wait_for_url("**/dashboard**")
             await page.wait_for_load_state("networkidle")
 
-            await page.set_input_files('input[type="file"]', str(mp3_path))
-            # Для загрузки самого аудиофайла даем целых 2 минуты
-            await page.wait_for_selector(".upload-progress-done, .audio-player", timeout=120000)
+            # 3. Кликаем "Добавить выпуск" в левом меню
+            await page.locator('text=Добавить выпуск').first.click()
 
-            title_input = page.locator('input[name="title"], input[placeholder*="название"], input[placeholder*="Название"]').first
+            # 4. Ждём всплывающее окно с полем загрузки файла
+            await page.wait_for_selector('input[type="file"]')
+            await page.set_input_files('input[type="file"]', str(mp3_path))
+
+            # 5. Пауза + ждём завершения загрузки файла (до 2 минут)
+            await asyncio.sleep(5)
+            await page.wait_for_selector(
+                ".upload-progress-done, .audio-player, "
+                "button:has-text('Опубликовать'):not([disabled]), "
+                "button:has-text('Сохранить'):not([disabled])",
+                timeout=120000
+            )
+
+            # 6. Заголовок
+            title_input = page.locator(
+                'input[placeholder*="название"], input[placeholder*="Название"], input[name="title"]'
+            ).first
             await title_input.fill(title)
 
-            desc_input = page.locator('textarea[name="description"], textarea[placeholder*="описание"], textarea[placeholder*="Описание"]').first
+            # 7. Описание — mave использует редактор ProseMirror
+            desc_input = page.locator(
+                '.ProseMirror, textarea[name="description"], textarea[placeholder*="описание"]'
+            ).first
             await desc_input.fill(description)
 
-            publish_btn = page.locator('button:has-text("Опубликовать"), button:has-text("Сохранить")').first
+            # 8. Публикуем
+            publish_btn = page.locator(
+                'button:has-text("Опубликовать"), button:has-text("Сохранить")'
+            ).first
             await publish_btn.click()
-            await page.wait_for_url("**/episodes**")
+
+            # 9. Ждём сохранения
+            await asyncio.sleep(5)
             return True
+
         except Exception as e:
             print(f"Ошибка mave: {e}")
             raise RuntimeError(f"Ошибка загрузки в mave: {e}")
