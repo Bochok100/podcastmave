@@ -89,48 +89,64 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    # Имя файла всегда с .mp3 — Whisper определяет формат по расширению
     enhanced_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
-    async with httpx.AsyncClient(timeout=300) as client:
-        resp = await client.post(
-            "https://auphonic.com/api/simple/productions.json",
-            auth=(AUPHONIC_USER, AUPHONIC_PASS),
-            data={
-                "action": "start",
-                "output_basename": mp3_path.stem + "_studio",
-                "output_formats": '[{"format": "mp3", "bitrate": "128"}]',
-            },
-            files={"input_file": open(mp3_path, "rb")},
-        )
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+        # Загружаем файл на Auphonic
+        with open(mp3_path, "rb") as audio_file:
+            resp = await client.post(
+                "https://auphonic.com/api/simple/productions.json",
+                auth=(AUPHONIC_USER, AUPHONIC_PASS),
+                data={"action": "start"},
+                files={"input_file": (mp3_path.name, audio_file, "audio/mpeg")},
+            )
         resp.raise_for_status()
-        uuid = resp.json()["data"]["uuid"]
+        production_data = resp.json()["data"]
+        uuid = production_data["uuid"]
+        print(f"Auphonic: запущена обработка {uuid}")
 
-        for _ in range(60):
+        # Ждём завершения (до 5 минут)
+        for attempt in range(60):
             await asyncio.sleep(5)
             s = await client.get(
                 f"https://auphonic.com/api/production/{uuid}.json",
                 auth=(AUPHONIC_USER, AUPHONIC_PASS),
             )
-            status = s.json()["data"]["status_string"]
-            if status == "Done":
-                output_files = s.json()["data"]["output_files"]
-                if not output_files:
-                    # Auphonic не вернул файл — возвращаем исходный
-                    print("Auphonic: нет output_files, используем исходный MP3")
-                    return mp3_path
-                url = output_files[0]["download_url"]
-                r = await client.get(url, auth=(AUPHONIC_USER, AUPHONIC_PASS))
-                enhanced_path.write_bytes(r.content)
-                # Проверяем что файл реально скачался
-                if enhanced_path.stat().st_size < 1000:
-                    print("Auphonic: файл слишком маленький, используем исходный")
-                    return mp3_path
-                return enhanced_path
-            if status in ("Error", "Failed"):
-                print(f"Auphonic статус: {status}, используем исходный MP3")
-                return mp3_path  # не падаем — просто используем исходный
+            data = s.json()["data"]
+            status = data["status_string"]
+            print(f"Auphonic статус ({attempt+1}): {status}")
 
-    print("Auphonic: таймаут, используем исходный MP3")
+            if status == "Done":
+                output_files = data.get("output_files", [])
+                print(f"Auphonic output_files: {output_files}")
+
+                if not output_files:
+                    print("Auphonic: нет output_files, используем исходный")
+                    return mp3_path
+
+                download_url = output_files[0].get("download_url", "")
+                if not download_url:
+                    print("Auphonic: нет download_url, используем исходный")
+                    return mp3_path
+
+                print(f"Auphonic: скачиваем {download_url}")
+                r = await client.get(download_url, auth=(AUPHONIC_USER, AUPHONIC_PASS))
+                r.raise_for_status()
+
+                enhanced_path.write_bytes(r.content)
+                size = enhanced_path.stat().st_size
+                print(f"Auphonic: скачан файл {size} байт")
+
+                if size < 10000:
+                    print("Auphonic: файл подозрительно маленький, используем исходный")
+                    return mp3_path
+
+                return enhanced_path
+
+            if status in ("Error", "Failed", "Cancelled"):
+                print(f"Auphonic: ошибка обработки ({status}), используем исходный")
+                return mp3_path
+
+    print("Auphonic: таймаут 5 минут, используем исходный")
     return mp3_path
 
 def transcribe(mp3_path: Path) -> str:
@@ -185,7 +201,28 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await page.wait_for_url("**/dashboard**")
             await page.wait_for_load_state("networkidle")
 
-            # 3. Кликаем "Добавить выпуск" в левом меню
+            # 3. Закрываем приветственное модальное окно если оно есть
+            try:
+                modal = page.locator('div.plus-welcome-modal__content, div.q-dialog, [id^="q-portal--dialog"]').first
+                close_btn = page.locator('button[aria-label="Close"], button.q-btn--flat, .q-dialog button:has-text("×"), .q-dialog button:has-text("Закрыть"), .q-dialog button:has-text("Понятно"), .q-dialog button:has-text("OK")').first
+                if await close_btn.count() > 0:
+                    await close_btn.click(timeout=3000)
+                    await asyncio.sleep(1)
+                else:
+                    # Пробуем нажать Escape
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
+            # 4. Ждём пока модалка закроется, потом кликаем "Добавить выпуск"
+            try:
+                await page.wait_for_selector(
+                    '[id^="q-portal--dialog"]', state="hidden", timeout=5000
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1)
             await page.locator('text=Добавить выпуск').first.click()
 
             # 4. Ждём всплывающее окно с полем загрузки файла
