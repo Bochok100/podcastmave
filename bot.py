@@ -1,6 +1,7 @@
 """
-Podcast Bot v2 — автоматизация подкаста с загрузкой в mave
-Скриншоты ошибок в Telegram + студийный звук через Adobe Podcast
+Podcast Bot v2 — автоматизация подкаста
+- Студийная обработка аудио через ElevenLabs (Voice Isolator)
+- Загрузка в mave.digital со скриншотами ошибок в Telegram
 """
 
 import os
@@ -22,14 +23,15 @@ import httpx
 from playwright.async_api import async_playwright
 
 # ──────────────────────────────────────────────
-# Настройки (Auphonic удален полностью)
+# Настройки
 # ──────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
-OPENAI_KEY      = os.getenv("OPENAI_API_KEY")
-MAVE_EMAIL      = os.getenv("MAVE_EMAIL")
-MAVE_PASSWORD   = os.getenv("MAVE_PASSWORD")
-MAVE_PODCAST_ID = os.getenv("MAVE_PODCAST_ID")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+OPENAI_KEY         = os.getenv("OPENAI_API_KEY")
+MAVE_EMAIL         = os.getenv("MAVE_EMAIL")
+MAVE_PASSWORD      = os.getenv("MAVE_PASSWORD")
+MAVE_PODCAST_ID    = os.getenv("MAVE_PODCAST_ID")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 EDIT_TITLE, EDIT_DESC = range(2)
 
@@ -87,60 +89,36 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    """ Улучшение звука исключительно через Adobe Podcast Enhance API """
-    enhanced_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
+    """ Нейросетевое улучшение звука (Студийное качество через ElevenLabs Voice Isolation) """
+    if not ELEVENLABS_API_KEY:
+        print("ElevenLabs: нет ключа, пропускаем обработку")
+        return mp3_path
 
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        print(f"Adobe Podcast: загружаем файл {mp3_path.name} ({mp3_path.stat().st_size} байт)")
+    enhanced_path = mp3_path.with_stem(mp3_path.stem + "_studio")
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        print(f"ElevenLabs: отправляем файл {mp3_path.name} на студийную обработку...")
         with open(mp3_path, "rb") as f:
-            upload_resp = await client.post(
-                "https://podcast.adobe.com/api/v1/enhance",
-                headers={"Accept": "application/json"},
-                files={"file": (mp3_path.name, f, "audio/mpeg")},
+            resp = await client.post(
+                "https://api.elevenlabs.io/v1/audio-isolation",
+                headers={
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                    "Accept": "audio/mpeg"
+                },
+                files={"audio": (mp3_path.name, f, "audio/mpeg")},
             )
 
-        if upload_resp.status_code not in (200, 201, 202):
-            print(f"Adobe Podcast: ошибка загрузки {upload_resp.status_code}")
+        if resp.status_code == 200:
+            enhanced_path.write_bytes(resp.content)
+            print(f"ElevenLabs: звук успешно улучшен ({enhanced_path.stat().st_size} байт)")
+            return enhanced_path
+        else:
+            print(f"Ошибка ElevenLabs: {resp.status_code} - {resp.text}")
             return mp3_path
-
-        data = upload_resp.json()
-        job_id = data.get("jobId") or data.get("id") or data.get("job_id")
-
-        if not job_id:
-            download_url = data.get("url") or data.get("download_url")
-            if download_url:
-                r = await client.get(download_url)
-                enhanced_path.write_bytes(r.content)
-                return enhanced_path
-            return mp3_path
-
-        for attempt in range(60):
-            await asyncio.sleep(5)
-            status_resp = await client.get(
-                f"https://podcast.adobe.com/api/v1/enhance/{job_id}",
-                headers={"Accept": "application/json"},
-            )
-            status_data = status_resp.json()
-            status = status_data.get("status", "unknown")
-
-            if status in ("succeeded", "completed", "done", "finished"):
-                download_url = status_data.get("url") or status_data.get("download_url") or status_data.get("outputUrl")
-                if not download_url:
-                    return mp3_path
-                r = await client.get(download_url)
-                enhanced_path.write_bytes(r.content)
-                if enhanced_path.stat().st_size < 10000:
-                    return mp3_path
-                return enhanced_path
-
-            if status in ("failed", "error"):
-                return mp3_path
-
-    return mp3_path
 
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
-    safe_path = mp3_path.parent / (mp3_path.stem + ".mp3")
+    safe_path = mp3_path.parent / (mp3_path.stem + "_ready.mp3")
     if safe_path != mp3_path:
         import shutil
         shutil.copy2(mp3_path, safe_path)
@@ -205,7 +183,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await page.set_input_files('input[type="file"]', str(mp3_path))
             await asyncio.sleep(5)
 
-            # 5. Ожидание загрузки аудио (цикл ожидания)
+            # 5. Ожидание загрузки аудио
             for i in range(24):
                 await asyncio.sleep(5)
                 html = await page.content()
@@ -262,8 +240,8 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Улучшаю звук (Adobe Podcast)...")
-        studio_mp3 = await enhance_audio(mp3) 
+        await msg.edit_text("🎙️ Улучшаю звук (ElevenLabs Студия)...")
+        studio_mp3 = await enhance_audio(mp3)
 
         await msg.edit_text("📝 Транскрибирую (Whisper)...")
         transcript = transcribe(studio_mp3)
@@ -381,7 +359,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
     
-    print("Бот v2 запущен (Adobe Podcast + Скриншоты ошибок)...")
+    print("Бот v2 запущен (ElevenLabs Студия + Скриншоты Mave)...")
     app.run_polling()
 
 if __name__ == "__main__":
