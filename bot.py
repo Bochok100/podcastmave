@@ -106,77 +106,101 @@ def convert_to_mp3(input_path: Path) -> Path:
 #    Шаг 2: FFmpeg мастеринг — делает голос радийным/студийным
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path) -> Path:
-    isolated_path = mp3_path.parent / (mp3_path.stem + "_isolated.mp3")
+    """
+    Шаг 1: Adobe Podcast Enhancement API — студийное качество голоса
+    Шаг 2: FFmpeg loudnorm — стандарт громкости подкастов (-16 LUFS)
+    """
+    isolated_path = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
     studio_path   = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
 
-    # ── ШАГ 1: ElevenLabs — нейросетевая изоляция голоса ──
-    if ELEVENLABS_API_KEY:
-        print("ElevenLabs: отправляем файл на изоляцию...")
-        async with httpx.AsyncClient(timeout=300) as client:
+    # ── ШАГ 1: Adobe Podcast Enhancement ──
+    # Бесплатный публичный API — улучшает голос как Adobe Podcast Enhance Speech
+    try:
+        print("Adobe Podcast: отправляем файл...")
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
             with open(mp3_path, "rb") as f:
                 resp = await client.post(
-                    "https://api.elevenlabs.io/v1/audio-isolation",
-                    headers={
-                        "xi-api-key": ELEVENLABS_API_KEY,
-                        "Accept":     "audio/mpeg",
-                    },
-                    files={"audio": (mp3_path.name, f, "audio/mpeg")},
+                    "https://podcast.adobe.com/api/v1/enhance",
+                    files={"file": (mp3_path.name, f, "audio/mpeg")},
                 )
-        print(f"ElevenLabs: HTTP {resp.status_code}, размер ответа {len(resp.content)} байт")
+            print(f"Adobe Podcast: HTTP {resp.status_code}")
 
-        if resp.status_code == 200 and len(resp.content) > 10000:
-            isolated_path.write_bytes(resp.content)
-            print(f"ElevenLabs: изоляция готова → {isolated_path.name}")
-            source = isolated_path
-        else:
-            print(f"ElevenLabs: ошибка или пустой ответ, мастерим исходный файл")
-            source = mp3_path
-    else:
-        print("ElevenLabs: ключ не задан, пропускаем изоляцию")
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                print(f"Adobe Podcast: ответ = {str(data)[:200]}")
+                job_id = data.get("jobId") or data.get("id") or data.get("job_id")
+
+                if job_id:
+                    print(f"Adobe Podcast: job_id={job_id}, ждём...")
+                    for attempt in range(60):
+                        await asyncio.sleep(5)
+                        status_resp = await client.get(
+                            f"https://podcast.adobe.com/api/v1/enhance/{job_id}",
+                        )
+                        sd = status_resp.json()
+                        status = sd.get("status", "unknown")
+                        print(f"Adobe Podcast: статус {attempt+1} = {status}")
+
+                        if status in ("succeeded", "completed", "done"):
+                            url = sd.get("url") or sd.get("download_url") or sd.get("outputUrl")
+                            if url:
+                                r = await client.get(url)
+                                isolated_path.write_bytes(r.content)
+                                size = isolated_path.stat().st_size
+                                print(f"Adobe Podcast: файл {size} байт")
+                                if size > 10000:
+                                    source = isolated_path
+                                    break
+                            print("Adobe Podcast: нет URL")
+                            source = mp3_path
+                            break
+                        if status in ("failed", "error"):
+                            print("Adobe Podcast: ошибка задания")
+                            source = mp3_path
+                            break
+                    else:
+                        print("Adobe Podcast: таймаут")
+                        source = mp3_path
+                else:
+                    # Может сразу вернул файл
+                    url = data.get("url") or data.get("download_url")
+                    if url:
+                        r = await client.get(url)
+                        isolated_path.write_bytes(r.content)
+                        if isolated_path.stat().st_size > 10000:
+                            source = isolated_path
+                        else:
+                            source = mp3_path
+                    else:
+                        print("Adobe Podcast: нет job_id и нет url")
+                        source = mp3_path
+            else:
+                print(f"Adobe Podcast: ошибка HTTP {resp.status_code}: {resp.text[:200]}")
+                source = mp3_path
+
+    except Exception as ex:
+        print(f"Adobe Podcast: исключение — {ex}, используем исходный")
         source = mp3_path
 
-    # ── ШАГ 2: FFmpeg мастеринг (Adobe Podcast-style) ──
-    #
-    # ElevenLabs уже убрал ФОН — теперь делаем голос КРАСИВЫМ:
-    #   highpass 100Гц     — добиваем остатки низкочастотного гула
-    #   eq 300Гц -4dB      — убираем "картонный" телефонный призвук
-    #   eq 1200Гц +2dB     — тело голоса, тёплость
-    #   eq 3500Гц +4dB     — ясность, присутствие (как Adobe Podcast)
-    #   eq 10000Гц +2dB    — воздух, профессиональный блеск
-    #   acompressor        — выравниваем динамику, голос становится плотным
-    #   loudnorm -16 LUFS  — стандарт громкости Spotify/Apple Podcasts
-    #
-    audio_filters = ",".join([
-        "highpass=f=100",
-        "equalizer=f=300:width_type=o:width=1.5:g=-4",
-        "equalizer=f=1200:width_type=o:width=1.5:g=2",
-        "equalizer=f=3500:width_type=o:width=1.5:g=4",
-        "equalizer=f=10000:width_type=o:width=1.5:g=2",
-        "acompressor=threshold=-20dB:ratio=4:attack=5:release=80:makeup=3",
-        "loudnorm=I=-16:TP=-1.5:LRA=11",
-    ])
-
-    print(f"FFmpeg мастеринг: обрабатываем {source.name}...")
+    # ── ШАГ 2: FFmpeg loudnorm — стандарт громкости подкастов ──
+    # Только нормализация громкости, не трогаем тембр (Adobe уже всё сделал)
+    print(f"FFmpeg loudnorm: обрабатываем {source.name}...")
     result = subprocess.run(
         ["ffmpeg", "-y", "-i", str(source),
-         "-af", audio_filters,
+         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
          "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
          str(studio_path)],
         capture_output=True, text=True
     )
 
     if result.returncode != 0 or not studio_path.exists():
-        print(f"FFmpeg мастеринг: ошибка — {result.stderr[-300:]}")
-        return source  # возвращаем хотя бы изолированный
+        print(f"FFmpeg: ошибка — {result.stderr[-200:]}")
+        return source
 
-    size = studio_path.stat().st_size
-    print(f"FFmpeg мастеринг: готово, {size} байт → {studio_path.name}")
+    print(f"FFmpeg: готово {studio_path.stat().st_size} байт")
     return studio_path
 
 
-# ──────────────────────────────────────────────
-# 4. Транскрипция через Whisper
-# ──────────────────────────────────────────────
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
     safe_path = mp3_path.parent / (mp3_path.stem + "_w.mp3")
@@ -434,7 +458,7 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
                 photo=open("/tmp/mave_done.png", "rb"),
                 caption=caption, parse_mode=ParseMode.MARKDOWN
             )
-            await query.delete()
+            await query.message.delete()
         else:
             await query.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
 
@@ -453,7 +477,7 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
                 photo=open(screenshot, "rb"),
                 caption=f"❌ Ошибка: {e}\n\nСкриншот момента сбоя прикреплён."
             )
-            await query.delete()
+            await query.message.delete()
         else:
             await query.edit_message_text(f"❌ Ошибка загрузки: {e}")
 
