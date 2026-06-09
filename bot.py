@@ -1,6 +1,6 @@
 """
 Podcast Bot v2 — автоматизация подкаста
-- ElevenLabs (Очистка) + FFmpeg (Студийный мастеринг/Эквалайзер)
+- ElevenLabs (Очистка) + Радийный эквалайзер (Анти-бункер)
 - Загрузка в mave.digital с ФОТООТЧЕТОМ после публикации
 """
 
@@ -89,7 +89,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    """ Двухэтапная обработка: Изоляция шума (ElevenLabs) + Студийный эквалайзер (FFmpeg) """
+    """ Двухэтапная обработка: Изоляция шума (ElevenLabs) + Радийный эквалайзер (FFmpeg) """
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Ключ ELEVENLABS_API_KEY не найден в настройках Render!")
 
@@ -114,12 +114,21 @@ async def enhance_audio(mp3_path: Path) -> Path:
 
         isolated_path.write_bytes(resp.content)
 
-    # ШАГ 2: Студийный мастеринг a-ля Adobe Podcast (Эквалайзер, басы, компрессия)
+    # ШАГ 2: Студийный мастеринг a-ля Adobe Podcast (Анти-бункер)
+    # 1. highpass=f=80 -> Срезаем гул микрофона ниже 80 Гц
+    # 2. eq=f=300:w=2:g=-6 -> ВЫРЕЗАЕМ БУНКЕР (эффект коробки на 300 Гц убираем на 6 Дб)
+    # 3. eq=f=4000:w=2:g=4 -> Добавляем эффект присутствия (ясность)
+    # 4. bass/treble -> Легкая радийная подкраска
+    # 5. acompressor -> Делаем голос плотным
+    # 6. loudnorm -> Стандарт громкости подкастов
     audio_filters = (
-        "bass=g=5:f=110:w=0.6,"          # Бархатные низкие частоты (эффект радио-микрофона)
-        "treble=g=3:f=8000:w=0.5,"       # Ясность и четкость
-        "acompressor=threshold=-20dB:ratio=4:attack=5:release=50," # Плотность звучания
-        "loudnorm=I=-16:TP=-1.5:LRA=11"  # Стандарт громкости Apple/Spotify
+        "highpass=f=80,"
+        "eq=f=300:width_type=q:w=2:g=-6,"
+        "eq=f=4000:width_type=q:w=2:g=4,"
+        "bass=g=3:f=90:w=0.6,"
+        "treble=g=3:f=8000:w=0.5,"
+        "acompressor=threshold=-18dB:ratio=3:attack=5:release=50,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
     )
     
     result = subprocess.run(
@@ -131,7 +140,7 @@ async def enhance_audio(mp3_path: Path) -> Path:
 
     if result.returncode != 0 or not final_studio_path.exists():
         print(f"Ошибка FFmpeg мастеринга: {result.stderr}")
-        return isolated_path # Если мастеринг сбойнул, отдаем хотя бы очищенный звук ElevenLabs
+        return isolated_path 
 
     return final_studio_path
 
@@ -384,7 +393,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
     
-    print("Бот v2 запущен (ElevenLabs + Мастеринг + Фотоотчет)...")
+    print("Бот v2 запущен (ElevenLabs + Анти-бункер + Фотоотчет)...")
     app.run_polling()
 
 if __name__ == "__main__":
