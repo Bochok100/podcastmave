@@ -1,6 +1,6 @@
 """
-Podcast Bot v2 — автоматизация подкаста с согласованием и загрузкой в mave
-Отправь голосовое → одобри → бот сам заливает в mave.digital
+Podcast Bot v2 — автоматизация подкаста с загрузкой в mave
+Скриншоты ошибок в Telegram + студийный звук через Adobe Podcast
 """
 
 import os
@@ -22,12 +22,10 @@ import httpx
 from playwright.async_api import async_playwright
 
 # ──────────────────────────────────────────────
-# Настройки
+# Настройки (Auphonic удален полностью)
 # ──────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 OPENAI_KEY      = os.getenv("OPENAI_API_KEY")
-AUPHONIC_USER   = os.getenv("AUPHONIC_USER")
-AUPHONIC_PASS   = os.getenv("AUPHONIC_PASS")
 MAVE_EMAIL      = os.getenv("MAVE_EMAIL")
 MAVE_PASSWORD   = os.getenv("MAVE_PASSWORD")
 MAVE_PODCAST_ID = os.getenv("MAVE_PODCAST_ID")
@@ -89,52 +87,33 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    """
-    Улучшение звука через Adobe Podcast Enhance API.
-    Бесплатно, без регистрации, работает через публичный endpoint.
-    Убирает шум, улучшает голос до студийного качества.
-    """
+    """ Улучшение звука исключительно через Adobe Podcast Enhance API """
     enhanced_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
 
     async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
         print(f"Adobe Podcast: загружаем файл {mp3_path.name} ({mp3_path.stat().st_size} байт)")
-
-        # Загружаем файл
         with open(mp3_path, "rb") as f:
             upload_resp = await client.post(
                 "https://podcast.adobe.com/api/v1/enhance",
-                headers={
-                    "Accept": "application/json",
-                },
+                headers={"Accept": "application/json"},
                 files={"file": (mp3_path.name, f, "audio/mpeg")},
             )
 
-        print(f"Adobe Podcast: HTTP {upload_resp.status_code}")
-
         if upload_resp.status_code not in (200, 201, 202):
-            print(f"Adobe Podcast: ошибка загрузки {upload_resp.status_code}: {upload_resp.text[:300]}")
+            print(f"Adobe Podcast: ошибка загрузки {upload_resp.status_code}")
             return mp3_path
 
         data = upload_resp.json()
-        print(f"Adobe Podcast: ответ = {str(data)[:300]}")
-
-        # Получаем job ID или сразу файл
         job_id = data.get("jobId") or data.get("id") or data.get("job_id")
 
         if not job_id:
-            # Может быть сразу вернул файл
             download_url = data.get("url") or data.get("download_url")
             if download_url:
                 r = await client.get(download_url)
                 enhanced_path.write_bytes(r.content)
-                if enhanced_path.stat().st_size > 10000:
-                    print(f"Adobe Podcast: файл сохранён {enhanced_path.stat().st_size} байт")
-                    return enhanced_path
-            print("Adobe Podcast: нет job_id и нет url, используем исходный")
+                return enhanced_path
             return mp3_path
 
-        # Ждём завершения job
-        print(f"Adobe Podcast: job_id={job_id}, ждём...")
         for attempt in range(60):
             await asyncio.sleep(5)
             status_resp = await client.get(
@@ -143,40 +122,24 @@ async def enhance_audio(mp3_path: Path) -> Path:
             )
             status_data = status_resp.json()
             status = status_data.get("status", "unknown")
-            print(f"Adobe Podcast: статус {attempt+1} = {status}")
 
             if status in ("succeeded", "completed", "done", "finished"):
-                download_url = (
-                    status_data.get("url") or
-                    status_data.get("download_url") or
-                    status_data.get("outputUrl")
-                )
+                download_url = status_data.get("url") or status_data.get("download_url") or status_data.get("outputUrl")
                 if not download_url:
-                    print("Adobe Podcast: нет URL для скачивания, используем исходный")
                     return mp3_path
-
                 r = await client.get(download_url)
                 enhanced_path.write_bytes(r.content)
-                size = enhanced_path.stat().st_size
-                print(f"Adobe Podcast: файл сохранён {size} байт")
-
-                if size < 10000:
-                    print("Adobe Podcast: файл слишком маленький, используем исходный")
+                if enhanced_path.stat().st_size < 10000:
                     return mp3_path
-
                 return enhanced_path
 
             if status in ("failed", "error"):
-                print(f"Adobe Podcast: ошибка обработки, используем исходный")
                 return mp3_path
 
-    print("Adobe Podcast: таймаут, используем исходный")
     return mp3_path
-
 
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
-    # Копируем файл с явным именем .mp3 — Whisper определяет формат строго по имени файла
     safe_path = mp3_path.parent / (mp3_path.stem + ".mp3")
     if safe_path != mp3_path:
         import shutil
@@ -199,7 +162,6 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
     text = response.choices[0].message.content
     title = description = ""
     
-    # Защита от маркдауна и парсинг строк
     for line in text.splitlines():
         clean_line = line.strip().replace("**", "")
         if clean_line.upper().startswith("ЗАГОЛОВОК:"):
@@ -224,100 +186,70 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await page.wait_for_url("**/dashboard**")
             await page.wait_for_load_state("networkidle")
             await asyncio.sleep(3)
-            print("mave: залогинились")
 
-            # 2. Убиваем все модалки через JS
+            # 2. Очистка всплывающих окон
             await page.evaluate("""() => {
                 document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e => e.remove());
                 document.querySelectorAll('.q-overlay, .q-dialog__backdrop').forEach(e => e.remove());
                 document.body.classList.remove('q-body--prevent-scroll', 'q-body--force-scrollbar-x');
             }""")
             await asyncio.sleep(1)
-            await page.screenshot(path="/tmp/mave_01_dashboard.png")
 
             # 3. Клик "Добавить выпуск"
             await page.locator('text=Добавить выпуск').first.click()
             await asyncio.sleep(3)
             await page.wait_for_load_state("networkidle")
-            await page.screenshot(path="/tmp/mave_02_after_click.png")
-            print(f"mave: после клика, URL={page.url}")
 
-            # 4. Ищем поле загрузки
+            # 4. Поиск формы и загрузка
             await page.wait_for_selector('input[type="file"]', timeout=15000)
-            await page.screenshot(path="/tmp/mave_03_form.png")
-            print("mave: форма найдена")
-
-            # 5. Загружаем файл
             await page.set_input_files('input[type="file"]', str(mp3_path))
-            print(f"mave: файл отправлен: {mp3_path.name}")
             await asyncio.sleep(5)
 
-            # 6. Ждём завершения загрузки — проверяем HTML каждые 5 сек
-            print("mave: ждём завершения загрузки...")
+            # 5. Ожидание загрузки аудио (цикл ожидания)
             for i in range(24):
                 await asyncio.sleep(5)
                 html = await page.content()
-                if any(x in html for x in [
-                    "audio-player", "upload-progress-done", "waveform",
-                    "Опубликовать", "Сохранить", "Название выпуска", "episode-title"
-                ]):
-                    print(f"mave: загрузка завершена (шаг {i+1})")
+                if any(x in html for x in ["audio-player", "upload-progress-done", "waveform", "Опубликовать", "Сохранить", "Название выпуска", "episode-title"]):
                     break
-                print(f"mave: ещё ждём ({i+1}/24)...")
 
-            await page.screenshot(path="/tmp/mave_04_after_upload.png")
-            html = await page.content()
-            print(f"mave: HTML (500 символов): {html[:500]}")
-
-            # 7. Заголовок
-            for sel in ['input[placeholder*="Название"]', 'input[placeholder*="название"]',
-                        'input[name="title"]', 'input[type="text"]']:
+            # 6. Вставка заголовка
+            for sel in ['input[placeholder*="Название"]', 'input[placeholder*="название"]', 'input[name="title"]', 'input[type="text"]']:
                 try:
                     el = page.locator(sel).first
                     if await el.count() > 0:
                         await el.fill(title)
-                        print(f"mave: заголовок → {sel}")
                         break
                 except Exception:
                     continue
 
-            # 8. Описание
-            for sel in ['.ProseMirror', 'div[contenteditable="true"]',
-                        'textarea[placeholder*="писание"]', 'textarea[name="description"]']:
+            # 7. Вставка описания
+            for sel in ['.ProseMirror', 'div[contenteditable="true"]', 'textarea[placeholder*="писание"]', 'textarea[name="description"]']:
                 try:
                     el = page.locator(sel).first
                     if await el.count() > 0:
                         await el.fill(description)
-                        print(f"mave: описание → {sel}")
                         break
                 except Exception:
                     continue
 
-            await page.screenshot(path="/tmp/mave_05_filled.png")
-
-            # 9. Публикуем
+            # 8. Публикация
             for btn_text in ["Опубликовать", "Сохранить", "Publish", "Save"]:
                 try:
                     btn = page.locator(f'button:has-text("{btn_text}")').first
                     if await btn.count() > 0:
                         await btn.click()
-                        print(f"mave: кнопка '{btn_text}' нажата")
                         break
                 except Exception:
                     continue
 
             await asyncio.sleep(5)
-            await page.screenshot(path="/tmp/mave_06_done.png")
-            print(f"mave: готово, URL={page.url}")
             return True
 
         except Exception as e:
             await page.screenshot(path="/tmp/mave_error.png")
-            print(f"Ошибка mave: {e}")
-            raise RuntimeError(f"Ошибка загрузки в mave: {e}")
+            raise RuntimeError(f"{e}")
         finally:
             await browser.close()
-
 
 async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -330,8 +262,8 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Улучшаю звук...")
-        studio_mp3 = await enhance_audio(mp3) if AUPHONIC_USER else mp3
+        await msg.edit_text("🎙️ Улучшаю звук (Adobe Podcast)...")
+        studio_mp3 = await enhance_audio(mp3) 
 
         await msg.edit_text("📝 Транскрибирую (Whisper)...")
         transcript = transcribe(studio_mp3)
@@ -364,16 +296,28 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     data = pending.get(user_id)
+    
     if not data:
         await query.edit_message_text("❌ Данные устарели. Запиши заново.")
         return
+        
     await query.edit_message_text("⏳ Загружаю в mave.digital...")
     try:
+        if os.path.exists("/tmp/mave_error.png"):
+            os.remove("/tmp/mave_error.png")
+            
         await upload_to_mave(data["mp3"], data["title"], data["description"])
         await query.edit_message_text(f"✅ *Опубликовано!*\n\n_{data['title']}_\n\nСкоро появится на площадках.", parse_mode=ParseMode.MARKDOWN)
         pending.pop(user_id, None)
     except Exception as e:
-        await query.edit_message_text(f"❌ Ошибка загрузки: {e}\n\nПопробуй залить вручную.")
+        if os.path.exists("/tmp/mave_error.png"):
+            await query.message.reply_photo(
+                photo=open("/tmp/mave_error.png", "rb"), 
+                caption=f"❌ Ошибка Mave! Посмотри на скриншот браузера, чтобы понять, что пошло не так."
+            )
+            await query.edit_message_text("❌ Ошибка загрузки. Скриншот отправлен отдельным сообщением.")
+        else:
+            await query.edit_message_text(f"❌ Ошибка загрузки: {e}")
 
 async def button_edit(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -437,7 +381,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
     
-    print("Бот v2 запущен (только OpenAI)...")
+    print("Бот v2 запущен (Adobe Podcast + Скриншоты ошибок)...")
     app.run_polling()
 
 if __name__ == "__main__":
