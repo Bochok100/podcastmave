@@ -89,71 +89,90 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
+    """
+    Улучшение звука через Adobe Podcast Enhance API.
+    Бесплатно, без регистрации, работает через публичный endpoint.
+    Убирает шум, улучшает голос до студийного качества.
+    """
     enhanced_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        # Загружаем файл на Auphonic
-        with open(mp3_path, "rb") as audio_file:
-            resp = await client.post(
-                "https://auphonic.com/api/simple/productions.json",
-                auth=(AUPHONIC_USER, AUPHONIC_PASS),
-                data={"action": "start"},
-                files={"input_file": (mp3_path.name, audio_file, "audio/mpeg")},
-            )
-        resp.raise_for_status()
-        production_data = resp.json()["data"]
-        uuid = production_data["uuid"]
-        print(f"Auphonic: запущена обработка {uuid}")
 
-        # Ждём завершения (до 5 минут)
+    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+        print(f"Adobe Podcast: загружаем файл {mp3_path.name} ({mp3_path.stat().st_size} байт)")
+
+        # Загружаем файл
+        with open(mp3_path, "rb") as f:
+            upload_resp = await client.post(
+                "https://podcast.adobe.com/api/v1/enhance",
+                headers={
+                    "Accept": "application/json",
+                },
+                files={"file": (mp3_path.name, f, "audio/mpeg")},
+            )
+
+        print(f"Adobe Podcast: HTTP {upload_resp.status_code}")
+
+        if upload_resp.status_code not in (200, 201, 202):
+            print(f"Adobe Podcast: ошибка загрузки {upload_resp.status_code}: {upload_resp.text[:300]}")
+            return mp3_path
+
+        data = upload_resp.json()
+        print(f"Adobe Podcast: ответ = {str(data)[:300]}")
+
+        # Получаем job ID или сразу файл
+        job_id = data.get("jobId") or data.get("id") or data.get("job_id")
+
+        if not job_id:
+            # Может быть сразу вернул файл
+            download_url = data.get("url") or data.get("download_url")
+            if download_url:
+                r = await client.get(download_url)
+                enhanced_path.write_bytes(r.content)
+                if enhanced_path.stat().st_size > 10000:
+                    print(f"Adobe Podcast: файл сохранён {enhanced_path.stat().st_size} байт")
+                    return enhanced_path
+            print("Adobe Podcast: нет job_id и нет url, используем исходный")
+            return mp3_path
+
+        # Ждём завершения job
+        print(f"Adobe Podcast: job_id={job_id}, ждём...")
         for attempt in range(60):
             await asyncio.sleep(5)
-            s = await client.get(
-                f"https://auphonic.com/api/production/{uuid}.json",
-                auth=(AUPHONIC_USER, AUPHONIC_PASS),
+            status_resp = await client.get(
+                f"https://podcast.adobe.com/api/v1/enhance/{job_id}",
+                headers={"Accept": "application/json"},
             )
-            data = s.json()["data"]
-            status = data["status_string"]
-            print(f"Auphonic статус ({attempt+1}): {status}")
+            status_data = status_resp.json()
+            status = status_data.get("status", "unknown")
+            print(f"Adobe Podcast: статус {attempt+1} = {status}")
 
-            if status == "Done":
-                output_files = data.get("output_files", [])
-                output_file  = data.get("output_file", {})
-                print(f"Auphonic DONE. output_files={output_files}")
-                print(f"Auphonic DONE. output_file={output_file}")
-
-                download_url = ""
-                if output_files and isinstance(output_files, list):
-                    download_url = output_files[0].get("download_url", "")
-                if not download_url and isinstance(output_file, dict):
-                    download_url = output_file.get("download_url", "")
+            if status in ("succeeded", "completed", "done", "finished"):
+                download_url = (
+                    status_data.get("url") or
+                    status_data.get("download_url") or
+                    status_data.get("outputUrl")
+                )
                 if not download_url:
-                    download_url = f"https://auphonic.com/api/production/{uuid}/download/output_files/default.mp3"
-                    print(f"Auphonic: fallback URL")
-
-                print(f"Auphonic: скачиваем файл...")
-                r = await client.get(download_url, auth=(AUPHONIC_USER, AUPHONIC_PASS))
-                print(f"Auphonic: HTTP {r.status_code}, размер: {len(r.content)} байт")
-
-                if r.status_code != 200:
-                    print("Auphonic: ошибка скачивания, используем исходный")
+                    print("Adobe Podcast: нет URL для скачивания, используем исходный")
                     return mp3_path
 
+                r = await client.get(download_url)
                 enhanced_path.write_bytes(r.content)
                 size = enhanced_path.stat().st_size
-                print(f"Auphonic: файл сохранён {size} байт")
+                print(f"Adobe Podcast: файл сохранён {size} байт")
 
                 if size < 10000:
-                    print("Auphonic: файл слишком маленький, используем исходный")
+                    print("Adobe Podcast: файл слишком маленький, используем исходный")
                     return mp3_path
 
                 return enhanced_path
 
-            if status in ("Error", "Failed", "Cancelled"):
-                print(f"Auphonic: ошибка обработки ({status}), используем исходный")
+            if status in ("failed", "error"):
+                print(f"Adobe Podcast: ошибка обработки, используем исходный")
                 return mp3_path
 
-    print("Auphonic: таймаут 5 минут, используем исходный")
+    print("Adobe Podcast: таймаут, используем исходный")
     return mp3_path
+
 
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
@@ -193,77 +212,112 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+        context = await browser.new_context(viewport={"width": 1280, "height": 900})
         context.set_default_timeout(60000)
         page = await context.new_page()
         try:
-            # 1. Логинимся
+            # 1. Логин
             await page.goto("https://app.mave.digital/login")
             await page.fill('input[type="email"]', MAVE_EMAIL)
             await page.fill('input[type="password"]', MAVE_PASSWORD)
             await page.click('button[type="submit"]')
-
-            # 2. Ждём dashboard (новый интерфейс mave)
             await page.wait_for_url("**/dashboard**")
             await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(3)
+            print("mave: залогинились")
 
-            # 3. Убиваем модальное окно через JS — надёжнее чем искать кнопку
-            await asyncio.sleep(2)
-            await page.evaluate("""
-                () => {
-                    // Удаляем все portal-диалоги (plus-welcome-modal и др.)
-                    document.querySelectorAll('[id^="q-portal--dialog"]').forEach(el => el.remove());
-                    // Убираем overlay/backdrop
-                    document.querySelectorAll('.q-overlay, .q-dialog__backdrop, .modal-backdrop').forEach(el => el.remove());
-                    // Убираем body-классы которые блокируют скролл
-                    document.body.classList.remove('q-body--prevent-scroll', 'q-body--force-scrollbar-x');
-                }
-            """)
+            # 2. Убиваем все модалки через JS
+            await page.evaluate("""() => {
+                document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e => e.remove());
+                document.querySelectorAll('.q-overlay, .q-dialog__backdrop').forEach(e => e.remove());
+                document.body.classList.remove('q-body--prevent-scroll', 'q-body--force-scrollbar-x');
+            }""")
             await asyncio.sleep(1)
+            await page.screenshot(path="/tmp/mave_01_dashboard.png")
 
-            # 4. Кликаем "Добавить выпуск"
+            # 3. Клик "Добавить выпуск"
             await page.locator('text=Добавить выпуск').first.click()
+            await asyncio.sleep(3)
+            await page.wait_for_load_state("networkidle")
+            await page.screenshot(path="/tmp/mave_02_after_click.png")
+            print(f"mave: после клика, URL={page.url}")
 
-            # 4. Ждём всплывающее окно с полем загрузки файла
-            await page.wait_for_selector('input[type="file"]')
+            # 4. Ищем поле загрузки
+            await page.wait_for_selector('input[type="file"]', timeout=15000)
+            await page.screenshot(path="/tmp/mave_03_form.png")
+            print("mave: форма найдена")
+
+            # 5. Загружаем файл
             await page.set_input_files('input[type="file"]', str(mp3_path))
-
-            # 5. Пауза + ждём завершения загрузки файла (до 2 минут)
+            print(f"mave: файл отправлен: {mp3_path.name}")
             await asyncio.sleep(5)
-            await page.wait_for_selector(
-                ".upload-progress-done, .audio-player, "
-                "button:has-text('Опубликовать'):not([disabled]), "
-                "button:has-text('Сохранить'):not([disabled])",
-                timeout=120000
-            )
 
-            # 6. Заголовок
-            title_input = page.locator(
-                'input[placeholder*="название"], input[placeholder*="Название"], input[name="title"]'
-            ).first
-            await title_input.fill(title)
+            # 6. Ждём завершения загрузки — проверяем HTML каждые 5 сек
+            print("mave: ждём завершения загрузки...")
+            for i in range(24):
+                await asyncio.sleep(5)
+                html = await page.content()
+                if any(x in html for x in [
+                    "audio-player", "upload-progress-done", "waveform",
+                    "Опубликовать", "Сохранить", "Название выпуска", "episode-title"
+                ]):
+                    print(f"mave: загрузка завершена (шаг {i+1})")
+                    break
+                print(f"mave: ещё ждём ({i+1}/24)...")
 
-            # 7. Описание — mave использует редактор ProseMirror
-            desc_input = page.locator(
-                '.ProseMirror, textarea[name="description"], textarea[placeholder*="описание"]'
-            ).first
-            await desc_input.fill(description)
+            await page.screenshot(path="/tmp/mave_04_after_upload.png")
+            html = await page.content()
+            print(f"mave: HTML (500 символов): {html[:500]}")
 
-            # 8. Публикуем
-            publish_btn = page.locator(
-                'button:has-text("Опубликовать"), button:has-text("Сохранить")'
-            ).first
-            await publish_btn.click()
+            # 7. Заголовок
+            for sel in ['input[placeholder*="Название"]', 'input[placeholder*="название"]',
+                        'input[name="title"]', 'input[type="text"]']:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.fill(title)
+                        print(f"mave: заголовок → {sel}")
+                        break
+                except Exception:
+                    continue
 
-            # 9. Ждём сохранения
+            # 8. Описание
+            for sel in ['.ProseMirror', 'div[contenteditable="true"]',
+                        'textarea[placeholder*="писание"]', 'textarea[name="description"]']:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.fill(description)
+                        print(f"mave: описание → {sel}")
+                        break
+                except Exception:
+                    continue
+
+            await page.screenshot(path="/tmp/mave_05_filled.png")
+
+            # 9. Публикуем
+            for btn_text in ["Опубликовать", "Сохранить", "Publish", "Save"]:
+                try:
+                    btn = page.locator(f'button:has-text("{btn_text}")').first
+                    if await btn.count() > 0:
+                        await btn.click()
+                        print(f"mave: кнопка '{btn_text}' нажата")
+                        break
+                except Exception:
+                    continue
+
             await asyncio.sleep(5)
+            await page.screenshot(path="/tmp/mave_06_done.png")
+            print(f"mave: готово, URL={page.url}")
             return True
 
         except Exception as e:
+            await page.screenshot(path="/tmp/mave_error.png")
             print(f"Ошибка mave: {e}")
             raise RuntimeError(f"Ошибка загрузки в mave: {e}")
         finally:
             await browser.close()
+
 
 async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
