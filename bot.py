@@ -1,7 +1,7 @@
 """
 Podcast Bot v2 — автоматизация подкаста
-- Студийная обработка аудио через ElevenLabs (Voice Isolator)
-- Загрузка в mave.digital со скриншотами ошибок в Telegram
+- Студийная обработка аудио через ElevenLabs (с выводом ошибок в Telegram)
+- Загрузка в mave.digital с ФОТООТЧЕТОМ после публикации
 """
 
 import os
@@ -89,15 +89,13 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
-    """ Нейросетевое улучшение звука (Студийное качество через ElevenLabs Voice Isolation) """
+    """ Нейросетевое улучшение звука. Выдает жесткую ошибку, если что-то не так. """
     if not ELEVENLABS_API_KEY:
-        print("ElevenLabs: нет ключа, пропускаем обработку")
-        return mp3_path
+        raise RuntimeError("Ключ ELEVENLABS_API_KEY не найден в настройках Render!")
 
     enhanced_path = mp3_path.with_stem(mp3_path.stem + "_studio")
 
     async with httpx.AsyncClient(timeout=300) as client:
-        print(f"ElevenLabs: отправляем файл {mp3_path.name} на студийную обработку...")
         with open(mp3_path, "rb") as f:
             resp = await client.post(
                 "https://api.elevenlabs.io/v1/audio-isolation",
@@ -108,13 +106,13 @@ async def enhance_audio(mp3_path: Path) -> Path:
                 files={"audio": (mp3_path.name, f, "audio/mpeg")},
             )
 
-        if resp.status_code == 200:
-            enhanced_path.write_bytes(resp.content)
-            print(f"ElevenLabs: звук успешно улучшен ({enhanced_path.stat().st_size} байт)")
-            return enhanced_path
-        else:
-            print(f"Ошибка ElevenLabs: {resp.status_code} - {resp.text}")
-            return mp3_path
+        # Если ElevenLabs недоволен, прерываем всё и выводим ошибку в Telegram
+        if resp.status_code != 200:
+            error_msg = f"Отказ ElevenLabs (Код {resp.status_code}): {resp.text}"
+            raise RuntimeError(error_msg)
+
+        enhanced_path.write_bytes(resp.content)
+        return enhanced_path
 
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
@@ -211,16 +209,24 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
                     continue
 
             # 8. Публикация
+            published = False
             for btn_text in ["Опубликовать", "Сохранить", "Publish", "Save"]:
                 try:
                     btn = page.locator(f'button:has-text("{btn_text}")').first
                     if await btn.count() > 0:
                         await btn.click()
+                        published = True
                         break
                 except Exception:
                     continue
 
+            # Даем сайту 5 секунд на реакцию и ДЕЛАЕМ ФИНАЛЬНЫЙ СКРИНШОТ
             await asyncio.sleep(5)
+            await page.screenshot(path="/tmp/mave_done.png")
+            
+            if not published:
+                raise RuntimeError("Не смог найти ни кнопку 'Опубликовать', ни 'Сохранить'.")
+
             return True
 
         except Exception as e:
@@ -279,21 +285,30 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Данные устарели. Запиши заново.")
         return
         
-    await query.edit_message_text("⏳ Загружаю в mave.digital...")
+    await query.edit_message_text("⏳ Загружаю в mave.digital (это займет около минуты)...")
     try:
-        if os.path.exists("/tmp/mave_error.png"):
-            os.remove("/tmp/mave_error.png")
+        # Удаляем старые скрины
+        if os.path.exists("/tmp/mave_error.png"): os.remove("/tmp/mave_error.png")
+        if os.path.exists("/tmp/mave_done.png"): os.remove("/tmp/mave_done.png")
             
         await upload_to_mave(data["mp3"], data["title"], data["description"])
-        await query.edit_message_text(f"✅ *Опубликовано!*\n\n_{data['title']}_\n\nСкоро появится на площадках.", parse_mode=ParseMode.MARKDOWN)
+        
+        # Отправляем ФОТООТЧЕТ
+        success_text = f"✅ *Действие завершено!*\n\n_{data['title']}_\n\nПосмотри на скриншот ниже, чтобы увидеть результат на сайте."
+        if os.path.exists("/tmp/mave_done.png"):
+            await query.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"), caption=success_text, parse_mode=ParseMode.MARKDOWN)
+            await query.delete() # удаляем старое сообщение "Загружаю..."
+        else:
+            await query.edit_message_text(success_text, parse_mode=ParseMode.MARKDOWN)
+            
         pending.pop(user_id, None)
     except Exception as e:
         if os.path.exists("/tmp/mave_error.png"):
             await query.message.reply_photo(
                 photo=open("/tmp/mave_error.png", "rb"), 
-                caption=f"❌ Ошибка Mave! Посмотри на скриншот браузера, чтобы понять, что пошло не так."
+                caption=f"❌ Ошибка Mave! Скриншот браузера в момент сбоя прикреплен."
             )
-            await query.edit_message_text("❌ Ошибка загрузки. Скриншот отправлен отдельным сообщением.")
+            await query.delete()
         else:
             await query.edit_message_text(f"❌ Ошибка загрузки: {e}")
 
@@ -359,7 +374,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
     
-    print("Бот v2 запущен (ElevenLabs Студия + Скриншоты Mave)...")
+    print("Бот v2 запущен (ElevenLabs Проверка + Фотоотчет Mave)...")
     app.run_polling()
 
 if __name__ == "__main__":
