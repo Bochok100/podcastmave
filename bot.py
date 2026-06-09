@@ -75,12 +75,17 @@ async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await file.download_to_drive(tmp.name)
     return Path(tmp.name)
 
-def convert_to_mp3(ogg_path: Path) -> Path:
-    mp3_path = ogg_path.with_suffix(".mp3")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(ogg_path), "-q:a", "2", str(mp3_path)],
-        check=True, capture_output=True
+def convert_to_mp3(input_path: Path) -> Path:
+    mp3_path = input_path.with_suffix(".mp3")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(input_path),
+         "-ar", "44100", "-ac", "1", "-q:a", "4", str(mp3_path)],
+        capture_output=True, text=True
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg ошибка: {result.stderr[-300:]}")
+    if not mp3_path.exists() or mp3_path.stat().st_size < 1000:
+        raise RuntimeError("ffmpeg не создал файл MP3")
     return mp3_path
 
 async def enhance_audio(mp3_path: Path) -> Path:
@@ -111,10 +116,14 @@ async def enhance_audio(mp3_path: Path) -> Path:
     return mp3_path
 
 def transcribe(mp3_path: Path) -> str:
+    # Whisper требует имя файла с правильным расширением
     client = openai.OpenAI(api_key=OPENAI_KEY)
     with open(mp3_path, "rb") as f:
+        # Передаём кортеж (имя, данные, тип) — Whisper определяет формат по имени
         return client.audio.transcriptions.create(
-            model="whisper-1", file=f, language="ru"
+            model="whisper-1",
+            file=(mp3_path.name, f, "audio/mpeg"),
+            language="ru"
         ).text
 
 def generate_metadata(transcript: str) -> tuple[str, str]:
