@@ -1,8 +1,7 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Multi-lang Upload)
-- Мультиязычный поиск кнопки загрузки (Choose/Выбрать/Загрузить)
-- Жесткий таймаут для резервной загрузки (защита от зависаний)
-- Исправлен тайминг после ввода пароля
+Podcast Bot v2 (Xvfb + Safe Screenshots + Pre-Upload Diagnostic)
+- Контрольный скриншот ПЕРЕД попыткой загрузки (чтобы видеть интерфейс)
+- Улучшенный алгоритм поиска кнопки Choose files через Regex
 - Интерактивный перехват 2FA-кода
 """
 
@@ -138,14 +137,11 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await asyncio.sleep(5)
 
                 if "auth" not in page.url:
-                    print("Adobe: Ищем кнопку Sign In глобальным скриптом...")
                     try:
                         await page.evaluate("""() => {
                             const elements = Array.from(document.querySelectorAll('a, button'));
                             const signIn = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === 'sign in');
-                            if (signIn) {
-                                signIn.click();
-                            }
+                            if (signIn) { signIn.click(); }
                         }""")
                         await asyncio.sleep(5)
                     except Exception:
@@ -238,40 +234,36 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
 
-                print("Adobe: Личный кабинет открыт! Ищем кнопку выбора файла...")
-                
-                # === МУЛЬТИЯЗЫЧНАЯ ЗАГРУЗКА И БЕЗОПАСНЫЙ ФОЛБЭК ===
+                # =================================================================
+                # ДИАГНОСТИЧЕСКИЙ СКРИНШОТ ПЕРЕД ЗАГРУЗКОЙ (Гарантированная отправка)
+                # =================================================================
+                print("Adobe: Панель загрузки найдена. Делаю скриншот перед кликом...")
                 try:
-                    # Попытка 1: Нативный File Chooser (Умный клик по кнопке на Рус/Англ)
-                    async with page.expect_file_chooser(timeout=15000) as fc_info:
-                        await page.evaluate("""() => {
-                            const elements = Array.from(document.querySelectorAll('button, label, span, div[role="button"]'));
-                            const btn = elements.find(el => {
-                                const t = el.innerText ? el.innerText.trim().toLowerCase() : '';
-                                return t.includes('choose') || t.includes('выбрать') || t.includes('загрузить') || t.includes('upload');
-                            });
-                            if (btn) btn.click();
-                        }""")
+                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=8000)
+                    if send_screenshot:
+                        await send_screenshot("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой файла. Если бот сейчас выдаст ошибку, мы увидим причину на этой картинке!")
+                except Exception as e:
+                    print(f"Не удалось сделать предварительный скриншот: {e}")
+
+                print("Adobe: Ищем кнопку выбора файла...")
+                try:
+                    # Умный поиск кнопки загрузки через Playwright (Regex)
+                    upload_btn = page.locator('text=/(choose|выбрать|загрузить|upload)/i').first
+                    
+                    async with page.expect_file_chooser(timeout=10000) as fc_info:
+                        await upload_btn.click(force=True) # force=True игнорирует перекрывающие баннеры
                     
                     file_chooser = await fc_info.value
                     await file_chooser.set_files(str(mp3_path))
-                    print("Adobe: Файл успешно передан через системный диалог!")
+                    print("Adobe: Файл передан через системный диалог!")
                     
                 except Exception as e:
-                    print(f"Adobe: File Chooser не сработал. Ошибка: {e}. Пробуем прямой инжект...")
+                    print(f"Adobe: File Chooser не сработал. Ошибка: {e}. Пробуем отправить напрямую в DOM...")
                     
-                    # Попытка 2: Принудительный показ скрытого инпута
-                    await page.evaluate("""() => {
-                        let inp = document.querySelector('input[type="file"]');
-                        if (inp) {
-                            inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
-                        }
-                    }""")
-                    await asyncio.sleep(1)
-                    # Жесткий таймаут в 10 секунд, чтобы скрипт больше не висел бесконечно
-                    await page.set_input_files('input[type="file"]', str(mp3_path), timeout=10000)
-                    print("Adobe: Файл загружен через скрытый input!")
-                # =================================================================
+                    # Жесткая попытка загрузить файл, даже если input скрыт
+                    input_locator = page.locator('input[type="file"]').first
+                    await input_locator.set_input_files(str(mp3_path), timeout=10000)
+                    print("Adobe: Файл загружен в скрытый input!")
 
                 await asyncio.sleep(3)
 
@@ -311,11 +303,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
             except Exception as e:
                 original_error = str(e)[:150]
                 print(f"Сработал except: {original_error}")
-                try:
-                    await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
-                    await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
-                except Exception:
-                    pass
+                # Если упадет ЗДЕСЬ, мы хотя бы уже получили скриншот ДО ошибки!
                 raise RuntimeError(f"{original_error}")
             finally:
                 await browser.close()
