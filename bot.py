@@ -1,9 +1,9 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Sync Fix)
-- Исправлен тайминг после ввода пароля (ожидание 3-5 секунд редиректа)
-- Поддержка русского интерфейса авторизации Adobe ("Продолжить", "Войти")
-- Безопасные скриншоты (timeout=5000)
-- Интерактивный перехват 2FA-кода из чата Telegram
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + FileChooser Fix)
+- Использование нативного file_chooser вместо хака скрытого input
+- Исправлен тайминг после ввода пароля
+- Поддержка русского интерфейса авторизации
+- Интерактивный перехват 2FA-кода
 """
 
 import os
@@ -58,7 +58,7 @@ STYLE_PROMPT = """
 """
 
 pending = {}
-adobe_2fa_state = {}  # Глобальное хранилище для перехвата 2FA-кода
+adobe_2fa_state = {}
 
 # ──────────────────────────────────────────────
 # ЧЕСТНЫЙ HTTP-СЕРВЕР ДЛЯ СЛУЖБЫ ПОДДЕРЖКИ RENDER
@@ -137,7 +137,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                # Глобальный JS-клик для гостевой страницы
                 if "auth" not in page.url:
                     print("Adobe: Ищем кнопку Sign In глобальным скриптом...")
                     try:
@@ -152,7 +151,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     except Exception:
                         pass
 
-                # Ввод Email / Пароля
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Вводим почту...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
@@ -166,9 +164,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                     await asyncio.sleep(4)
                     
-                    # Проверка 2FA (Личность)
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
-                        print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем код...")
+                        print("Adobe: Запрашиваем 2FA код...")
                         try:
                             await page.locator('button:has-text("Продолжить")').first.evaluate("node => node.click()")
                         except:
@@ -207,7 +204,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         finally:
                             adobe_2fa_state.pop(user_id, None)
 
-                    # Ввод пароля
                     if await page.locator('input[type="password"], #password').count() > 0:
                         print("Adobe: Вводим пароль...")
                         await page.locator('input[type="password"], #password').first.fill(ADOBE_PASSWORD)
@@ -217,15 +213,10 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                                 if await el.count() > 0: await el.evaluate("node => node.click()"); break
                             except Exception: continue
 
-                    # === КРИТИЧЕСКИЙ ФИКС: ТЕРПЕЛИВОЕ ОЖИДАНИЕ РЕДИРЕНТА (До 20 секунд) ===
-                    print("Adobe: Вход выполнен. Замираем и ждем завершения редиректов...")
+                    print("Adobe: Ждем завершения редиректов...")
                     for _ in range(20):
-                        # Если в URL появилось слово enhance, и мы ушли с серверов логина auth/ims — сессия закрепилась!
                         if "enhance" in page.url and "auth" not in page.url and "ims" not in page.url:
-                            print(f"Adobe: Успешный переход зафиксирован на URL: {page.url}")
                             break
-                        
-                        # Если всплывают окна "Оставаться в системе?" или привязка телефона — кликаем "Да"/"Пропустить" через JS
                         if "adobelogin" in page.url or "auth" in page.url:
                             try:
                                 await page.evaluate("""() => {
@@ -239,27 +230,38 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             except:
                                 pass
                         await asyncio.sleep(1)
-                    await asyncio.sleep(3) # Финальные 3 секунды для полной отрисовки React-компонентов
+                    await asyncio.sleep(3)
 
-                # Страховочная проверка: если редирект не дошел до конца, плавно обновляем страницу
                 if "enhance" not in page.url or "auth" in page.url:
-                    print("Adobe: Сессия готова, делаем чистый переход на панель Enhance...")
+                    print("Adobe: Делаем чистый переход на панель Enhance...")
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
 
-                print("Adobe: Личный кабинет открыт! Ищем поле загрузки подкаста...")
-                await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
+                print("Adobe: Личный кабинет открыт! Ищем кнопку 'Choose files'...")
                 
-                await page.evaluate("""() => {
-                    document.querySelectorAll('input[type="file"]').forEach(el => {
-                        el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
-                    });
-                }""")
-                await asyncio.sleep(1)
+                # === НОВЫЙ СПОСОБ ЗАГРУЗКИ (Нативный File Chooser Playwright) ===
+                try:
+                    # Ждем, пока браузер сам перехватит окно выбора файла
+                    async with page.expect_file_chooser(timeout=20000) as fc_info:
+                        # Кликаем по кнопке или всей фиолетовой зоне загрузки
+                        await page.locator('button:has-text("Choose files"), label:has-text("Choose files")').first.click()
+                    
+                    file_chooser = await fc_info.value
+                    await file_chooser.set_files(str(mp3_path))
+                    print("Adobe: Файл передан через системный диалог!")
+                except Exception as e:
+                    print(f"Adobe: Клик по Choose files не сработал. Ошибка: {e}. Пробуем старый метод...")
+                    # Резервный метод на всякий случай
+                    await page.evaluate("""() => {
+                        document.querySelectorAll('input[type="file"]').forEach(el => {
+                            el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
+                        });
+                    }""")
+                    await asyncio.sleep(1)
+                    await page.set_input_files('input[type="file"]', str(mp3_path))
+                # =================================================================
 
-                await page.set_input_files('input[type="file"]', str(mp3_path))
-                print(f"Adobe: Файл загружен в инпут")
                 await asyncio.sleep(3)
 
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
@@ -303,7 +305,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
                 except Exception:
                     pass
-                
                 raise RuntimeError(f"{original_error}")
             finally:
                 await browser.close()
@@ -434,7 +435,6 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-# === ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ТЕКСТА ДЛЯ ВВОДА 2FA КОДА ===
 async def handle_global_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in adobe_2fa_state:
