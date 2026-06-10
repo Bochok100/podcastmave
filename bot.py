@@ -1,11 +1,9 @@
 """
-Podcast Bot v2 (Xvfb Headed Bypass + Raw Socket Server + Diagnostics)
-- Запуск в Headed-режиме через виртуальный монитор (xvfb) для 100% обхода Cloudflare
-- Родные отпечатки браузера (без конфликтов User-Agent)
-- Диагностический скриншот сразу после захода на Adobe Podcast
-- Оптимизация памяти под 512MB
+Podcast Bot v2 (Xvfb Background + Pure HTTP Server)
+- Запуск Xvfb в фоне через Docker для 100% обхода Cloudflare
+- Родные отпечатки браузера в headed-режиме (headless=False)
+- Честный HTTP-сервер для прохождения пинга Render (порт 10000)
 - Инжекция сессии ADOBE_COOKIES_JSON
-- Непробиваемый сокет-сервер (Dummy) для обхода таймаутов Render (порт 10000)
 """
 
 import os
@@ -15,7 +13,7 @@ import tempfile
 import subprocess
 import shutil
 import threading
-import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -62,31 +60,23 @@ STYLE_PROMPT = """
 pending = {}
 
 # ──────────────────────────────────────────────
-# ВЕБ-ЗАГЛУШКА НА СЫРЫХ СОКЕТАХ (КРИТИЧНО ДЛЯ RENDER)
+# ЧЕСТНЫЙ HTTP-СЕРВЕР ДЛЯ СЛУЖБЫ ПОДДЕРЖКИ RENDER
 # ──────────────────────────────────────────────
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and kicking!")
+        
+    def log_message(self, format, *args):
+        return # Отключаем спам логов сервера в консоль
+
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
-    # Создаем сырой TCP-сокет
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
-    try:
-        server_socket.bind(('0.0.0.0', port))
-        server_socket.listen(5)
-        print(f"✅ Dummy-сервер (Socket) успешно запущен на порту {port}. Деплой не упадет!")
-    except Exception as e:
-        print(f"❌ Ошибка запуска Dummy-сервера: {e}")
-        return
-
-    while True:
-        try:
-            client_socket, _ = server_socket.accept()
-            # Отдаем минимальный HTTP-ответ, чтобы Render был счастлив
-            response = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nBot is active!"
-            client_socket.sendall(response)
-            client_socket.close()
-        except Exception:
-            pass
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    print(f"✅ Официальный HTTP-сервер успешно запущен на порту {port}")
+    server.serve_forever()
 
 async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
     voice = update.message.voice or update.message.audio
@@ -105,7 +95,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Adobe Podcast с диагностикой)
+# 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -116,15 +106,11 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             await send_screenshot(path, caption)
 
     try:
-        print("Adobe: Запуск Chromium в ВИДИМОМ (Headed) режиме с виртуальным дисплеем...")
+        print("Adobe: Открываем Chromium в HEADED режиме (Дисплей :99)...")
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage'
-                ]
+                headless=False, # Имитируем реальный монитор
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             )
             
             context = await browser.new_context(
@@ -138,24 +124,24 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             
             try:
                 if ADOBE_COOKIES_JSON:
-                    print("Adobe: Обнаружены куки сессии! Загружаем...")
+                    print("Adobe: Подгружаем куки сессии...")
                     try:
                         cookies = json.loads(ADOBE_COOKIES_JSON)
                         await context.add_cookies(cookies)
                     except Exception as ce:
-                        print(f"Adobe: Ошибка разбора JSON куков: {ce}")
+                        print(f"Adobe: Ошибка куков: {ce}")
 
-                print("Adobe: Открываем страницу Enhance...")
+                print("Adobe: Переход на страницу Enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(5)
+                await asyncio.sleep(4)
 
-                # ДИАГНОСТИКА: Скриншот сразу после захода на страницу
+                # Диагностика
                 await page.screenshot(path="/tmp/adobe_state.png")
-                await notify("/tmp/adobe_state.png", f"Экран после загрузки сайта. URL: {page.url}")
+                await notify("/tmp/adobe_state.png", f"Статус страницы. Текущий URL: {page.url}")
 
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
-                    print("Adobe: Куки отсутствуют или протухли. Пробуем стандартный вход...")
+                    print("Adobe: Токены не подошли, пробуем ввести форму...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
                     await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
                     
@@ -180,13 +166,12 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
 
                     await page.wait_for_url("**/enhance**", timeout=60000)
                     await page.wait_for_load_state("networkidle")
-                    await asyncio.sleep(4)
 
                 if "enhance" not in page.url:
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("networkidle")
 
-                print("Adobe: Панель открыта! Ищем поле загрузки...")
+                print("Adobe: Ожидаем поле загрузки...")
                 await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
                 
                 await page.evaluate("""() => {
@@ -197,16 +182,16 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await asyncio.sleep(1)
 
                 await page.set_input_files('input[type="file"]', str(mp3_path))
-                print(f"Adobe: Файл отправлен")
+                print(f"Adobe: Файл загружен в инпут")
                 await asyncio.sleep(2)
 
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
                     try:
                         btn = page.locator(sel).first
-                        if await btn.count() > 0: await btn.click(); print(f"Adobe: Кликнули '{sel}'"); break
+                        if await btn.count() > 0: await btn.click(); break
                     except Exception: continue
 
-                print("Adobe: Ждем готовности кнопки Download (до 5 минут)...")
+                print("Adobe: Ожидание рендеринга кнопки скачивания...")
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
@@ -217,8 +202,8 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
 
                 if not download_locator:
                     await page.screenshot(path="/tmp/adobe_timeout.png")
-                    await notify("/tmp/adobe_timeout.png", "Adobe: Таймаут обработки")
-                    raise RuntimeError("Adobe: Превышено время ожидания обработки")
+                    await notify("/tmp/adobe_timeout.png", "Adobe: Тайм-аут генерации")
+                    raise RuntimeError("Adobe не отдал файл за 5 минут")
 
                 async with page.expect_download(timeout=120000) as dl_info:
                     await download_locator.click()
@@ -237,12 +222,12 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
 
             except Exception as e:
                 await page.screenshot(path="/tmp/adobe_error.png")
-                await notify("/tmp/adobe_error.png", f"Ошибка на Adobe:")
-                raise RuntimeError(f"Ошибка автоматизации Adobe: {str(e)[:150]}")
+                await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
+                raise RuntimeError(f"Ошибка Playwright Adobe: {str(e)[:150]}")
             finally:
                 await browser.close()
     except Exception as e:
-        raise RuntimeError(f"Adobe не принял файл: {e}")
+        raise RuntimeError(f"Adobe завершился ошибкой: {e}")
 
 def transcribe(mp3_path: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
@@ -268,10 +253,7 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
 
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        )
+        browser = await p.chromium.launch(headless=False, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
         context = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
         page = await context.new_page()
         try:
@@ -326,7 +308,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
                     if await btn.count() > 0: await btn.click(); published = True; break
                 except Exception: continue
 
-            if not published: raise RuntimeError("Не найдена финальная кнопка в Mave")
+            if not published: raise RuntimeError("Кнопка публикации mave не найдена")
             await asyncio.sleep(5)
             await page.screenshot(path="/tmp/mave_done.png")
             return True
@@ -345,7 +327,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Превращаю в MP3...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Загружаю в ИИ Adobe Podcast (Обход Cloudflare v3)...")
+        await msg.edit_text("🎙️ Улучшаю звук в ИИ Adobe Podcast...")
 
         async def send_screenshot(path: str, caption: str):
             try:
@@ -354,10 +336,10 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
 
         studio_mp3 = await enhance_audio(mp3, send_screenshot=send_screenshot)
 
-        await msg.edit_text("📝 Делаю расшифровку (Whisper)...")
+        await msg.edit_text("📝 Делаю расшифровку текста...")
         transcript = transcribe(studio_mp3)
 
-        await msg.edit_text("✍️ Придумываю заголовок в твоем стиле (GPT-4o)...")
+        await msg.edit_text("✍️ Создаю метаданные под твой стиль...")
         title, description = generate_metadata(transcript)
 
         pending[user_id] = {"mp3": studio_mp3, "title": title, "description": description}
@@ -367,7 +349,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("✅ Опубликовать в mave", callback_data="publish"),
             InlineKeyboardButton("✏️ Изменить", callback_data="edit")
         ], [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-        preview = f"🎙 *Выпуск готов к выгрузке*\n\n*Заголовок:*\n{title}\n\n*Описание:*\n{description}\n\nВыгружаем?"
+        preview = f"🎙 *Выпуск готов к публикации*\n\n*Заголовок:*\n{title}\n\n*Описание:*\n{description}\n\nВыгружаем?"
         await update.message.reply_document(document=open(studio_mp3, "rb"), filename=f"{title[:40]}.mp3")
         await update.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     except Exception as e:
@@ -381,7 +363,7 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     if not data:
         await query.edit_message_text("❌ Сессия устарела.")
         return
-    await query.edit_message_text("⏳ Выгружаю на хостинг mave.digital...")
+    await query.edit_message_text("⏳ Загружаю на mave.digital...")
     try:
         for f in ["/tmp/mave_error.png", "/tmp/mave_done.png"]:
             if os.path.exists(f): os.remove(f)
@@ -430,7 +412,7 @@ async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    # Запуск Dummy-сервера на сырых сокетах
+    # Стартуем честный HTTP сервер в параллельном потоке
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
     print("🚀 Запускаем Telegram-бота...")
