@@ -1,6 +1,6 @@
 """
 Podcast Bot v2 (Stealth Mode)
-- Скрытый обход защиты Cloudflare (playwright-stealth)
+- Скрытый обход защиты Cloudflare (playwright-stealth v2.0+)
 - Полностью автоматический Adobe Podcast Enhance
 - Загрузка в mave.digital
 """
@@ -22,7 +22,7 @@ from telegram.constants import ParseMode
 
 import openai
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async  # Тот самый плащ-невидимка
+from playwright_stealth import Stealth  # Обновленный импорт для версии 2.0+
 
 # ──────────────────────────────────────────────
 # Настройки
@@ -129,8 +129,8 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             
             page = await context.new_page()
             
-            # ПРИМЕНЯЕМ НЕВИДИМКУ
-            await stealth_async(page)
+            # ПРИМЕНЯЕМ НЕВИДИМКУ (Новый синтаксис v2.0)
+            await Stealth().apply_stealth_async(page)
             
             try:
                 print("Adobe: открываем сайт...")
