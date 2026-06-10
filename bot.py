@@ -1,5 +1,7 @@
 """
-Podcast Bot v3 — Adobe Podcast как человек + mave публикация
+Podcast Bot v3.1 — Adobe Session Persistence + Async Fix
+- Сохранение куки (сессии) в adobe_state.json для обхода 2FA
+- block=False для параллельного приема проверочных кодов
 """
 
 import os
@@ -33,6 +35,8 @@ ADOBE_EMAIL     = os.getenv("ADOBE_EMAIL", "")
 ADOBE_PASSWORD  = os.getenv("ADOBE_PASSWORD", "")
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 
+STATE_FILE = "adobe_state.json"
+
 EDIT_TITLE, EDIT_DESC = range(2)
 pending = {}
 adobe_2fa_state = {}
@@ -58,7 +62,6 @@ STYLE_PROMPT = """
 ТРАНСКРИПЦИЯ:
 """
 
-
 # ── HTTP сервер (Render требует порт) ──────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -78,10 +81,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         return
 
-
 def run_server():
     HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), Handler).serve_forever()
-
 
 # ── Утилиты ────────────────────────────────────
 async def download_voice(update, context) -> Path:
@@ -91,7 +92,6 @@ async def download_voice(update, context) -> Path:
     await f.download_to_drive(tmp.name)
     return Path(tmp.name)
 
-
 def to_mp3(src: Path) -> Path:
     dst = src.with_suffix(".mp3")
     subprocess.run(["ffmpeg", "-y", "-i", str(src),
@@ -99,7 +99,6 @@ def to_mp3(src: Path) -> Path:
                     "-ar", "44100", "-ac", "1", str(dst)],
                    capture_output=True)
     return dst
-
 
 # ── Adobe Podcast ──────────────────────────────
 async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
@@ -120,13 +119,19 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                   "--disable-dev-shm-usage",
                   "--disable-blink-features=AutomationControlled"]
         )
-        ctx = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36",
-        )
+        
+        # Загрузка сохраненной сессии, если она есть
+        context_args = {
+            "viewport": {"width": 1366, "height": 768},
+            "locale": "en-US",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+        if os.path.exists(STATE_FILE):
+            print("Adobe: Обнаружен файл сессии, подгружаем куки...")
+            context_args["storage_state"] = STATE_FILE
+
+        ctx = await browser.new_context(**context_args)
+        
         await ctx.add_init_script("""
             Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
             Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
@@ -143,6 +148,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe открыт. URL: {page.url}")
 
+            # Если сессия рабочая, мы уже залогинены и кнопок логина не будет.
+            # Если кнопок нет — блок авторизации (шаги 2-6) просто пропустится.
+
             # ── 2. Нажимаем Sign In если нужно ──
             if "auth" not in page.url and "ims" not in page.url:
                 try:
@@ -152,7 +160,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         if (el) el.click();
                     }""")
                     await asyncio.sleep(4)
-                    print(f"Adobe: после Sign In клика → {page.url}")
                 except Exception:
                     pass
 
@@ -171,7 +178,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         el = page.locator(sel).first
                         if await el.count() > 0:
                             await el.click()
-                            print(f"Adobe: Continue нажат")
                             break
                     except Exception:
                         continue
@@ -190,8 +196,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             code_sel = 'input[type="text"][maxlength="6"],input[name*="code"],input[autocomplete*="one-time"]'
             if await page.locator(code_sel).count() > 0:
                 print("Adobe: нужен 2FA код...")
-                await shot("/tmp/adobe_last.png",
-                           "⚠️ Adobe запросил код с почты!\nПришли мне его обычным текстом (2 минуты).")
+                await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты!\nПришли мне его обычным текстом (2 минуты).")
                 ev = asyncio.Event()
                 adobe_2fa_state[user_id] = {"event": ev, "code": ""}
                 try:
@@ -222,12 +227,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         el = page.locator(sel).first
                         if await el.count() > 0:
                             await el.click()
-                            print("Adobe: Sign in нажат")
                             break
                     except Exception:
                         continue
                 await asyncio.sleep(6)
-                await shot("/tmp/adobe_last.png", "Adobe: после пароля")
 
             # Закрываем промежуточные экраны
             for _ in range(10):
@@ -243,16 +246,19 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     break
                 await asyncio.sleep(1)
 
-            # Переходим на enhance если не там
             if "enhance" not in page.url:
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(4)
 
-            # Проверяем что залогинились
+            # Проверяем, что залогинились
             if await page.locator('input[type="email"],input[name="username"]').count() > 0:
                 await shot("/tmp/adobe_error.png", "❌ Не удалось войти в Adobe — проверь /screen")
-                raise RuntimeError("Adobe: не удалось войти. Проверь email/пароль в Render Variables")
+                raise RuntimeError("Adobe: не удалось войти. Проверь email/пароль")
+
+            # СОХРАНЕНИЕ СЕССИИ (КУКИ)
+            await ctx.storage_state(path=STATE_FILE)
+            print("✅ Adobe: сессия успешно сохранена!")
 
             # Закрываем баннеры
             try:
@@ -262,32 +268,23 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     });
                 }""")
                 await asyncio.sleep(2)
-            except Exception:
-                pass
+            except Exception: pass
 
-            await shot("/tmp/adobe_last.png", "Adobe: залогинились! Загружаем файл...")
-            print("Adobe: залогинились, загружаем файл...")
+            await shot("/tmp/adobe_last.png", "Adobe: Загружаем файл...")
 
-            # ── 7. Загрузка файла (3 стратегии) ──
+            # ── 7. Загрузка файла ──
             uploaded = False
-
-            # Стратегия 1 — скрытый input
             for frame in page.frames:
                 try:
                     for inp in await frame.locator('input[type="file"]').all():
                         try:
                             await inp.set_input_files(str(mp3), timeout=5000)
-                            print("✅ Файл через input[type=file]")
                             uploaded = True
                             break
-                        except Exception:
-                            pass
-                    if uploaded:
-                        break
-                except Exception:
-                    continue
+                        except Exception: pass
+                    if uploaded: break
+                except Exception: continue
 
-            # Стратегия 2 — file chooser
             if not uploaded:
                 for frame in page.frames:
                     try:
@@ -296,13 +293,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             async with page.expect_file_chooser(timeout=5000) as fc_info:
                                 await btn.click(force=True)
                             await (await fc_info.value).set_files(str(mp3))
-                            print("✅ Файл через file chooser")
                             uploaded = True
                             break
-                    except Exception:
-                        continue
+                    except Exception: continue
 
-            # Стратегия 3 — drag-and-drop JS
             if not uploaded:
                 with open(mp3, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode()
@@ -315,12 +309,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         document.body.dispatchEvent(new DragEvent(ev,{{bubbles:true,cancelable:true,dataTransfer:dt}}))
                     );
                 }}""")
-                print("✅ Файл через drag-and-drop JS")
                 uploaded = True
 
             await asyncio.sleep(3)
-            await shot("/tmp/adobe_last.png", "Adobe: файл загружен, жмём Enhance...")
-
+            
             # ── 8. Нажимаем Enhance ──
             for frame in page.frames:
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
@@ -328,13 +320,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         btn = frame.locator(sel).first
                         if await btn.count() > 0:
                             await btn.evaluate("n=>n.click()")
-                            print(f"Adobe: Enhance нажат")
                             break
-                    except Exception:
-                        continue
+                    except Exception: continue
 
             # ── 9. Ждём Download (до 5 минут) ──
-            print("Adobe: ждём обработку...")
             dl_btn = None
             for i in range(60):
                 await asyncio.sleep(5)
@@ -343,15 +332,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     if await b.count() > 0:
                         dl_btn = b
                         break
-                if dl_btn:
-                    print(f"Adobe: Download найден (шаг {i+1})")
-                    break
-                # Скриншот каждые 30 сек
-                if i % 6 == 5:
-                    await shot("/tmp/adobe_last.png", f"Adobe: обрабатываем... {(i+1)*5} сек")
+                if dl_btn: break
+                if i % 6 == 5: await shot("/tmp/adobe_last.png", f"Adobe: обрабатываем... {(i+1)*5} сек")
 
             if not dl_btn:
-                await shot("/tmp/adobe_error.png", "Adobe: таймаут — Download не появился за 5 минут")
                 raise RuntimeError("Adobe: Download не появился за 5 минут")
 
             await shot("/tmp/adobe_last.png", "✅ Adobe обработал! Скачиваем...")
@@ -362,12 +346,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             dl = await dl_info.value
             await dl.save_as(str(adobe))
             size = adobe.stat().st_size
-            print(f"Adobe: скачан {size} байт")
 
             if size < 10000:
                 raise RuntimeError(f"Adobe вернул пустой файл ({size} байт)")
 
-            # loudnorm
             r = subprocess.run(
                 ["ffmpeg", "-y", "-i", str(adobe),
                  "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
@@ -380,12 +362,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             try:
                 await page.screenshot(path="/tmp/adobe_error.png")
                 await notify("/tmp/adobe_error.png", f"❌ Adobe ошибка: {str(e)[:120]}")
-            except Exception:
-                pass
+            except Exception: pass
             raise RuntimeError(f"Adobe: {e}")
         finally:
             await browser.close()
-
 
 # ── mave.digital ───────────────────────────────
 async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
@@ -423,14 +403,12 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
                     if await btn.count() > 0:
                         await btn.evaluate("n=>n.click()")
                         break
-                except Exception:
-                    continue
+                except Exception: continue
 
             for _ in range(36):
                 await asyncio.sleep(5)
                 html = await page.content()
-                if any(x in html for x in ["Название выпуска", "episode-title", "upload-progress-done"]):
-                    break
+                if any(x in html for x in ["Название выпуска", "episode-title", "upload-progress-done"]): break
 
             for sel in ['input[placeholder*="Название выпуска"]', 'input[placeholder*="Название"]', 'input[name="title"]']:
                 try:
@@ -439,8 +417,7 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
                         await el.clear()
                         await el.fill(title)
                         break
-                except Exception:
-                    continue
+                except Exception: continue
 
             for sel in ['.ProseMirror', 'div[contenteditable="true"]', 'textarea[name="description"]']:
                 try:
@@ -449,8 +426,7 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
                         await el.click()
                         await el.fill(desc)
                         break
-                except Exception:
-                    continue
+                except Exception: continue
 
             published = False
             for txt in ["Опубликовать", "Сохранить выпуск", "Сохранить"]:
@@ -460,8 +436,7 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
                         await btn.evaluate("n=>n.click()")
                         published = True
                         break
-                except Exception:
-                    continue
+                except Exception: continue
 
             if not published:
                 raise RuntimeError("Кнопка публикации mave не найдена")
@@ -474,7 +449,6 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
         finally:
             await browser.close()
 
-
 # ── Транскрипция ───────────────────────────────
 def transcribe(mp3: Path) -> str:
     client = openai.OpenAI(api_key=OPENAI_KEY)
@@ -482,7 +456,6 @@ def transcribe(mp3: Path) -> str:
     shutil.copy2(mp3, safe)
     with open(safe, "rb") as f:
         return client.audio.transcriptions.create(model="whisper-1", file=f, language="ru").text
-
 
 # ── Метаданные ─────────────────────────────────
 def generate_metadata(transcript: str) -> tuple[str, str]:
@@ -496,18 +469,14 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
     title = desc = ""
     for line in text.splitlines():
         c = line.strip().replace("**", "")
-        if c.upper().startswith("ЗАГОЛОВОК:"):
-            title = c[10:].strip()
-        elif c.upper().startswith("ОПИСАНИЕ:"):
-            desc = c[9:].strip()
+        if c.upper().startswith("ЗАГОЛОВОК:"): title = c[10:].strip()
+        elif c.upper().startswith("ОПИСАНИЕ:"): desc = c[9:].strip()
     return title, desc
-
 
 # ── Telegram handlers ──────────────────────────
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if ALLOWED_USER_ID and uid != ALLOWED_USER_ID:
-        return
+    if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
     msg = await update.message.reply_text("⏳ Начинаю...")
     try:
         ogg = await download_voice(update, ctx)
@@ -520,8 +489,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 if os.path.exists(path):
                     await update.message.reply_photo(photo=open(path, "rb"), caption=f"ℹ️ {caption}")
-            except Exception:
-                pass
+            except Exception: pass
 
         studio = await enhance_audio(mp3, uid, notify)
 
@@ -547,14 +515,12 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-
 async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid in adobe_2fa_state:
         adobe_2fa_state[uid]["code"] = update.message.text.strip()
         adobe_2fa_state[uid]["event"].set()
-        await update.message.reply_text("✅ Код принят!")
-
+        await update.message.reply_text("✅ Код принят! Возвращаюсь в Adobe...")
 
 async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -569,39 +535,31 @@ async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await upload_to_mave(data["mp3"], data["title"], data["description"])
         caption = f"✅ *Опубликовано!*\n\n_{data['title']}_"
         if os.path.exists("/tmp/mave_done.png"):
-            await q.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"),
-                                        caption=caption, parse_mode=ParseMode.MARKDOWN)
+            await q.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"), caption=caption, parse_mode=ParseMode.MARKDOWN)
             await q.message.delete()
         else:
             await q.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
         pending.pop(uid, None)
     except Exception as e:
         if os.path.exists("/tmp/mave_error.png"):
-            await q.message.reply_photo(photo=open("/tmp/mave_error.png", "rb"),
-                                        caption=f"❌ mave ошибка: {e}")
+            await q.message.reply_photo(photo=open("/tmp/mave_error.png", "rb"), caption=f"❌ mave ошибка: {e}")
             await q.message.delete()
         else:
             await q.edit_message_text(f"❌ Ошибка: {e}")
-
 
 async def btn_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = pending.get(q.from_user.id)
-    await q.edit_message_text(f"✏️ Заголовок:\n*{data['title']}*\n\nНовый (или /skip):",
-                              parse_mode=ParseMode.MARKDOWN)
+    await q.edit_message_text(f"✏️ Заголовок:\n*{data['title']}*\n\nНовый (или /skip):", parse_mode=ParseMode.MARKDOWN)
     return EDIT_TITLE
-
 
 async def edit_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if update.message.text != "/skip":
         pending[uid]["title"] = update.message.text
-    await update.message.reply_text(
-        f"📝 Описание:\n_{pending[uid]['description']}_\n\nНовое (или /skip):",
-        parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📝 Описание:\n_{pending[uid]['description']}_\n\nНовое (или /skip):", parse_mode=ParseMode.MARKDOWN)
     return EDIT_DESC
-
 
 async def edit_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -612,11 +570,8 @@ async def edit_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("✅ Опубликовать", callback_data="publish"),
         InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
     ]])
-    await update.message.reply_text(
-        f"*Заголовок:* {d['title']}\n*Описание:* {d['description']}\n\nПубликуем?",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    await update.message.reply_text(f"*Заголовок:* {d['title']}\n*Описание:* {d['description']}\n\nПубликуем?", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     return ConversationHandler.END
-
 
 async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -625,14 +580,16 @@ async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("❌ Отменено.")
     return ConversationHandler.END
 
-
 # ── Запуск ─────────────────────────────────────
 def main():
     threading.Thread(target=run_server, daemon=True).start()
     print("🚀 Бот запускается...")
     try:
         app = Application.builder().token(TELEGRAM_TOKEN).build()
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text), group=-1)
+        
+        # ДОБАВЛЕНО block=False ДЛЯ РЕШЕНИЯ ПРОБЛЕМЫ DEADLOCK
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text, block=False), group=1)
+        
         conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(btn_edit, pattern="^edit$")],
             states={
@@ -642,17 +599,18 @@ def main():
             fallbacks=[CallbackQueryHandler(btn_cancel, pattern="^cancel$")],
             per_chat=True,
         )
-        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+        # block=False ПОЗВОЛЯЕТ БОТУ СЛУШАТЬ ТВОИ СООБЩЕНИЯ В ПРОЦЕССЕ ЗАГРУЗКИ АУДИО
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice, block=False))
         app.add_handler(conv)
         app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
         app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
+        
         print("✅ Бот запущен!")
         app.run_polling()
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
         while True:
             time.sleep(60)
-
 
 if __name__ == "__main__":
     main()
