@@ -1,10 +1,10 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + JS Click)
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Global JS Click)
 - Запуск Xvfb в фоне через Docker
 - Безопасные скриншоты (timeout=5000)
 - Честный HTTP-сервер для прохождения пинга Render
 - Интерактивный перехват 2FA-кода из чата Telegram
-- JS-клик для обхода невидимых перекрытий и баннеров Cookie
+- Глобальный JS-клик для обхода перерисовок DOM на Adobe
 """
 
 import os
@@ -138,24 +138,20 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                # === УЛУЧШЕННЫЙ КЛИК (ОБХОД ПЕРЕКРЫТИЙ ЧЕРЕЗ JS) ===
-                sign_in_btns = page.locator('a:has-text("Sign in"), button:has-text("Sign in")')
-                if await sign_in_btns.count() > 0 and "auth" not in page.url:
-                    print("Adobe: Найдена гостевая страница. Пробиваем кнопку 'Sign in' через JS...")
-                    clicked = False
-                    # Ищем первую реально видимую кнопку
-                    for i in range(await sign_in_btns.count()):
-                        el = sign_in_btns.nth(i)
-                        if await el.is_visible():
-                            await el.evaluate("node => node.click()") # Прямой JS-клик
-                            clicked = True
-                            break
-                    # Если все скрыты, просто бьем по первой попавшейся
-                    if not clicked:
-                        await sign_in_btns.first.evaluate("node => node.click()")
-                        
-                    await page.wait_for_load_state("domcontentloaded")
-                    await asyncio.sleep(5)
+                # === ГЛОБАЛЬНЫЙ JS-КЛИК БЕЗ ЛОКАТОРОВ PLAYWRIGHT ===
+                if "auth" not in page.url:
+                    print("Adobe: Ищем кнопку Sign In глобальным скриптом...")
+                    try:
+                        await page.evaluate("""() => {
+                            const elements = Array.from(document.querySelectorAll('a, button'));
+                            const signIn = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === 'sign in');
+                            if (signIn) {
+                                signIn.click();
+                            }
+                        }""")
+                        await asyncio.sleep(5) # Ждем, пока сработает редирект
+                    except Exception as e:
+                        print(f"Adobe: JS-клик пропущен: {e}")
                 # ====================================================
 
                 # Ввод Email / Пароля
@@ -211,7 +207,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             await page.wait_for_load_state("domcontentloaded")
                             await asyncio.sleep(5)
                         except asyncio.TimeoutError:
-                            raise RuntimeError("Таймаут: ты не успел прислать код за 2 минуты.")
+                            raise RuntimeError("Таймаут: ты не успел прислать код за 2 минут.")
                         finally:
                             adobe_2fa_state.pop(user_id, None)
                     # ===================================================
