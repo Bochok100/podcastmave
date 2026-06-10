@@ -1,6 +1,6 @@
 """
 Podcast Bot v2
-- Студийный звук через ElevenLabs API (официально, без блокировок)
+- ElevenLabs (Удаление шума) + Студийный эквалайзер (Радийный голос)
 - Загрузка в mave.digital с фотоотчётом
 """
 
@@ -81,7 +81,7 @@ async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return Path(tmp.name)
 
 # ──────────────────────────────────────────────
-# 2. Подготовка аудио (Идеальный формат для ElevenLabs)
+# 2. Подготовка аудио 
 # ──────────────────────────────────────────────
 def convert_to_mp3(input_path: Path) -> Path:
     mp3_path = input_path.with_suffix(".mp3")
@@ -96,14 +96,16 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. ElevenLabs Студийный звук
+# 3. Студийный звук (ElevenLabs + Эквалайзер)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path) -> Path:
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Ключ ELEVENLABS_API_KEY не найден в настройках Render!")
 
+    isolated_path = mp3_path.with_stem(mp3_path.stem + "_isolated")
     studio_path = mp3_path.with_stem(mp3_path.stem + "_studio")
 
+    # ШАГ 1: Идеально вырезаем шум (ElevenLabs)
     async with httpx.AsyncClient(timeout=300) as client:
         with open(mp3_path, "rb") as f:
             resp = await client.post(
@@ -118,8 +120,30 @@ async def enhance_audio(mp3_path: Path) -> Path:
         if resp.status_code != 200:
             raise RuntimeError(f"Отказ ElevenLabs (Код {resp.status_code}): {resp.text}")
 
-        studio_path.write_bytes(resp.content)
-        return studio_path
+        isolated_path.write_bytes(resp.content)
+
+    # ШАГ 2: Делаем "вкусный" студийный голос (FFmpeg мастеринг)
+    # bass=g=6 добавляет бархатный низ, treble добавляет ясность, acompressor делает голос плотным
+    audio_filters = (
+        "highpass=f=80,"
+        "bass=g=6:f=100:w=0.6,"
+        "treble=g=4:f=8000:w=0.5,"
+        "acompressor=threshold=-20dB:ratio=4:attack=5:release=50,"
+        "loudnorm=I=-16:TP=-1.5:LRA=11"
+    )
+    
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(isolated_path),
+         "-af", audio_filters,
+         "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", 
+         str(studio_path)],
+        capture_output=True, text=True
+    )
+
+    if result.returncode != 0 or not studio_path.exists():
+        raise RuntimeError(f"Ошибка эквалайзера: {result.stderr}")
+
+    return studio_path
 
 # ──────────────────────────────────────────────
 # 4. Транскрипция (Whisper)
@@ -266,7 +290,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ ElevenLabs: Студийная обработка...")
+        await msg.edit_text("🎙️ ElevenLabs: Студийная обработка + Эквалайзер...")
         studio_mp3 = await enhance_audio(mp3)
 
         await msg.edit_text("📝 Транскрибирую (Whisper)...")
@@ -395,7 +419,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
 
-    print("Бот v2 запущен (Только ElevenLabs API + Mave)...")
+    print("Бот v2 запущен (ElevenLabs + Студийный Эквалайзер + Mave)...")
     app.run_polling()
 
 if __name__ == "__main__":
