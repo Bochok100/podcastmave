@@ -1,10 +1,10 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass)
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + JS Click)
 - Запуск Xvfb в фоне через Docker
 - Безопасные скриншоты (timeout=5000)
-- Отказ от networkidle (защита от бесконечной загрузки трекеров)
 - Честный HTTP-сервер для прохождения пинга Render
 - Интерактивный перехват 2FA-кода из чата Telegram
+- JS-клик для обхода невидимых перекрытий и баннеров Cookie
 """
 
 import os
@@ -138,13 +138,25 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                # Клик по кнопке Sign in, если она есть на экране гостя
-                sign_in_btn = page.locator('a:has-text("Sign in"), button:has-text("Sign in")').first
-                if await sign_in_btn.count() > 0 and "auth" not in page.url:
-                    print("Adobe: Найдена гостевая страница. Нажимаем 'Sign in'...")
-                    await sign_in_btn.click()
+                # === УЛУЧШЕННЫЙ КЛИК (ОБХОД ПЕРЕКРЫТИЙ ЧЕРЕЗ JS) ===
+                sign_in_btns = page.locator('a:has-text("Sign in"), button:has-text("Sign in")')
+                if await sign_in_btns.count() > 0 and "auth" not in page.url:
+                    print("Adobe: Найдена гостевая страница. Пробиваем кнопку 'Sign in' через JS...")
+                    clicked = False
+                    # Ищем первую реально видимую кнопку
+                    for i in range(await sign_in_btns.count()):
+                        el = sign_in_btns.nth(i)
+                        if await el.is_visible():
+                            await el.evaluate("node => node.click()") # Прямой JS-клик
+                            clicked = True
+                            break
+                    # Если все скрыты, просто бьем по первой попавшейся
+                    if not clicked:
+                        await sign_in_btns.first.evaluate("node => node.click()")
+                        
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
+                # ====================================================
 
                 # Ввод Email / Пароля
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
@@ -155,15 +167,19 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     for sel in ['button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
                         try:
                             el = page.locator(sel).first
-                            if await el.count() > 0: await el.click(); break
+                            if await el.count() > 0: await el.evaluate("node => node.click()"); break
                         except Exception: continue
 
                     await asyncio.sleep(4)
                     
                     # === ИНТЕРАКТИВНЫЙ ОБХОД 2FA (Проверка личности) ===
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
-                        print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем отправку кода...")
-                        await page.locator('button:has-text("Продолжить")').first.click()
+                        print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем код...")
+                        try:
+                            await page.locator('button:has-text("Продолжить")').first.evaluate("node => node.click()")
+                        except:
+                            pass
+                            
                         await page.wait_for_load_state("domcontentloaded")
                         await asyncio.sleep(4)
                         
@@ -189,7 +205,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             
                             for sub_sel in ['button:has-text("Продолжить")', 'button[type="submit"]', 'button:has-text("Submit")']:
                                 if await page.locator(sub_sel).count() > 0:
-                                    await page.locator(sub_sel).first.click()
+                                    await page.locator(sub_sel).first.evaluate("node => node.click()")
                                     break
                             
                             await page.wait_for_load_state("domcontentloaded")
@@ -207,7 +223,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
                             try:
                                 el = page.locator(sel).first
-                                if await el.count() > 0: await el.click(); break
+                                if await el.count() > 0: await el.evaluate("node => node.click()"); break
                             except Exception: continue
 
                     await asyncio.sleep(5)
@@ -233,7 +249,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
                     try:
                         btn = page.locator(sel).first
-                        if await btn.count() > 0: await btn.click(); break
+                        if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
                     except Exception: continue
 
                 print("Adobe: Ожидание рендеринга кнопки скачивания...")
@@ -249,7 +265,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     raise RuntimeError("Adobe не отдал файл за 5 минут")
 
                 async with page.expect_download(timeout=120000) as dl_info:
-                    await download_locator.click()
+                    await download_locator.evaluate("node => node.click()")
                 dl = await dl_info.value
                 await dl.save_as(str(adobe_path))
                 
@@ -266,7 +282,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
             except Exception as e:
                 original_error = str(e)[:150]
                 print(f"Сработал except: {original_error}")
-                # Безопасный скриншот ошибки
                 try:
                     await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
                     await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
@@ -331,7 +346,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             for sel in ['button:has-text("Загрузить файл")', 'button:has-text("Загрузить")', '.upload-btn']:
                 try:
                     btn = page.locator(sel).first
-                    if await btn.count() > 0: await btn.click(); break
+                    if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
                 except Exception: continue
 
             for i in range(36):
@@ -355,7 +370,7 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             for btn_text in ["Опубликовать", "Сохранить выпуск", "Сохранить"]:
                 try:
                     btn = page.locator(f'button:has-text("{btn_text}")').first
-                    if await btn.count() > 0: await btn.click(); published = True; break
+                    if await btn.count() > 0: await btn.evaluate("node => node.click()"); published = True; break
                 except Exception: continue
 
             if not published: raise RuntimeError("Кнопка публикации mave не найдена")
@@ -382,7 +397,6 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
                 if os.path.exists(path): await update.message.reply_photo(photo=open(path, "rb"), caption=f"ℹ️ {caption}")
             except Exception: pass
 
-        # Передаем user_id для работы сессии перехвата 2FA
         studio_mp3 = await enhance_audio(mp3, user_id=user_id, send_screenshot=send_screenshot)
 
         await msg.edit_text("📝 Делаю расшифровку текста...")
@@ -407,11 +421,10 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
 # === ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ТЕКСТА ДЛЯ ВВОДА 2FA КОДА ===
 async def handle_global_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # Если бот сейчас ждет 2FA-код подтверждения от этого юзера
     if user_id in adobe_2fa_state:
         code_text = update.message.text.strip()
         adobe_2fa_state[user_id]["code"] = code_text
-        adobe_2fa_state[user_id]["event"].set()  # Будим спящий поток Playwright
+        adobe_2fa_state[user_id]["event"].set() 
         await update.message.reply_text("✅ Код принят, отправляю на проверку в Adobe...")
         return
 
@@ -467,7 +480,6 @@ def main():
     print("🚀 Запускаем Telegram-бота...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Регистрация перехватчика 2FA-кодов в приоритетной группе -1 (выполняется ДО стейтов редактирования текста)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text), group=-1)
 
     conv = ConversationHandler(
