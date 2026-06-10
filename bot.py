@@ -1,10 +1,10 @@
 """
-Podcast Bot v2 (Xvfb Background + Pure HTTP Server + Adobe UI Fix)
+Podcast Bot v2 (Xvfb Background + Pure HTTP Server + Interactive 2FA Bypass)
 - Запуск Xvfb в фоне через Docker для 100% обхода Cloudflare
 - Родные отпечатки браузера в headed-режиме (headless=False)
 - Честный HTTP-сервер для прохождения пинга Render (порт 10000)
 - Инжекция сессии ADOBE_COOKIES_JSON
-- Авто-клик по кнопке Sign In (фикс обновления интерфейса Adobe)
+- Интерактивный перехват 2FA-кода подтверждения прямо из чата Telegram!
 """
 
 import os
@@ -59,6 +59,7 @@ STYLE_PROMPT = """
 """
 
 pending = {}
+adobe_2fa_state = {}  # Глобальное хранилище для перехвата 2FA-кода из чата
 
 # ──────────────────────────────────────────────
 # ЧЕСТНЫЙ HTTP-СЕРВЕР ДЛЯ СЛУЖБЫ ПОДДЕРЖКИ RENDER
@@ -71,7 +72,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive and kicking!")
         
     def log_message(self, format, *args):
-        return # Отключаем спам логов сервера в консоль
+        return
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -96,9 +97,9 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Adobe Podcast)
+# 3. Обработка звука (Adobe Podcast с обходом 2FA)
 # ──────────────────────────────────────────────
-async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
+async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
     studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
 
@@ -110,7 +111,7 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
         print("Adobe: Открываем Chromium в HEADED режиме (Дисплей :99)...")
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False, # Имитируем реальный монитор
+                headless=False,
                 args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             )
             
@@ -137,21 +138,17 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(4)
 
-                # Диагностика
-                await page.screenshot(path="/tmp/adobe_state.png")
-                await notify("/tmp/adobe_state.png", f"Статус страницы. Текущий URL: {page.url}")
-
-                # === НОВОЕ: Проверяем, есть ли на странице кнопка Sign In ===
+                # Клик по кнопке Sign in, если она есть на экране гостя
                 sign_in_btn = page.locator('a:has-text("Sign in"), button:has-text("Sign in")').first
                 if await sign_in_btn.count() > 0 and "auth" not in page.url:
-                    print("Adobe: Найдена кнопка 'Sign in'. Сайт требует логин. Кликаем...")
+                    print("Adobe: Найдена гостевая страница. Нажимаем 'Sign in'...")
                     await sign_in_btn.click()
                     await page.wait_for_load_state("networkidle")
                     await asyncio.sleep(4)
-                # ==============================================================
 
+                # Ввод Email / Пароля
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
-                    print("Adobe: Токены не подошли, пробуем ввести форму...")
+                    print("Adobe: Вводим почту...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
                     await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
                     
@@ -162,17 +159,57 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                         except Exception: continue
 
                     await asyncio.sleep(3)
-                    for sel in ['input[type="password"]', '#password']:
+                    
+                    # === ИНТЕРАКТИВНЫЙ ОБХОД 2FA (Проверка личности) ===
+                    if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
+                        print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем отправку кода...")
+                        await page.locator('button:has-text("Продолжить")').first.click()
+                        await page.wait_for_load_state("networkidle")
+                        await asyncio.sleep(4)
+                        
+                        # Делаем скриншот формы ввода кода и отправляем пользователю
+                        await page.screenshot(path="/tmp/adobe_2fa_input.png")
+                        if send_screenshot:
+                            await send_screenshot("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Скопируй его и пришли мне сюда ОБЫЧНЫМ ТЕКСТОМ в течение 2 минут.")
+                        
+                        # Создаем событие ожидания ответа из чата Телеграм
+                        event = asyncio.Event()
+                        adobe_2fa_state[user_id] = {"event": event, "code": ""}
+                        
                         try:
-                            el = page.locator(sel).first
-                            if await el.count() > 0: await el.fill(ADOBE_PASSWORD); break
-                        except Exception: continue
+                            # Блокируем поток и ждем 2 минуты, пока юзер скинет текст
+                            await asyncio.wait_for(event.wait(), timeout=120.0)
+                            received_code = adobe_2fa_state[user_id]["code"].strip()
+                            print(f"Adobe: Перехватили код из чата: {received_code}. Заполняем форму...")
+                            
+                            # Находим поле ввода 2FA-кода
+                            code_field = page.locator('input[type="text"], input[type="number"], input[name*="code"]').first
+                            await code_field.fill(received_code)
+                            await asyncio.sleep(1)
+                            
+                            # Нажимаем финальную синюю кнопку подтверждения кода
+                            for sub_sel in ['button:has-text("Продолжить")', 'button[type="submit"]', 'button:has-text("Submit")']:
+                                if await page.locator(sub_sel).count() > 0:
+                                    await page.locator(sub_sel).first.click()
+                                    break
+                            
+                            await page.wait_for_load_state("networkidle")
+                            await asyncio.sleep(4)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError("Таймаут: ты не успел прислать код за 2 минуты.")
+                        finally:
+                            adobe_2fa_state.pop(user_id, None) # Чистим стейт
+                    # ===================================================
 
-                    for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
-                        try:
-                            el = page.locator(sel).first
-                            if await el.count() > 0: await el.click(); break
-                        except Exception: continue
+                    # Обычный ввод пароля, если 2FA не выскочил или уже пройден
+                    if await page.locator('input[type="password"], #password').count() > 0:
+                        print("Adobe: Вводим пароль...")
+                        await page.locator('input[type="password"], #password').first.fill(ADOBE_PASSWORD)
+                        for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
+                            try:
+                                el = page.locator(sel).first
+                                if await el.count() > 0: await el.click(); break
+                            except Exception: continue
 
                     await page.wait_for_url("**/enhance**", timeout=60000)
                     await page.wait_for_load_state("networkidle")
@@ -344,7 +381,8 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
                 if os.path.exists(path): await update.message.reply_photo(photo=open(path, "rb"), caption=f"ℹ️ {caption}")
             except Exception: pass
 
-        studio_mp3 = await enhance_audio(mp3, send_screenshot=send_screenshot)
+        # Передаем user_id для работы сессии перехвата 2FA
+        studio_mp3 = await enhance_audio(mp3, user_id=user_id, send_screenshot=send_screenshot)
 
         await msg.edit_text("📝 Делаю расшифровку текста...")
         transcript = transcribe(studio_mp3)
@@ -364,6 +402,17 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
+
+# === ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ТЕКСТА ДЛЯ ВВОДА 2FA КОДА ===
+async def handle_global_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    # Если бот сейчас ждет 2FA-код подтверждения от этого юзера
+    if user_id in adobe_2fa_state:
+        code_text = update.message.text.strip()
+        adobe_2fa_state[user_id]["code"] = code_text
+        adobe_2fa_state[user_id]["event"].set()  # Будим спящий поток Playwright
+        await update.message.reply_text("✅ Код принят, отправляю на проверку в Adobe...")
+        return
 
 async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -422,11 +471,14 @@ async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    # Стартуем честный HTTP сервер в параллельном потоке
     threading.Thread(target=run_dummy_server, daemon=True).start()
     
     print("🚀 Запускаем Telegram-бота...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Регистрация перехватчика 2FA-кодов в приоритетной группе -1 (выполняется ДО стейтов редактирования текста)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text), group=-1)
+
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_edit, pattern="^edit$")],
         states={
