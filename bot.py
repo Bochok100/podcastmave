@@ -195,24 +195,75 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                     await page.wait_for_load_state("networkidle")
 
                 print("Adobe: ищем форму загрузки...")
-                await page.wait_for_selector('text="Choose files", input[type="file"]', timeout=30000)
-                
+                # Ждём появления либо input[type=file] либо зоны загрузки
+                await page.wait_for_selector(
+                    'input[type="file"], [class*="drop"], [class*="upload"]',
+                    timeout=30000
+                )
+                await page.screenshot(path="/tmp/adobe_upload_form.png")
+                await notify("/tmp/adobe_upload_form.png", "Adobe: форма загрузки")
+
+                # Делаем input[type=file] видимым
                 await page.evaluate("""() => {
                     document.querySelectorAll('input[type="file"]').forEach(el => {
-                        el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;';
+                        el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:100px!important;height:100px!important;';
                     });
                 }""")
                 await asyncio.sleep(1)
-                
-                await page.set_input_files('input[type="file"]', str(mp3_path))
-                print(f"Adobe: файл {mp3_path.name} загружен на сайт")
 
-                print("Adobe: Ждем появления кнопки Download...")
-                download_locator = page.locator('button:has-text("Download"), a:has-text("Download")').last
-                await download_locator.wait_for(state="visible", timeout=600000) 
-                
+                await page.set_input_files('input[type="file"]', str(mp3_path))
+                print(f"Adobe: файл {mp3_path.name} передан")
+                await asyncio.sleep(3)
+                await page.screenshot(path="/tmp/adobe_file_set.png")
+
+                # Нажимаем кнопку Enhance если она есть
+                for sel in [
+                    'button:has-text("Enhance speech")',
+                    'button:has-text("Enhance")',
+                    'button:has-text("Clean up speech")',
+                    'button:has-text("Start")',
+                    'button[type="submit"]',
+                ]:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.count() > 0:
+                            await el.click()
+                            print(f"Adobe: нажата кнопка '{sel}'")
+                            break
+                    except Exception:
+                        continue
+
+                await asyncio.sleep(3)
+                await page.screenshot(path="/tmp/adobe_enhancing.png")
+                await notify("/tmp/adobe_enhancing.png", "Adobe: начал обработку")
+
+                # Ждём кнопку Download — максимум 3 минуты, с промежуточными скринами
+                print("Adobe: ждём кнопку Download (до 3 минут)...")
+                download_locator = None
+                for i in range(36):  # 36 × 5 сек = 3 минуты
+                    await asyncio.sleep(5)
+                    html = await page.content()
+
+                    # Ищем кнопку Download
+                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download")').last
+                    if await dl_btn.count() > 0:
+                        download_locator = dl_btn
+                        print(f"Adobe: кнопка Download найдена (шаг {i+1})")
+                        break
+
+                    # Каждые 30 секунд шлём скриншот
+                    if i % 6 == 5:
+                        await page.screenshot(path=f"/tmp/adobe_wait_{i}.png")
+                        await notify(f"/tmp/adobe_wait_{i}.png", f"Adobe: ждём обработку ({(i+1)*5} сек)")
+                        print(f"Adobe: ждём... ({i+1}/36), URL={page.url}")
+
+                if not download_locator:
+                    await page.screenshot(path="/tmp/adobe_timeout.png")
+                    await notify("/tmp/adobe_timeout.png", "Adobe: таймаут 3 минуты — кнопка Download не появилась")
+                    raise RuntimeError("Adobe: кнопка Download не появилась за 3 минуты")
+
                 await page.screenshot(path="/tmp/adobe_done.png")
-                await notify("/tmp/adobe_done.png", "Adobe: Звук обработан! Скачиваем...")
+                await notify("/tmp/adobe_done.png", "Adobe: обработка готова, скачиваем...")
 
                 async with page.expect_download(timeout=120000) as dl_info:
                     await download_locator.click()
