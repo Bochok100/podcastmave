@@ -2,6 +2,7 @@
 Podcast Bot v2 (Xvfb Headed Bypass + Raw Socket Server)
 - Запуск в Headed-режиме через виртуальный монитор (xvfb) для 100% обхода Cloudflare
 - Родные отпечатки браузера (без конфликтов User-Agent)
+- Диагностический скриншот сразу после захода на Adobe Podcast
 - Оптимизация памяти под 512MB
 - Инжекция сессии ADOBE_COOKIES_JSON
 - Непробиваемый сокет-сервер для обхода таймаутов Render
@@ -96,7 +97,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Adobe Podcast)
+# 3. Обработка звука (Adobe Podcast с диагностикой)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -129,7 +130,7 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             
             try:
                 if ADOBE_COOKIES_JSON:
-                    print("Adobe: Обнаружены куки сессии! Загружаем в контекст браузера...")
+                    print("Adobe: Обнаружены куки сессии! Загружаем in контекст...")
                     try:
                         cookies = json.loads(ADOBE_COOKIES_JSON)
                         await context.add_cookies(cookies)
@@ -139,7 +140,11 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 print("Adobe: Открываем страницу Enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)
+
+                # ДИАГНОСТИКА: Скриншот сразу после захода на страницу
+                await page.screenshot(path="/tmp/adobe_state.png")
+                await notify("/tmp/adobe_state.png", f"Экран после загрузки сайта. URL: {page.url}")
 
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Куки отсутствуют или протухли. Пробуем стандартный вход...")
@@ -279,163 +284,4 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await page.locator('text=Добавить выпуск').first.click()
             await asyncio.sleep(3)
 
-            await page.wait_for_selector('input[type="file"]', state='attached', timeout=15000)
-            await page.set_input_files('input[type="file"]', str(mp3_path))
-            await asyncio.sleep(2)
-
-            for sel in ['button:has-text("Загрузить файл")', 'button:has-text("Загрузить")', '.upload-btn']:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0: await btn.click(); break
-                except Exception: continue
-
-            for i in range(36):
-                await asyncio.sleep(5)
-                html = await page.content()
-                if any(x in html for x in ["Название выпуска", "episode-title", "upload-progress-done"]): break
-
-            for sel in ['input[placeholder*="Название выпуска"]', 'input[placeholder*="Название"]', 'input[name="title"]']:
-                try:
-                    el = page.locator(sel).first
-                    if await el.count() > 0: await el.clear(); await el.fill(title); break
-                except Exception: continue
-
-            for sel in ['.ProseMirror', 'div[contenteditable="true"]', 'textarea[name="description"]']:
-                try:
-                    el = page.locator(sel).first
-                    if await el.count() > 0: await el.click(); await el.fill(description); break
-                except Exception: continue
-
-            published = False
-            for btn_text in ["Опубликовать", "Сохранить выпуск", "Сохранить"]:
-                try:
-                    btn = page.locator(f'button:has-text("{btn_text}")').first
-                    if await btn.count() > 0: await btn.click(); published = True; break
-                except Exception: continue
-
-            if not published: raise RuntimeError("Не найдена финальная кнопка в Mave")
-            await asyncio.sleep(5)
-            await page.screenshot(path="/tmp/mave_done.png")
-            return True
-        except Exception as e:
-            await page.screenshot(path="/tmp/mave_error.png")
-            raise RuntimeError(f"{e}")
-        finally:
-            await browser.close()
-
-async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID: return
-    msg = await update.message.reply_text("⏳ Начинаю обработку...")
-    try:
-        ogg = await download_voice(update, tg_context)
-        await msg.edit_text("🔄 Превращаю в MP3...")
-        mp3 = convert_to_mp3(ogg)
-
-        await msg.edit_text("🎙️ Загружаю в ИИ Adobe Podcast (Обход Cloudflare v3)...")
-
-        async def send_screenshot(path: str, caption: str):
-            try:
-                if os.path.exists(path): await update.message.reply_photo(photo=open(path, "rb"), caption=f"ℹ️ {caption}")
-            except Exception: pass
-
-        studio_mp3 = await enhance_audio(mp3, send_screenshot=send_screenshot)
-
-        await msg.edit_text("📝 Делаю расшифровку (Whisper)...")
-        transcript = transcribe(studio_mp3)
-
-        await msg.edit_text("✍️ Придумываю заголовок в твоем стиле (GPT-4o)...")
-        title, description = generate_metadata(transcript)
-
-        pending[user_id] = {"mp3": studio_mp3, "title": title, "description": description}
-        await msg.delete()
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Опубликовать в mave", callback_data="publish"),
-            InlineKeyboardButton("✏️ Изменить", callback_data="edit")
-        ], [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-        preview = f"🎙 *Выпуск готов к выгрузке*\n\n*Заголовок:*\n{title}\n\n*Описание:*\n{description}\n\nВыгружаем?"
-        await update.message.reply_document(document=open(studio_mp3, "rb"), filename=f"{title[:40]}.mp3")
-        await update.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
-
-async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = pending.get(user_id)
-    if not data:
-        await query.edit_message_text("❌ Сессия устарела.")
-        return
-    await query.edit_message_text("⏳ Выгружаю на хостинг mave.digital...")
-    try:
-        for f in ["/tmp/mave_error.png", "/tmp/mave_done.png"]:
-            if os.path.exists(f): os.remove(f)
-        await upload_to_mave(data["mp3"], data["title"], data["description"])
-        caption = f"✅ *Успешно выгружено!*\n\n_{data['title']}_"
-        if os.path.exists("/tmp/mave_done.png"):
-            await query.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"), caption=caption, parse_mode=ParseMode.MARKDOWN)
-            await query.message.delete()
-        else:
-            await query.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
-        pending.pop(user_id, None)
-    except Exception as e:
-        if os.path.exists("/tmp/mave_error.png"):
-            await query.message.reply_photo(photo=open("/tmp/mave_error.png", "rb"), caption=f"❌ Ошибка Mave: {e}")
-            await query.message.delete()
-        else:
-            await query.edit_message_text(f"❌ Ошибка: {e}")
-
-async def button_edit(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = pending.get(query.from_user.id)
-    await query.edit_message_text(f"✏️ Текущий заголовок:\n*{data['title']}*\n\nНапиши новый заголовок (или /skip):", parse_mode=ParseMode.MARKDOWN)
-    return EDIT_TITLE
-
-async def edit_title(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if update.message.text != "/skip": pending[user_id]["title"] = update.message.text
-    data = pending[user_id]
-    await update.message.reply_text(f"📝 Текущее описание:\n_{data['description']}_\n\nНапиши новое описание (или /skip):", parse_mode=ParseMode.MARKDOWN)
-    return EDIT_DESC
-
-async def edit_desc(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if update.message.text != "/skip": pending[user_id]["description"] = update.message.text
-    data = pending[user_id]
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Опубликовать", callback_data="publish"), InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-    await update.message.reply_text(f"🎙 *Данные обновлены:*\n\n*Заголовок:* {data['title']}\n*Описание:* {data['description']}\n\nПубликуем?", parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-    return ConversationHandler.END
-
-async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    pending.pop(query.from_user.id, None)
-    await query.edit_message_text("❌ Отменено.")
-    return ConversationHandler.END
-
-def main():
-    # Сервер на сырых сокетах запускается первым
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-    
-    print("🚀 Запускаем Telegram-бота...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_edit, pattern="^edit$")],
-        states={
-            EDIT_TITLE: [MH(filters.TEXT & ~filters.COMMAND, edit_title)],
-            EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
-        },
-        fallbacks=[CallbackQueryHandler(button_cancel, pattern="^cancel$")],
-        per_chat=True
-    )
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
-    app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+            await page.wait_for_selector('input
