@@ -1,17 +1,17 @@
-# Берем официальный образ ТОЧНО ТОЙ ВЕРСИИ, которую просит система (v1.60.0)
 FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
 
 WORKDIR /app
 
-# Устанавливаем ffmpeg для работы со звуком
-RUN apt-get update && apt-get install -y ffmpeg
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV DISPLAY=:99
 
-# Копируем файл с библиотеками и устанавливаем их
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg xvfb && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем остальной код нашего бота
 COPY . .
 
-# Запускаем бота
-CMD ["python", "bot.py"]
+# Xvfb стартует первым, ждём 2 секунды, потом бот
+CMD sh -c "Xvfb :99 -screen 0 1366x768x24 -ac +extension GLX +render -noreset & sleep 2 && python -u bot.py"
