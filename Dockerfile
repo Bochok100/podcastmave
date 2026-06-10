@@ -15,5 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Бронебойный запуск: удаляем лок -> стартуем монитор -> ждем 2 сек -> запускаем бота
-CMD ["/bin/bash", "-c", "rm -f /tmp/.X99-lock; Xvfb :99 -screen 0 1366x768x24 -ac & sleep 2; DISPLAY=:99 python -u bot.py"]
+# Штатный запуск: -a автоматически подбирает дисплей и обходит проблему с .X99-lock
+CMD xvfb-run -a -s "-screen 0 1366x768x24 -ac" python -u bot.py
