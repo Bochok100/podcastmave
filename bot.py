@@ -1,9 +1,7 @@
 """
-Podcast Bot v2 (Final Stable Version)
-- Live Stream камеры через /screen
-- Дамп HTML при ошибках через /html
-- Защита от дублей (токен)
-- Эмуляция клавиатуры для Adobe
+Podcast Bot v2 (DEBUG MODE: Full Screenshot Stream)
+- Бот делает скриншот на КАЖДОМ шаге авторизации и шлет его в чат
+- Короткие таймауты
 """
 
 import os
@@ -43,43 +41,19 @@ ADOBE_COOKIES_JSON = os.getenv("ADOBE_COOKIES_JSON")
 ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 EDIT_TITLE, EDIT_DESC = range(2)
-STYLE_PROMPT = "Ты — редактор подкаста. Сделай заголовок и описание в разговорном стиле."
+STYLE_PROMPT = "Ты — редактор подкаста. Сделай заголовок и описание."
 
 pending = {}
 adobe_2fa_state = {}
 
 # ──────────────────────────────────────────────
-# HTTP СЕРВЕР (ВЕБ-КАМЕРА И ДАМП)
+# HTTP СЕРВЕР (ДЛЯ ОБХОДА RENDER SLEEP)
 # ──────────────────────────────────────────────
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/screen':
-            try:
-                with open('live.png', 'rb') as f:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.end_headers()
-                    self.wfile.write(f.read())
-            except:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write("Картинка пока не готова.".encode('utf-8'))
-        elif self.path == '/html':
-            try:
-                with open('error.html', 'rb') as f:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(f.read())
-            except:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write("HTML дамп пока не создан.".encode('utf-8'))
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write("Бот работает. Проверь /screen или /html".encode('utf-8'))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -87,49 +61,61 @@ def run_dummy_server():
     server.serve_forever()
 
 # ──────────────────────────────────────────────
-# ОСНОВНАЯ ЛОГИКА
+# ОСНОВНАЯ ЛОГИКА С ОТПРАВКОЙ СКРИНОВ
 # ──────────────────────────────────────────────
-async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
+async def enhance_audio(mp3_path: Path, user_id: int, update: Update) -> Path:
     adobe_path = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
+
+    async def snap(step_name):
+        try:
+            path = f"debug_{step_name}.png"
+            await page.screenshot(path=path)
+            await update.message.reply_photo(photo=open(path, "rb"), caption=f"🔍 Шаг: {step_name}")
+            await asyncio.sleep(1) # Небольшая пауза чтобы не спамить
+        except Exception as e:
+            print(f"Ошибка отправки скрина: {e}")
 
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False, args=['--no-sandbox'])
             page = await browser.new_page()
-            
-            async def snap():
-                try: await page.screenshot(path="live.png")
-                except: pass
+            await Stealth().apply_stealth_async(page)
             
             await page.goto("https://podcast.adobe.com/enhance")
-            await asyncio.sleep(5)
-            await snap()
+            await snap("Загрузка сайта")
 
             # Авторизация
+            if await page.locator('text=Sign in').count() > 0:
+                await page.locator('text=Sign in').first.click()
+                await snap("Клик Sign in")
+
             email_field = page.locator('input[type="email"], input[name="username"]')
             if await email_field.count() > 0:
                 await email_field.fill(ADOBE_EMAIL.strip())
+                await snap("Ввод почты")
                 await page.locator('button:has-text("Продолжить"), button:has-text("Continue")').first.click()
+                await snap("Клик Продолжить после почты")
                 await asyncio.sleep(5)
-                await snap()
 
-            # Пароль
             pwd_field = page.locator('input[type="password"], #password')
             if await pwd_field.count() > 0:
                 await pwd_field.fill(ADOBE_PASSWORD.strip())
+                await snap("Ввод пароля")
                 await page.locator('button:has-text("Продолжить"), button:has-text("Continue")').first.click()
+                await snap("Клик Продолжить после пароля")
                 await asyncio.sleep(5)
-                await snap()
 
             # Загрузка
+            await snap("Экран перед загрузкой")
             target = page.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').first
             if await target.count() > 0:
                 async with page.expect_file_chooser() as fc_info:
                     await target.click()
                 await (await fc_info.value).set_files(str(mp3_path))
+                await snap("Файл выбран")
             
             await asyncio.sleep(10)
-            await snap()
+            await snap("После загрузки (ждем Enhance)")
             
             # Скачивание
             dl_btn = page.locator('button:has-text("Download"), a:has-text("Скачать")').last
@@ -141,22 +127,23 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
             return adobe_path
 
     except Exception as e:
-        # Дамп HTML при ошибке
-        try:
-            html = await page.content()
-            with open("error.html", "w", encoding="utf-8") as f: f.write(html)
-        except: pass
-        raise RuntimeError(f"Ошибка Adobe: {str(e)[:100]}")
+        raise RuntimeError(f"Adobe: {str(e)[:100]}")
 
 # ──────────────────────────────────────────────
 # TELEGRAM БОТ
 # ──────────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Обработка...")
+    msg = await update.message.reply_text("⏳ Начинаю поток скриншотов...")
     try:
-        # (Тут код загрузки и вызова enhance_audio)
-        # Вставь сюда код из предыдущих версий, он был рабочий
-        pass
+        # download and convert (оставляем старое)
+        ogg = await update.message.voice.get_file()
+        await ogg.download_to_drive("input.ogg")
+        subprocess.run(["ffmpeg", "-y", "-i", "input.ogg", "input.mp3"])
+        
+        studio_mp3 = await enhance_audio(Path("input.mp3"), update.effective_user.id, update)
+        
+        await update.message.reply_document(document=open(studio_mp3, "rb"))
+        await msg.delete()
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
