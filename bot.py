@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Stealth Mode)
-- Скрытый обход защиты Cloudflare (playwright-stealth v2.0+)
+Podcast Bot v2 (Firefox Bypass Mode)
+- Обход Cloudflare через смену движка на Firefox
 - Полностью автоматический Adobe Podcast Enhance
-- Загрузка в mave.digital
+- Загрузка в mave.digital через Chromium
 """
 
 import os
@@ -22,7 +22,6 @@ from telegram.constants import ParseMode
 
 import openai
 from playwright.async_api import async_playwright
-from playwright_stealth import Stealth  # Обновленный импорт для версии 2.0+
 
 # ──────────────────────────────────────────────
 # Настройки
@@ -94,7 +93,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Улучшение звука через Adobe Podcast (STEALTH)
+# 3. Улучшение звука через Adobe Podcast (FIREFOX HACK)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -105,23 +104,18 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             await send_screenshot(path, caption)
 
     try:
-        print("Adobe: Запуск браузера в режиме Stealth...")
+        print("Adobe: Запуск браузера Firefox (Обход Cloudflare)...")
         async with async_playwright() as p:
-            # Запускаем браузер с аргументами, отключающими флаги автоматизации
-            browser = await p.chromium.launch(
+            # ИСПОЛЬЗУЕМ FIREFOX ВМЕСТО CHROMIUM
+            browser = await p.firefox.launch(
                 headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-infobars',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                ]
+                args=['--no-sandbox']
             )
             
-            # Маскируемся под живого юзера (Windows, Chrome, Московское время)
+            # Маскируемся под живого юзера с Firefox
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
                 locale="ru-RU",
                 timezone_id="Europe/Moscow",
                 accept_downloads=True
@@ -129,11 +123,13 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             
             page = await context.new_page()
             
-            # ПРИМЕНЯЕМ НЕВИДИМКУ (Новый синтаксис v2.0)
-            await Stealth().apply_stealth_async(page)
-            
             try:
-                print("Adobe: открываем сайт...")
+                # Имитируем поведение человека: заходим на главную, ждем, идем на enhance
+                print("Adobe: заходим на главную страницу (имитация)...")
+                await page.goto("https://podcast.adobe.com/", timeout=60000)
+                await asyncio.sleep(4)
+                
+                print("Adobe: переходим на страницу Enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("networkidle")
                 
@@ -370,7 +366,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Adobe Podcast (Stealth-режим, ожидайте около 3-5 минут)...")
+        await msg.edit_text("🎙️ Захожу в Adobe Podcast через Firefox (ждем 3-5 минут)...")
 
         async def send_adobe_screenshot(path: str, caption: str):
             try:
@@ -501,7 +497,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
 
-    print("Бот v2 запущен (Stealth режим для Adobe)...")
+    print("Бот v2 запущен (Firefox Bypass Mode для Adobe)...")
     app.run_polling()
 
 if __name__ == "__main__":
