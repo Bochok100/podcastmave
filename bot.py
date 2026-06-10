@@ -1,10 +1,10 @@
 """
-Podcast Bot v2 (Xvfb Background + Pure HTTP Server + Interactive 2FA Bypass)
-- Запуск Xvfb в фоне через Docker для 100% обхода Cloudflare
-- Родные отпечатки браузера в headed-режиме (headless=False)
-- Честный HTTP-сервер для прохождения пинга Render (порт 10000)
-- Инжекция сессии ADOBE_COOKIES_JSON
-- Интерактивный перехват 2FA-кода подтверждения прямо из чата Telegram!
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass)
+- Запуск Xvfb в фоне через Docker
+- Безопасные скриншоты (timeout=5000)
+- Отказ от networkidle (защита от бесконечной загрузки трекеров)
+- Честный HTTP-сервер для прохождения пинга Render
+- Интерактивный перехват 2FA-кода из чата Telegram
 """
 
 import os
@@ -135,16 +135,16 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                 print("Adobe: Переход на страницу Enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
-                await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(4)
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(5)
 
                 # Клик по кнопке Sign in, если она есть на экране гостя
                 sign_in_btn = page.locator('a:has-text("Sign in"), button:has-text("Sign in")').first
                 if await sign_in_btn.count() > 0 and "auth" not in page.url:
                     print("Adobe: Найдена гостевая страница. Нажимаем 'Sign in'...")
                     await sign_in_btn.click()
-                    await page.wait_for_load_state("networkidle")
-                    await asyncio.sleep(4)
+                    await page.wait_for_load_state("domcontentloaded")
+                    await asyncio.sleep(5)
 
                 # Ввод Email / Пароля
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
@@ -158,50 +158,49 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             if await el.count() > 0: await el.click(); break
                         except Exception: continue
 
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(4)
                     
                     # === ИНТЕРАКТИВНЫЙ ОБХОД 2FA (Проверка личности) ===
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
                         print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем отправку кода...")
                         await page.locator('button:has-text("Продолжить")').first.click()
-                        await page.wait_for_load_state("networkidle")
+                        await page.wait_for_load_state("domcontentloaded")
                         await asyncio.sleep(4)
                         
-                        # Делаем скриншот формы ввода кода и отправляем пользователю
-                        await page.screenshot(path="/tmp/adobe_2fa_input.png")
-                        if send_screenshot:
-                            await send_screenshot("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Скопируй его и пришли мне сюда ОБЫЧНЫМ ТЕКСТОМ в течение 2 минут.")
+                        try:
+                            await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
+                            if send_screenshot:
+                                await send_screenshot("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Скопируй его и пришли мне сюда ОБЫЧНЫМ ТЕКСТОМ в течение 2 минут.")
+                        except Exception as screenshot_err:
+                            print(f"Ошибка скриншота 2FA (пропускаем): {screenshot_err}")
                         
                         # Создаем событие ожидания ответа из чата Телеграм
                         event = asyncio.Event()
                         adobe_2fa_state[user_id] = {"event": event, "code": ""}
                         
                         try:
-                            # Блокируем поток и ждем 2 минуты, пока юзер скинет текст
                             await asyncio.wait_for(event.wait(), timeout=120.0)
                             received_code = adobe_2fa_state[user_id]["code"].strip()
                             print(f"Adobe: Перехватили код из чата: {received_code}. Заполняем форму...")
                             
-                            # Находим поле ввода 2FA-кода
                             code_field = page.locator('input[type="text"], input[type="number"], input[name*="code"]').first
                             await code_field.fill(received_code)
                             await asyncio.sleep(1)
                             
-                            # Нажимаем финальную синюю кнопку подтверждения кода
                             for sub_sel in ['button:has-text("Продолжить")', 'button[type="submit"]', 'button:has-text("Submit")']:
                                 if await page.locator(sub_sel).count() > 0:
                                     await page.locator(sub_sel).first.click()
                                     break
                             
-                            await page.wait_for_load_state("networkidle")
-                            await asyncio.sleep(4)
+                            await page.wait_for_load_state("domcontentloaded")
+                            await asyncio.sleep(5)
                         except asyncio.TimeoutError:
                             raise RuntimeError("Таймаут: ты не успел прислать код за 2 минуты.")
                         finally:
-                            adobe_2fa_state.pop(user_id, None) # Чистим стейт
+                            adobe_2fa_state.pop(user_id, None)
                     # ===================================================
 
-                    # Обычный ввод пароля, если 2FA не выскочил или уже пройден
+                    # Обычный ввод пароля
                     if await page.locator('input[type="password"], #password').count() > 0:
                         print("Adobe: Вводим пароль...")
                         await page.locator('input[type="password"], #password').first.fill(ADOBE_PASSWORD)
@@ -211,12 +210,11 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                                 if await el.count() > 0: await el.click(); break
                             except Exception: continue
 
-                    await page.wait_for_url("**/enhance**", timeout=60000)
-                    await page.wait_for_load_state("networkidle")
+                    await asyncio.sleep(5)
 
                 if "enhance" not in page.url:
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
-                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_load_state("domcontentloaded")
 
                 print("Adobe: Ожидаем поле загрузки...")
                 await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
@@ -248,8 +246,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         break
 
                 if not download_locator:
-                    await page.screenshot(path="/tmp/adobe_timeout.png")
-                    await notify("/tmp/adobe_timeout.png", "Adobe: Тайм-аут генерации")
                     raise RuntimeError("Adobe не отдал файл за 5 минут")
 
                 async with page.expect_download(timeout=120000) as dl_info:
@@ -268,9 +264,16 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 return adobe_path
 
             except Exception as e:
-                await page.screenshot(path="/tmp/adobe_error.png")
-                await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
-                raise RuntimeError(f"Ошибка Playwright Adobe: {str(e)[:150]}")
+                original_error = str(e)[:150]
+                print(f"Сработал except: {original_error}")
+                # Безопасный скриншот ошибки
+                try:
+                    await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
+                    await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
+                except Exception as screenshot_err:
+                    print(f"Не удалось сделать скриншот: {screenshot_err}")
+                
+                raise RuntimeError(f"{original_error}")
             finally:
                 await browser.close()
     except Exception as e:
@@ -308,8 +311,8 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await page.fill('input[type="email"]', MAVE_EMAIL)
             await page.fill('input[type="password"]', MAVE_PASSWORD)
             await page.click('button[type="submit"]')
-            await page.wait_for_url("**/dashboard**", timeout=30000)
-            await asyncio.sleep(3)
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(4)
 
             await page.evaluate("""() => {
                 document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e => e.remove());
@@ -357,10 +360,8 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
 
             if not published: raise RuntimeError("Кнопка публикации mave не найдена")
             await asyncio.sleep(5)
-            await page.screenshot(path="/tmp/mave_done.png")
             return True
         except Exception as e:
-            await page.screenshot(path="/tmp/mave_error.png")
             raise RuntimeError(f"{e}")
         finally:
             await browser.close()
@@ -424,22 +425,12 @@ async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         return
     await query.edit_message_text("⏳ Загружаю на mave.digital...")
     try:
-        for f in ["/tmp/mave_error.png", "/tmp/mave_done.png"]:
-            if os.path.exists(f): os.remove(f)
         await upload_to_mave(data["mp3"], data["title"], data["description"])
         caption = f"✅ *Успешно выгружено!*\n\n_{data['title']}_"
-        if os.path.exists("/tmp/mave_done.png"):
-            await query.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"), caption=caption, parse_mode=ParseMode.MARKDOWN)
-            await query.message.delete()
-        else:
-            await query.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
         pending.pop(user_id, None)
     except Exception as e:
-        if os.path.exists("/tmp/mave_error.png"):
-            await query.message.reply_photo(photo=open("/tmp/mave_error.png", "rb"), caption=f"❌ Ошибка Mave: {e}")
-            await query.message.delete()
-        else:
-            await query.edit_message_text(f"❌ Ошибка: {e}")
+        await query.edit_message_text(f"❌ Ошибка Mave: {e}")
 
 async def button_edit(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
