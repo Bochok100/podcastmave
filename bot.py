@@ -1,7 +1,8 @@
 """
-Podcast Bot v2 (Strict Login + Web Camera Hack + Anti-Crash)
-- Встроенный веб-сервер теперь транслирует скриншот экрана Adobe по адресу /screen
-- Жесткий контроль авторизации и 3 ступени загрузки
+Podcast Bot v2 (Visual Auth + Iframe Scanner + Web Camera + Drag-and-Drop)
+- Визуальный контроль интерфейса (без привязки к плавающим URL Adobe)
+- Встроенный веб-сервер транслирует экран по адресу /screen
+- Жесткий визуальный контроль перед попыткой загрузки
 """
 
 import os
@@ -61,7 +62,7 @@ pending = {}
 adobe_2fa_state = {}
 
 # ──────────────────────────────────────────────
-# ЧЕСТНЫЙ HTTP-СЕРВЕР (ТЕПЕРЬ С ВЕБ-КАМЕРОЙ)
+# ЧЕСТНЫЙ HTTP-СЕРВЕР (ВЕБ-КАМЕРА)
 # ──────────────────────────────────────────────
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -157,45 +158,60 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                if "auth" not in page.url:
-                    try:
-                        await page.evaluate("""() => {
-                            const elements = Array.from(document.querySelectorAll('a, button'));
-                            const signIn = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === 'sign in');
-                            if (signIn) { signIn.click(); }
-                        }""")
-                        await asyncio.sleep(5)
-                    except Exception:
-                        pass
+                # Глобальный клик "Sign in", если мы на гостевой странице
+                try:
+                    await page.evaluate("""() => {
+                        const elements = Array.from(document.querySelectorAll('a, button'));
+                        const signIn = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === 'sign in');
+                        if (signIn) { signIn.click(); }
+                    }""")
+                    await asyncio.sleep(5)
+                except Exception:
+                    pass
 
                 # =================================================================
-                # ЖЕСТКИЙ БЛОК АВТОРИЗАЦИИ
+                # УМНЫЙ ВИЗУАЛЬНЫЙ БЛОК АВТОРИЗАЦИИ (БЕЗ ПРИВЯЗКИ К ССЫЛКАМ)
                 # =================================================================
-                if "auth" in page.url or "login" in page.url or "ims" in page.url:
+                print("Adobe: Ожидаем прогрузки интерфейса...")
+                login_found = False
+                for _ in range(15):
+                    if await page.locator('input[type="email"], input[name="username"]').count() > 0:
+                        login_found = True
+                        break
+                    if await page.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').count() > 0:
+                        break
+                    await asyncio.sleep(1)
+
+                if login_found:
                     print(f"Adobe: Экран авторизации. Вводим почту: {ADOBE_EMAIL}")
                     email_field = page.locator('input[type="email"], input[name="username"]').first
-                    await email_field.wait_for(state="visible", timeout=15000)
                     await email_field.fill(ADOBE_EMAIL)
                     await asyncio.sleep(2)
                     
                     continue_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue"), button[type="submit"], #btn-id-forward').first
-                    await continue_btn.click()
+                    if await continue_btn.count() > 0:
+                        await continue_btn.click()
                     await asyncio.sleep(5)
                     
-                    if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
+                    # ПАРОЛЬ
+                    pwd_field = page.locator('input[type="password"], #password').first
+                    if await pwd_field.count() > 0:
+                        print("Adobe: Вводим пароль...")
+                        await pwd_field.fill(ADOBE_PASSWORD)
+                        await asyncio.sleep(1)
+                        
+                        login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
+                        if await login_btn.count() > 0:
+                            await login_btn.click()
+                        await asyncio.sleep(5)
+
+                    # 2FA КОД
+                    if await page.locator('text=/Подтверждение|Verification|Код|Code/i').count() > 0 and await page.locator('input[type="text"], input[type="number"], input[name*="code"]').count() > 0:
                         print("Adobe: Запрашиваем 2FA код...")
                         try:
-                            await page.locator('button:has-text("Продолжить")').first.click()
-                        except:
-                            pass
-                            
-                        await asyncio.sleep(4)
-                        
-                        try:
-                            await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000) # Сохраняем для веб-сервера
+                            await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
                             await notify("/tmp/adobe_before_upload.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
-                        except Exception:
-                            pass
+                        except Exception: pass
                         
                         event = asyncio.Event()
                         adobe_2fa_state[user_id] = {"event": event, "code": ""}
@@ -203,58 +219,55 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         try:
                             await asyncio.wait_for(event.wait(), timeout=120.0)
                             received_code = adobe_2fa_state[user_id]["code"].strip()
-                            
                             code_field = page.locator('input[type="text"], input[type="number"], input[name*="code"]').first
                             await code_field.fill(received_code)
                             await asyncio.sleep(1)
                             
                             sub_btn = page.locator('button:has-text("Продолжить"), button[type="submit"], button:has-text("Submit")').first
-                            await sub_btn.click()
-                            
+                            if await sub_btn.count() > 0:
+                                await sub_btn.click()
                             await asyncio.sleep(5)
                         except asyncio.TimeoutError:
                             raise RuntimeError("Таймаут: вы не успели прислать код за 2 минуты.")
                         finally:
                             adobe_2fa_state.pop(user_id, None)
 
-                    if await page.locator('input[type="password"], #password').count() > 0:
-                        print("Adobe: Вводим пароль...")
-                        pwd_field = page.locator('input[type="password"], #password').first
-                        await pwd_field.fill(ADOBE_PASSWORD)
-                        await asyncio.sleep(1)
-                        
-                        login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
-                        await login_btn.click()
-
                     print("Adobe: Ждем завершения редиректов (до 20 сек)...")
                     for _ in range(20):
-                        if "enhance" in page.url and "auth" not in page.url and "ims" not in page.url:
+                        if await page.locator('text=/Choose files|Выбрать|Загрузить/i').count() > 0:
                             break
-                        if "adobelogin" in page.url or "auth" in page.url:
-                            try:
-                                await page.evaluate("""() => {
-                                    const targets = Array.from(document.querySelectorAll('button, a, span'));
-                                    const interstitialBtn = targets.find(el => {
-                                        const t = el.innerText ? el.innerText.trim().toLowerCase() : '';
-                                        return t === 'не сейчас' || t === 'пропустить' || t === 'not now' || t === 'skip' || t === 'напомнить позже' || t === 'да' || t === 'yes' || t === 'продолжить';
-                                    });
-                                    if (interstitialBtn) interstitialBtn.click();
-                                }""")
-                            except:
-                                pass
+                        try:
+                            # Закрываем окна "Не сейчас", "Оставаться в системе"
+                            await page.evaluate("""() => {
+                                const targets = Array.from(document.querySelectorAll('button, a, span'));
+                                const interstitialBtn = targets.find(el => {
+                                    const t = el.innerText ? el.innerText.trim().toLowerCase() : '';
+                                    return t === 'не сейчас' || t === 'пропустить' || t === 'not now' || t === 'skip' || t === 'напомнить позже' || t === 'да' || t === 'yes' || t === 'продолжить';
+                                });
+                                if (interstitialBtn) interstitialBtn.click();
+                            }""")
+                        except: pass
                         await asyncio.sleep(1)
                     await asyncio.sleep(3)
 
-                if "enhance" not in page.url or "auth" in page.url:
+                # Принудительный переход, если мы потерялись
+                if "enhance" not in page.url:
                     print("Adobe: Принудительный переход на панель Enhance...")
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
                     
-                if "auth" in page.url or "login" in page.url:
-                    raise RuntimeError("❌ Бот застрял на странице авторизации! Проверьте правильность ADOBE_EMAIL и ADOBE_PASSWORD.")
+                # =================================================================
+                # ЖЕСТКАЯ ПРОВЕРКА И ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ ДЛЯ ВЕБ-СЕРВЕРА
+                # =================================================================
+                try:
+                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
+                except Exception: pass
 
-                # Закрываем всплывающие окна (Cookies, Welcome) перед загрузкой
+                if await page.locator('input[type="email"], input[name="username"]').count() > 0:
+                    raise RuntimeError("❌ Бот не смог войти в аккаунт и остался на странице логина! Проверь скриншот по ссылке /screen")
+
+                # Закрываем всплывающие баннеры
                 try:
                     await page.evaluate("""() => {
                         const btns = Array.from(document.querySelectorAll('button'));
@@ -265,18 +278,9 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 except: pass
 
                 # =================================================================
-                # ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ ДЛЯ ВЕБ-СЕРВЕРА
-                # =================================================================
-                print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
-                try:
-                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
-                    await notify("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой. Если не видно, зайди на /screen")
-                except Exception as e:
-                    print(f"Не удалось сделать предварительный скриншот: {e}")
-
-                # =================================================================
                 # МУЛЬТИ-ЗАГРУЗКА
                 # =================================================================
+                print("Adobe: Кабинет открыт. Инициируем алгоритм загрузки...")
                 uploaded = False
                 
                 # ШАГ 1: Скрытые поля
@@ -344,7 +348,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         print(f"Шаг 3 завершился ошибкой: {e}")
 
                 if not uploaded:
-                    raise RuntimeError("Adobe заблокировал интерфейс загрузки. Открой ссылку /screen, чтобы увидеть причину.")
+                    raise RuntimeError("❌ Adobe заблокировал интерфейс загрузки. Посмотри причину по ссылке /screen")
                 # =================================================================
 
                 await asyncio.sleep(3)
