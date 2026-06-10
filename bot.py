@@ -1,8 +1,9 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + Pre-Upload Diagnostic)
-- Контрольный скриншот ПЕРЕД попыткой загрузки (чтобы видеть интерфейс)
-- Улучшенный алгоритм поиска кнопки Choose files через Regex
-- Интерактивный перехват 2FA-кода
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Iframe Scanner Fix)
+- Сканирование абсолютно всех фреймов (page.frames) для прорыва сквозь iframe-защиту Adobe
+- Мультиязычный поиск кнопок загрузки внутри под-фреймов
+- Безопасные скриншоты (timeout=5000)
+- Интерактивный перехват 2FA-кода из чата Telegram
 """
 
 import os
@@ -95,7 +96,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Adobe Podcast)
+# 3. Обработка звука (Adobe Podcast с фиксом фреймов)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -128,7 +129,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     try:
                         cookies = json.loads(ADOBE_COOKIES_JSON)
                         await context.add_cookies(cookies)
-                    except Exception as ce:
+                    except Exception:
                         pass
 
                 print("Adobe: Переход на страницу Enhance...")
@@ -235,51 +236,74 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(5)
 
                 # =================================================================
-                # ДИАГНОСТИЧЕСКИЙ СКРИНШОТ ПЕРЕД ЗАГРУЗКОЙ (Гарантированная отправка)
+                # КРИТИЧЕСКИЙ ФИКС: СКАНИРОВАНИЕ ВСЕХ СЛОЕВ И ФРЕЙМОВ (IFRAMES)
                 # =================================================================
-                print("Adobe: Панель загрузки найдена. Делаю скриншот перед кликом...")
-                try:
-                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=8000)
-                    if send_screenshot:
-                        await send_screenshot("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой файла. Если бот сейчас выдаст ошибку, мы увидим причину на этой картинке!")
-                except Exception as e:
-                    print(f"Не удалось сделать предварительный скриншот: {e}")
+                print("Adobe: Кабинет открыт. Запускаем сканирование фреймов...")
+                uploaded = False
+                
+                # Попытка 1: Проверяем все фреймы на наличие input[type="file"] напрямую
+                for frame in page.frames:
+                    try:
+                        inp = frame.locator('input[type="file"]').first
+                        if await inp.count() > 0:
+                            print(f"Adobe: Нашли скрытое поле ввода во фрейме: {frame.url[:40]}")
+                            await frame.evaluate("""() => {
+                                document.querySelectorAll('input[type="file"]').forEach(el => {
+                                    el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
+                                });
+                            }""")
+                            await asyncio.sleep(1)
+                            await inp.set_input_files(str(mp3_path), timeout=15000)
+                            print("Adobe: Файл успешно внедрен во фрейм напрямую!")
+                            uploaded = True
+                            break
+                    except Exception:
+                        continue
 
-                print("Adobe: Ищем кнопку выбора файла...")
-                try:
-                    # Умный поиск кнопки загрузки через Playwright (Regex)
-                    upload_btn = page.locator('text=/(choose|выбрать|загрузить|upload)/i').first
-                    
-                    async with page.expect_file_chooser(timeout=10000) as fc_info:
-                        await upload_btn.click(force=True) # force=True игнорирует перекрывающие баннеры
-                    
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(str(mp3_path))
-                    print("Adobe: Файл передан через системный диалог!")
-                    
-                except Exception as e:
-                    print(f"Adobe: File Chooser не сработал. Ошибка: {e}. Пробуем отправить напрямую в DOM...")
-                    
-                    # Жесткая попытка загрузить файл, даже если input скрыт
-                    input_locator = page.locator('input[type="file"]').first
-                    await input_locator.set_input_files(str(mp3_path), timeout=10000)
-                    print("Adobe: Файл загружен в скрытый input!")
+                # Попытка 2: Если прямой инжект заблокирован, ищем кнопку Choose files внутри фреймов
+                if not uploaded:
+                    print("Adobe: Прямой инжект заблокирован. Ищем кнопку Choose files внутри фреймов...")
+                    for frame in page.frames:
+                        try:
+                            # Ищем кнопку по мультиязычному регулярному выражению прямо внутри фрейма
+                            upload_btn = frame.locator('text=/choose|выбрать|загрузить|upload/i').first
+                            if await upload_btn.count() > 0:
+                                print(f"Adobe: Нашли кнопку загрузки во фрейме {frame.url[:40]}, запускаем File Chooser...")
+                                async with page.expect_file_chooser(timeout=15000) as fc_info:
+                                    await upload_btn.click(force=True)
+                                file_chooser = await fc_info.value
+                                await file_chooser.set_files(str(mp3_path))
+                                print("Adobe: Файл успешно передан через диалог фрейма!")
+                                uploaded = True
+                                break
+                        except Exception:
+                            continue
+
+                if not uploaded:
+                    raise RuntimeError("Adobe заблокировал интерфейс загрузки: элемент не найден ни во фреймах, ни в DOM.")
+                # =================================================================
 
                 await asyncio.sleep(3)
 
-                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
-                    except Exception: continue
+                # Ищем кнопку запуска ИИ-обработки по всем фреймам
+                for frame in page.frames:
+                    for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
+                        try:
+                            btn = frame.locator(sel).first
+                            if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
+                        except Exception: continue
 
                 print("Adobe: Ожидание скачивания готового аудио (до 5 минут)...")
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
-                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
-                    if await dl_btn.count() > 0:
-                        download_locator = dl_btn
+                    # Ищем кнопку скачивания по всем фреймам страницы
+                    for frame in page.frames:
+                        dl_btn = frame.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
+                        if await dl_btn.count() > 0:
+                            download_locator = dl_btn
+                            break
+                    if download_locator:
                         break
 
                 if not download_locator:
@@ -303,7 +327,12 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
             except Exception as e:
                 original_error = str(e)[:150]
                 print(f"Сработал except: {original_error}")
-                # Если упадет ЗДЕСЬ, мы хотя бы уже получили скриншот ДО ошибки!
+                try:
+                    await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
+                    if send_screenshot:
+                        await send_screenshot("/tmp/adobe_error.png", f"Критический сбой Adobe:")
+                except Exception:
+                    pass
                 raise RuntimeError(f"{original_error}")
             finally:
                 await browser.close()
@@ -485,32 +514,3 @@ async def edit_desc(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
 async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    pending.pop(query.from_user.id, None)
-    await query.edit_message_text("❌ Отменено.")
-    return ConversationHandler.END
-
-def main():
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-    
-    print("🚀 Запускаем Telegram-бота...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text), group=-1)
-
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(button_edit, pattern="^edit$")],
-        states={
-            EDIT_TITLE: [MH(filters.TEXT & ~filters.COMMAND, edit_title)],
-            EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
-        },
-        fallbacks=[CallbackQueryHandler(button_cancel, pattern="^cancel$")],
-        per_chat=True
-    )
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
-    app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
