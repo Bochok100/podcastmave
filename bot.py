@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Visual Auth + Iframe Scanner + Web Camera + Drag-and-Drop)
-- Визуальный контроль интерфейса (без привязки к плавающим URL Adobe)
+Podcast Bot v2 (Human-Like Typing + Iframe Scanner + Web Camera + Drag-and-Drop)
+- Эмуляция живого ввода клавиатуры (защита от антиспама Adobe)
+- Вывод длины переменной Email в логи для дебага
 - Встроенный веб-сервер транслирует экран по адресу /screen
-- Жесткий визуальный контроль перед попыткой загрузки
 """
 
 import os
@@ -36,8 +36,8 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 OPENAI_KEY         = os.getenv("OPENAI_API_KEY")
 MAVE_EMAIL         = os.getenv("MAVE_EMAIL")
 MAVE_PASSWORD      = os.getenv("MAVE_PASSWORD")
-ADOBE_EMAIL        = os.getenv("ADOBE_EMAIL")
-ADOBE_PASSWORD     = os.getenv("ADOBE_PASSWORD")
+ADOBE_EMAIL        = os.getenv("ADOBE_EMAIL", "")
+ADOBE_PASSWORD     = os.getenv("ADOBE_PASSWORD", "")
 ADOBE_COOKIES_JSON = os.getenv("ADOBE_COOKIES_JSON")
 ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
@@ -115,8 +115,8 @@ def convert_to_mp3(input_path: Path) -> Path:
 # 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
-    if not ADOBE_EMAIL or not ADOBE_PASSWORD:
-        raise RuntimeError("❌ ОШИБКА: В Render не заполнены переменные ADOBE_EMAIL или ADOBE_PASSWORD!")
+    if not ADOBE_EMAIL.strip() or not ADOBE_PASSWORD.strip():
+        raise RuntimeError("❌ ОШИБКА: В Render пустое поле ADOBE_EMAIL или ADOBE_PASSWORD!")
 
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
     studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
@@ -158,16 +158,16 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                # Глобальный клик "Sign in", если мы на гостевой странице
-                try:
-                    await page.evaluate("""() => {
-                        const elements = Array.from(document.querySelectorAll('a, button'));
-                        const signIn = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === 'sign in');
-                        if (signIn) { signIn.click(); }
-                    }""")
-                    await asyncio.sleep(5)
-                except Exception:
-                    pass
+                if "auth" not in page.url:
+                    try:
+                        await page.evaluate("""() => {
+                            const elements = Array.from(document.querySelectorAll('a, button'));
+                            const signIn = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === 'sign in');
+                            if (signIn) { signIn.click(); }
+                        }""")
+                        await asyncio.sleep(5)
+                    except Exception:
+                        pass
 
                 # =================================================================
                 # УМНЫЙ ВИЗУАЛЬНЫЙ БЛОК АВТОРИЗАЦИИ (БЕЗ ПРИВЯЗКИ К ССЫЛКАМ)
@@ -183,9 +183,16 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(1)
 
                 if login_found:
-                    print(f"Adobe: Экран авторизации. Вводим почту: {ADOBE_EMAIL}")
+                    email_str = ADOBE_EMAIL.strip()
+                    print(f"Adobe: Экран авторизации. Вводим почту по буквам (Длина: {len(email_str)} симв.)")
+                    
                     email_field = page.locator('input[type="email"], input[name="username"]').first
-                    await email_field.fill(ADOBE_EMAIL)
+                    await email_field.wait_for(state="visible", timeout=15000)
+                    
+                    # Имитируем живого человека: кликаем, ждем, печатаем с задержкой
+                    await email_field.click()
+                    await asyncio.sleep(1)
+                    await email_field.press_sequentially(email_str, delay=100)
                     await asyncio.sleep(2)
                     
                     continue_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue"), button[type="submit"], #btn-id-forward').first
@@ -196,9 +203,12 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     # ПАРОЛЬ
                     pwd_field = page.locator('input[type="password"], #password').first
                     if await pwd_field.count() > 0:
-                        print("Adobe: Вводим пароль...")
-                        await pwd_field.fill(ADOBE_PASSWORD)
+                        pwd_str = ADOBE_PASSWORD.strip()
+                        print(f"Adobe: Вводим пароль по буквам (Длина: {len(pwd_str)} симв.)")
+                        await pwd_field.click()
                         await asyncio.sleep(1)
+                        await pwd_field.press_sequentially(pwd_str, delay=100)
+                        await asyncio.sleep(2)
                         
                         login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
                         if await login_btn.count() > 0:
@@ -237,7 +247,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         if await page.locator('text=/Choose files|Выбрать|Загрузить/i').count() > 0:
                             break
                         try:
-                            # Закрываем окна "Не сейчас", "Оставаться в системе"
                             await page.evaluate("""() => {
                                 const targets = Array.from(document.querySelectorAll('button, a, span'));
                                 const interstitialBtn = targets.find(el => {
@@ -250,7 +259,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         await asyncio.sleep(1)
                     await asyncio.sleep(3)
 
-                # Принудительный переход, если мы потерялись
+                # Принудительный переход
                 if "enhance" not in page.url:
                     print("Adobe: Принудительный переход на панель Enhance...")
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
@@ -258,16 +267,15 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(5)
                     
                 # =================================================================
-                # ЖЕСТКАЯ ПРОВЕРКА И ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ ДЛЯ ВЕБ-СЕРВЕРА
+                # ЖЕСТКАЯ ПРОВЕРКА И ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
                 # =================================================================
                 try:
                     await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
                 except Exception: pass
 
                 if await page.locator('input[type="email"], input[name="username"]').count() > 0:
-                    raise RuntimeError("❌ Бот не смог войти в аккаунт и остался на странице логина! Проверь скриншот по ссылке /screen")
+                    raise RuntimeError("❌ Бот не смог войти в аккаунт! Почта или пароль не приняты сайтом. Проверь /screen")
 
-                # Закрываем всплывающие баннеры
                 try:
                     await page.evaluate("""() => {
                         const btns = Array.from(document.querySelectorAll('button'));
@@ -277,13 +285,18 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(2)
                 except: pass
 
+                print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
+                try:
+                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
+                    await notify("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой. Если не видно, зайди на /screen")
+                except Exception as e:
+                    pass
+
                 # =================================================================
                 # МУЛЬТИ-ЗАГРУЗКА
                 # =================================================================
-                print("Adobe: Кабинет открыт. Инициируем алгоритм загрузки...")
                 uploaded = False
                 
-                # ШАГ 1: Скрытые поля
                 print("Шаг 1: Ищем скрытый input[type='file'] во всех фреймах...")
                 for frame in page.frames:
                     try:
@@ -300,7 +313,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     except Exception:
                         continue
 
-                # ШАГ 2: File Chooser
                 if not uploaded:
                     print("Шаг 2: Пробуем кликнуть по кнопке Choose files...")
                     for frame in page.frames:
@@ -317,7 +329,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         except Exception:
                             continue
 
-                # ШАГ 3: Drag-and-Drop
                 if not uploaded:
                     print("Шаг 3: Активируем Drag-and-Drop...")
                     try:
@@ -349,7 +360,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                 if not uploaded:
                     raise RuntimeError("❌ Adobe заблокировал интерфейс загрузки. Посмотри причину по ссылке /screen")
-                # =================================================================
 
                 await asyncio.sleep(3)
 
