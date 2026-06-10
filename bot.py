@@ -1,9 +1,10 @@
 """
-Podcast Bot v2 (Xvfb Headed Bypass + Cookie Injection)
+Podcast Bot v2 (Xvfb Headed Bypass + Raw Socket Server)
 - Запуск в Headed-режиме через виртуальный монитор (xvfb) для 100% обхода Cloudflare
 - Родные отпечатки браузера (без конфликтов User-Agent)
 - Оптимизация памяти под 512MB
 - Инжекция сессии ADOBE_COOKIES_JSON
+- Непробиваемый сокет-сервер для обхода таймаутов Render
 """
 
 import os
@@ -13,7 +14,7 @@ import tempfile
 import subprocess
 import shutil
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import socket
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -59,16 +60,24 @@ STYLE_PROMPT = """
 
 pending = {}
 
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is active!")
-
+# ──────────────────────────────────────────────
+# ВЕБ-ЗАГЛУШКА НА СЫРЫХ СОКЕТАХ (Непробиваемая для Render)
+# ──────────────────────────────────────────────
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    server.serve_forever()
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(('0.0.0.0', port))
+    server_socket.listen(5)
+    print(f"✅ Низкоуровневый Dummy-сервер запущен на порту {port}")
+    while True:
+        try:
+            client_socket, _ = server_socket.accept()
+            response = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\nBot is active!"
+            client_socket.sendall(response)
+            client_socket.close()
+        except Exception:
+            pass
 
 async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
     voice = update.message.voice or update.message.audio
@@ -101,7 +110,7 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
         print("Adobe: Запуск Chromium в ВИДИМОМ (Headed) режиме с виртуальным дисплеем...")
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=False,  # КРИТИЧЕСКИ ВАЖНО: Выключаем headless, обманываем Cloudflare!
+                headless=False,
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -109,7 +118,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 ]
             )
             
-            # Убрали жесткий user_agent, чтобы избежать конфликтов версий (Cloudflare это сечет)
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
                 locale="ru-RU",
@@ -120,7 +128,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             await Stealth().apply_stealth_async(page)
             
             try:
-                # Инжектим куки
                 if ADOBE_COOKIES_JSON:
                     print("Adobe: Обнаружены куки сессии! Загружаем в контекст браузера...")
                     try:
@@ -134,7 +141,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(2)
 
-                # Запасной логин, если куки не сработали
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Куки отсутствуют или протухли. Пробуем стандартный вход...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
@@ -250,7 +256,7 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=False, # Mave тоже запустим в Headed-режиме на всякий случай
+            headless=False,
             args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
         )
         context = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
@@ -411,7 +417,10 @@ async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
+    # Сервер на сырых сокетах запускается первым
     threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    print("🚀 Запускаем Telegram-бота...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_edit, pattern="^edit$")],
