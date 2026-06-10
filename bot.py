@@ -1,8 +1,7 @@
 """
-Podcast Bot v2 (Strict Login + Iframe Scanner + Token Conflict Safe)
-- Сканирование ВСЕХ фреймов на скрытые поля input[type="file"]
-- Предварительный скриншот экрана загрузки
-- Жесткий контроль авторизации
+Podcast Bot v2 (Strict Login + Web Camera Hack + Anti-Crash)
+- Встроенный веб-сервер теперь транслирует скриншот экрана Adobe по адресу /screen
+- Жесткий контроль авторизации и 3 ступени загрузки
 """
 
 import os
@@ -62,14 +61,29 @@ pending = {}
 adobe_2fa_state = {}
 
 # ──────────────────────────────────────────────
-# ЧЕСТНЫЙ HTTP-СЕРВЕР ДЛЯ СЛУЖБЫ ПОДДЕРЖКИ RENDER
+# ЧЕСТНЫЙ HTTP-СЕРВЕР (ТЕПЕРЬ С ВЕБ-КАМЕРОЙ)
 # ──────────────────────────────────────────────
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == '/screen':
+            try:
+                with open('/tmp/adobe_before_upload.png', 'rb') as f:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.end_headers()
+                    self.wfile.write(f.read())
+                    return
+            except FileNotFoundError:
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b"Screenshot is not ready yet. Send an audio to the bot first!")
+                return
+
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot is alive and kicking!")
+        self.wfile.write(b"Bot is alive! To see the Adobe screen, go to: /screen")
         
     def log_message(self, format, *args):
         return
@@ -77,7 +91,7 @@ class DummyHandler(BaseHTTPRequestHandler):
 def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    print(f"✅ Официальный HTTP-сервер успешно запущен на порту {port}")
+    print(f"✅ Официальный HTTP-сервер запущен на порту {port}")
     server.serve_forever()
 
 async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -110,9 +124,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
         if send_screenshot and os.path.exists(path):
             try:
                 await send_screenshot(path, caption)
-                print(f"📸 Скриншот успешно отправлен: {caption}")
-            except Exception as e:
-                print(f"❌ Сбой отправки скриншота в Телеграм: {e}")
+            except Exception:
+                pass
 
     try:
         print("Adobe: Открываем Chromium в HEADED режиме (Дисплей :99)...")
@@ -133,7 +146,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
             
             try:
                 if ADOBE_COOKIES_JSON:
-                    print("Adobe: Подгружаем куки сессии...")
                     try:
                         cookies = json.loads(ADOBE_COOKIES_JSON)
                         await context.add_cookies(cookies)
@@ -180,8 +192,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         await asyncio.sleep(4)
                         
                         try:
-                            await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
-                            await notify("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
+                            await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000) # Сохраняем для веб-сервера
+                            await notify("/tmp/adobe_before_upload.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
                         except Exception:
                             pass
                         
@@ -242,22 +254,32 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 if "auth" in page.url or "login" in page.url:
                     raise RuntimeError("❌ Бот застрял на странице авторизации! Проверьте правильность ADOBE_EMAIL и ADOBE_PASSWORD.")
 
+                # Закрываем всплывающие окна (Cookies, Welcome) перед загрузкой
+                try:
+                    await page.evaluate("""() => {
+                        const btns = Array.from(document.querySelectorAll('button'));
+                        const closeBtns = btns.filter(b => b.innerText.match(/Accept|Принять|Agree|Got it|Понятно|Close|Закрыть|Skip|Пропустить/i));
+                        closeBtns.forEach(b => b.click());
+                    }""")
+                    await asyncio.sleep(2)
+                except: pass
+
                 # =================================================================
-                # ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
+                # ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ ДЛЯ ВЕБ-СЕРВЕРА
                 # =================================================================
                 print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
                 try:
                     await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
-                    await notify("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой файла. Ищу кнопки...")
+                    await notify("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой. Если не видно, зайди на /screen")
                 except Exception as e:
                     print(f"Не удалось сделать предварительный скриншот: {e}")
 
                 # =================================================================
-                # МУЛЬТИ-ЗАГРУЗКА: ФРЕЙМЫ + СКРЫТЫЕ ПОЛЯ + DRAG&DROP
+                # МУЛЬТИ-ЗАГРУЗКА
                 # =================================================================
                 uploaded = False
                 
-                # ШАГ 1: Поиск скрытых полей input[type="file"] ВЕЗДЕ (во всех фреймах)
+                # ШАГ 1: Скрытые поля
                 print("Шаг 1: Ищем скрытый input[type='file'] во всех фреймах...")
                 for frame in page.frames:
                     try:
@@ -274,7 +296,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     except Exception:
                         continue
 
-                # ШАГ 2: Системный File Chooser через клик (если скрытые поля не сработали)
+                # ШАГ 2: File Chooser
                 if not uploaded:
                     print("Шаг 2: Пробуем кликнуть по кнопке Choose files...")
                     for frame in page.frames:
@@ -291,7 +313,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         except Exception:
                             continue
 
-                # ШАГ 3: Ультимативный Drag-and-Drop (насильный сброс файла)
+                # ШАГ 3: Drag-and-Drop
                 if not uploaded:
                     print("Шаг 3: Активируем Drag-and-Drop...")
                     try:
@@ -322,7 +344,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         print(f"Шаг 3 завершился ошибкой: {e}")
 
                 if not uploaded:
-                    raise RuntimeError("Adobe заблокировал интерфейс загрузки. Все методы исчерпаны.")
+                    raise RuntimeError("Adobe заблокировал интерфейс загрузки. Открой ссылку /screen, чтобы увидеть причину.")
                 # =================================================================
 
                 await asyncio.sleep(3)
