@@ -15,5 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# ХАК: Запускаем виртуальный экран в фоне (&), привязываем DISPLAY и честно стартуем бота
-CMD Xvfb :99 -screen 0 1366x768x24 -ac & export DISPLAY=:99 && python -u bot.py
+# Удаляем старый файл блокировки (если есть), запускаем виртуальный экран в фоне и стартуем бота
+CMD rm -f /tmp/.X99-lock && Xvfb :99 -screen 0 1366x768x24 -ac & export DISPLAY=:99 && python -u bot.py
