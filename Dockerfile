@@ -15,5 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Штатный запуск: -a автоматически подбирает дисплей и обходит проблему с .X99-lock
-CMD xvfb-run -a -s "-screen 0 1366x768x24 -ac" python -u bot.py
+# Железобетонный запуск через базовый shell:
+# 1. rm -rf /tmp/.X* -> жестко чистим любые старые блокировки
+# 2. Xvfb :99... &   -> запускаем монитор в фоне
+# 3. sleep 2         -> даем ему 2 секунды на включение
+# 4. python bot.py   -> запускаем нашего готового бота
+CMD sh -c "rm -rf /tmp/.X* && Xvfb :99 -screen 0 1366x768x24 -ac & sleep 2 && DISPLAY=:99 python -u bot.py"
