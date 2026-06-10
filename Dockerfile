@@ -3,16 +3,19 @@ FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
 
 WORKDIR /app
 
-# Отключаем буферизацию логов, чтобы видеть ошибки мгновенно
+# КРИТИЧЕСКИ ВАЖНО: Отключаем любые интерактивные вопросы при установке (чтобы сборка не висла)
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Устанавливаем ffmpeg для аудио и xvfb для виртуального монитора
-RUN apt-get update && apt-get install -y ffmpeg xvfb
+# Устанавливаем ffmpeg и xvfb в тихом режиме
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg xvfb && rm -rf /var/lib/apt/lists/*
 
+# Устанавливаем библиотеки Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Копируем код
 COPY . .
 
-# ЗАПУСК ЧЕРЕЗ ВИРТУАЛЬНЫЙ МОНИТОР (xvfb-run) с флагом -u
+# Запуск через виртуальный монитор
 CMD ["xvfb-run", "-a", "python", "-u", "bot.py"]
