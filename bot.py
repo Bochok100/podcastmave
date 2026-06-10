@@ -1,5 +1,6 @@
 """
-Podcast Bot v3.1 — Adobe Session Persistence + Async Fix
+Podcast Bot v3.2 — Armor Auth + Session Persistence + Async Fix
+- Жесткий обход невидимых полей (force=True, state="attached")
 - Сохранение куки (сессии) в adobe_state.json для обхода 2FA
 - block=False для параллельного приема проверочных кодов
 """
@@ -120,7 +121,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                   "--disable-blink-features=AutomationControlled"]
         )
         
-        # Загрузка сохраненной сессии, если она есть
         context_args = {
             "viewport": {"width": 1366, "height": 768},
             "locale": "en-US",
@@ -148,9 +148,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe открыт. URL: {page.url}")
 
-            # Если сессия рабочая, мы уже залогинены и кнопок логина не будет.
-            # Если кнопок нет — блок авторизации (шаги 2-6) просто пропустится.
-
             # ── 2. Нажимаем Sign In если нужно ──
             if "auth" not in page.url and "ims" not in page.url:
                 try:
@@ -163,21 +160,21 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 except Exception:
                     pass
 
-            # ── 3. Вводим email ──
+            # ── 3. Вводим email (С ЖЕСТКИМ ОБХОДОМ) ──
             if await page.locator('input[type="email"],input[name="username"]').count() > 0:
                 print("Adobe: вводим email...")
                 field = page.locator('input[type="email"],input[name="username"]').first
-                await field.wait_for(state="visible", timeout=10000)
-                await field.click()
+                await field.wait_for(state="attached", timeout=10000)
+                await field.click(force=True)
                 await asyncio.sleep(0.5)
-                await field.press_sequentially(ADOBE_EMAIL.strip(), delay=80)
+                await field.fill(ADOBE_EMAIL.strip())
                 await asyncio.sleep(1)
 
                 for sel in ['button:has-text("Continue")', '#btn-id-forward', 'button[type="submit"]']:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
-                            await el.click()
+                            await el.click(force=True)
                             break
                     except Exception:
                         continue
@@ -189,7 +186,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 print("Adobe: экран подтверждения — нажимаем Continue...")
                 btn = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
                 if await btn.count() > 0:
-                    await btn.click()
+                    await btn.click(force=True)
                 await asyncio.sleep(4)
 
             # ── 5. Ввод 2FA кода ──
@@ -206,7 +203,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(1)
                     sub = page.locator('button:has-text("Continue"),button:has-text("Submit"),button:has-text("Verify"),button[type="submit"]').first
                     if await sub.count() > 0:
-                        await sub.click()
+                        await sub.click(force=True)
                     await asyncio.sleep(5)
                     print(f"Adobe: 2FA код отправлен")
                 except asyncio.TimeoutError:
@@ -214,19 +211,21 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль ──
+            # ── 6. Вводим пароль (С ЖЕСТКИМ ОБХОДОМ) ──
             if await page.locator('input[type="password"],#password').count() > 0:
                 print("Adobe: вводим пароль...")
                 pwd = page.locator('input[type="password"],#password').first
-                await pwd.click()
+                await pwd.wait_for(state="attached", timeout=10000)
+                await pwd.click(force=True)
                 await asyncio.sleep(0.5)
-                await pwd.press_sequentially(ADOBE_PASSWORD.strip(), delay=80)
+                await pwd.fill(ADOBE_PASSWORD.strip())
                 await asyncio.sleep(1)
+                
                 for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
-                            await el.click()
+                            await el.click(force=True)
                             break
                     except Exception:
                         continue
@@ -587,7 +586,6 @@ def main():
     try:
         app = Application.builder().token(TELEGRAM_TOKEN).build()
         
-        # ДОБАВЛЕНО block=False ДЛЯ РЕШЕНИЯ ПРОБЛЕМЫ DEADLOCK
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text, block=False), group=1)
         
         conv = ConversationHandler(
@@ -599,7 +597,6 @@ def main():
             fallbacks=[CallbackQueryHandler(btn_cancel, pattern="^cancel$")],
             per_chat=True,
         )
-        # block=False ПОЗВОЛЯЕТ БОТУ СЛУШАТЬ ТВОИ СООБЩЕНИЯ В ПРОЦЕССЕ ЗАГРУЗКИ АУДИО
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice, block=False))
         app.add_handler(conv)
         app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
