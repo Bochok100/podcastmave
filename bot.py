@@ -121,110 +121,112 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             page = await context.new_page()
             await Stealth().apply_stealth_async(page) # Маскировка отпечатков
             
-            # ШАГ 1: Инжектим куки, если они заданы в настройках Render
-            if ADOBE_COOKIES_JSON:
-                print("Adobe: Обнаружены куки сессии! Загружаем в контекст браузера...")
-                try:
-                    cookies = json.loads(ADOBE_COOKIES_JSON)
-                    await context.add_cookies(cookies)
-                except Exception as ce:
-                    print(f"Adobe: Ошибка разбора JSON куков: {ce}")
-
-            print("Adobe: Открываем страницу Enhance...")
-            await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
-            await page.wait_for_load_state("networkidle")
-            await asyncio.sleep(2)
-
-            # ШАГ 2: Логин по логину/паролю (сработает ТОЛЬКО если куков нет или они протухли)
-            if "auth" in page.url or "login" in page.url or "ims" in page.url:
-                print("Adobe: Куки отсутствуют или не подошли. Пробуем стандартный вход...")
-                await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
-                await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
-                
-                for sel in ['button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
+            try:
+                # ШАГ 1: Инжектим куки, если они заданы в настройках Render
+                if ADOBE_COOKIES_JSON:
+                    print("Adobe: Обнаружены куки сессии! Загружаем в контекст браузера...")
                     try:
-                        el = page.locator(sel).first
-                        if await el.count() > 0: await el.click(); break
-                    except Exception: continue
+                        cookies = json.loads(ADOBE_COOKIES_JSON)
+                        await context.add_cookies(cookies)
+                    except Exception as ce:
+                        print(f"Adobe: Ошибка разбора JSON куков: {ce}")
 
-                await asyncio.sleep(3)
-                for sel in ['input[type="password"]', '#password']:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.count() > 0: await el.fill(ADOBE_PASSWORD); break
-                    except Exception: continue
-
-                for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.count() > 0: await el.click(); break
-                    except Exception: continue
-
-                await page.wait_for_url("**/enhance**", timeout=60000)
-                await page.wait_for_load_state("networkidle")
-
-            # Перестраховка перехода
-            if "enhance" not in page.url:
+                print("Adobe: Открываем страницу Enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("networkidle")
+                await asyncio.sleep(2)
 
-            print("Adobe: Панель открыта! Ищем скрытое поле загрузки...")
-            await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
-            
-            # Вытаскиваем input наружу для Playwright
-            await page.evaluate("""() => {
-                document.querySelectorAll('input[type="file"]').forEach(el => {
-                    el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
-                });
-            }""")
-            await asyncio.sleep(1)
+                # ШАГ 2: Логин по логину/паролю (сработает ТОЛЬКО если куков нет или они протухли)
+                if "auth" in page.url or "login" in page.url or "ims" in page.url:
+                    print("Adobe: Куки отсутствуют или не подошли. Пробуем стандартный вход...")
+                    await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
+                    await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
+                    
+                    for sel in ['button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.count() > 0: await el.click(); break
+                        except Exception: continue
 
-            await page.set_input_files('input[type="file"]', str(mp3_path))
-            print(f"Adobe: Файл {mp3_path.name} отправлен")
-            await asyncio.sleep(2)
+                    await asyncio.sleep(3)
+                    for sel in ['input[type="password"]', '#password']:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.count() > 0: await el.fill(ADOBE_PASSWORD); break
+                        except Exception: continue
 
-            # Нажимаем кнопку запуска ИИ обработки
-            for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.count() > 0: await btn.click(); print(f"Adobe: Кликнули '{sel}'"); break
-                except Exception: continue
+                    for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.count() > 0: await el.click(); break
+                        except Exception: continue
 
-            print("Adobe: Ждем готовности кнопки Download (до 5 минут)...")
-            download_locator = None
-            for i in range(60): 
-                await asyncio.sleep(5)
-                dl_btn = page.locator('button:has-text("Download"), a:has-text("Download")').last
-                if await dl_btn.count() > 0:
-                    download_locator = dl_btn
-                    break
+                    await page.wait_for_url("**/enhance**", timeout=60000)
+                    await page.wait_for_load_state("networkidle")
+                    await asyncio.sleep(4)
 
-            if not download_locator:
-                await page.screenshot(path="/tmp/adobe_timeout.png")
-                await notify("/tmp/adobe_timeout.png", "Adobe: Таймаут обработки")
-                raise RuntimeError("Adobe: Превышено время ожидания обработки")
+                # Перестраховка перехода
+                if "enhance" not in page.url:
+                    await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
+                    await page.wait_for_load_state("networkidle")
 
-            async with page.expect_download(timeout=120000) as dl_info:
-                await download_locator.click()
-            dl = await dl_info.value
-            await dl.save_as(str(adobe_path))
-            
-            if adobe_path.stat().st_size > 10000:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(adobe_path),
-                     "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                     "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(studio_path)],
-                    capture_output=True, text=True
-                )
-                if studio_path.exists(): return studio_path
-            return adobe_path
+                print("Adobe: Панель открыта! Ищем скрытое поле загрузки...")
+                await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
+                
+                # Вытаскиваем input наружу для Playwright
+                await page.evaluate("""() => {
+                    document.querySelectorAll('input[type="file"]').forEach(el => {
+                        el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
+                    });
+                }""")
+                await asyncio.sleep(1)
 
-        except Exception as e:
-            await page.screenshot(path="/tmp/adobe_error.png")
-            await notify("/tmp/adobe_error.png", f"Ошибка на Adobe:")
-            raise RuntimeError(f"Ошибка автоматизации Adobe: {str(e)[:150]}")
-        finally:
-            await browser.close()
+                await page.set_input_files('input[type="file"]', str(mp3_path))
+                print(f"Adobe: Файл {mp3_path.name} отправлен")
+                await asyncio.sleep(2)
+
+                # Нажимаем кнопку запуска ИИ обработки
+                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0: await btn.click(); print(f"Adobe: Кликнули '{sel}'"); break
+                    except Exception: continue
+
+                print("Adobe: Ждем готовности кнопки Download (до 5 минут)...")
+                download_locator = None
+                for i in range(60): 
+                    await asyncio.sleep(5)
+                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download")').last
+                    if await dl_btn.count() > 0:
+                        download_locator = dl_btn
+                        break
+
+                if not download_locator:
+                    await page.screenshot(path="/tmp/adobe_timeout.png")
+                    await notify("/tmp/adobe_timeout.png", "Adobe: Таймаут обработки")
+                    raise RuntimeError("Adobe: Превышено время ожидания обработки")
+
+                async with page.expect_download(timeout=120000) as dl_info:
+                    await download_locator.click()
+                dl = await dl_info.value
+                await dl.save_as(str(adobe_path))
+                
+                if adobe_path.stat().st_size > 10000:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(adobe_path),
+                         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                         "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(studio_path)],
+                        capture_output=True, text=True
+                    )
+                    if studio_path.exists(): return studio_path
+                return adobe_path
+
+            except Exception as e:
+                await page.screenshot(path="/tmp/adobe_error.png")
+                await notify("/tmp/adobe_error.png", f"Ошибка на Adobe:")
+                raise RuntimeError(f"Ошибка автоматизации Adobe: {str(e)[:150]}")
+            finally:
+                await browser.close()
     except Exception as e:
         raise RuntimeError(f"Adobe не принял файл: {e}")
 
