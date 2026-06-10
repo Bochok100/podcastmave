@@ -186,6 +186,9 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
 
                     await page.wait_for_url("**/enhance**", timeout=60000)
                     await page.wait_for_load_state("networkidle")
+                    await asyncio.sleep(5)
+                    await page.screenshot(path="/tmp/adobe_login_done.png")
+                    print(f"Adobe: логин успешен, URL={page.url}")
 
                 if "enhance" not in page.url:
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
