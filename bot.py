@@ -101,13 +101,13 @@ class DummyHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(b"HTML код пока не сохранен. Ждем ошибку...")
+                self.wfile.write("HTML код пока не сохранен. Ждем ошибку...".encode('utf-8'))
                 return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot is alive! Go to: /screen")
+        self.wfile.write("Bot is alive! To see the Adobe screen, go to: /screen".encode('utf-8'))
         
     def log_message(self, format, *args):
         return
