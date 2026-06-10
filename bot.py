@@ -1,9 +1,10 @@
 """
-Podcast Bot v2 (Xvfb Background + Pure HTTP Server)
+Podcast Bot v2 (Xvfb Background + Pure HTTP Server + Adobe UI Fix)
 - Запуск Xvfb в фоне через Docker для 100% обхода Cloudflare
 - Родные отпечатки браузера в headed-режиме (headless=False)
 - Честный HTTP-сервер для прохождения пинга Render (порт 10000)
 - Инжекция сессии ADOBE_COOKIES_JSON
+- Авто-клик по кнопке Sign In (фикс обновления интерфейса Adobe)
 """
 
 import os
@@ -139,6 +140,15 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 # Диагностика
                 await page.screenshot(path="/tmp/adobe_state.png")
                 await notify("/tmp/adobe_state.png", f"Статус страницы. Текущий URL: {page.url}")
+
+                # === НОВОЕ: Проверяем, есть ли на странице кнопка Sign In ===
+                sign_in_btn = page.locator('a:has-text("Sign in"), button:has-text("Sign in")').first
+                if await sign_in_btn.count() > 0 and "auth" not in page.url:
+                    print("Adobe: Найдена кнопка 'Sign in'. Сайт требует логин. Кликаем...")
+                    await sign_in_btn.click()
+                    await page.wait_for_load_state("networkidle")
+                    await asyncio.sleep(4)
+                # ==============================================================
 
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Токены не подошли, пробуем ввести форму...")
