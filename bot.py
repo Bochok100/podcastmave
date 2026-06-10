@@ -1,5 +1,5 @@
 """
-Podcast Bot v2 (Xvfb + Adobe 2FA + Drag-and-Drop + Веб-камера)
+Podcast Bot v3 — Adobe Podcast как человек + mave публикация
 """
 
 import os
@@ -21,318 +21,263 @@ from telegram.ext import (
     filters, ContextTypes,
 )
 from telegram.constants import ParseMode
-
 import openai
 from playwright.async_api import async_playwright
 
-# ──────────────────────────────────────────────
-# Настройки
-# ──────────────────────────────────────────────
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
-OPENAI_KEY         = os.getenv("OPENAI_API_KEY")
-MAVE_EMAIL         = os.getenv("MAVE_EMAIL")
-MAVE_PASSWORD      = os.getenv("MAVE_PASSWORD")
-ADOBE_EMAIL        = os.getenv("ADOBE_EMAIL", "")
-ADOBE_PASSWORD     = os.getenv("ADOBE_PASSWORD", "")
-ADOBE_COOKIES_JSON = os.getenv("ADOBE_COOKIES_JSON")
-ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
+# ── Настройки ──────────────────────────────────
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
+OPENAI_KEY      = os.getenv("OPENAI_API_KEY")
+MAVE_EMAIL      = os.getenv("MAVE_EMAIL")
+MAVE_PASSWORD   = os.getenv("MAVE_PASSWORD")
+ADOBE_EMAIL     = os.getenv("ADOBE_EMAIL", "")
+ADOBE_PASSWORD  = os.getenv("ADOBE_PASSWORD", "")
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 EDIT_TITLE, EDIT_DESC = range(2)
+pending = {}
+adobe_2fa_state = {}
 
 STYLE_PROMPT = """
-Ты — редактор подкаста Василия. Темы бывают разные: крипта, ИИ, технологии, семья, жизнь, бытовые вопросы — всё что угодно.
-ТВОЯ ЗАДАЧА: по расшифровке придумать заголовок и описание.
+Ты — редактор подкаста Василия. Темы разные: крипта, ИИ, технологии, семья, жизнь.
+По расшифровке придумай заголовок и описание.
 
-=== СТИЛЬ ЗАГОЛОВКА ===
-Учись у этих примеров (только стиль, не копируй):
+Стиль заголовков (только пример, не копируй):
 - Как на самом деле работают сделки
-- Что такое Long и Short на самом деле
-- Будущие тренды в крипте: куда смотреть до хайпа
 - Агенты ИИ: почему без них уже нельзя
 - Майнинг в России: быть или не быть?
+- Что такое Long и Short на самом деле
 
-Закономерности: конкретно, без воды, иногда "на самом деле", иногда вопрос.
-Тема диктует заголовок — не тяни всё к крипте если тема другая.
+Правила: конкретно, без воды, тема диктует заголовок.
 НЕ пиши "топ", "секреты", "шокирующий".
+Описание: 2 предложения, разговорный тон.
 
-=== СТИЛЬ ОПИСАНИЯ ===
-2 предложения: суть выпуска + зачем слушать. Разговорный тон.
-
-=== ФОРМАТ (СТРОГО) ===
-ЗАГОЛОВОК: [заголовок]
-ОПИСАНИЕ: [описание]
+Ответ строго:
+ЗАГОЛОВОК: [текст]
+ОПИСАНИЕ: [текст]
 
 ТРАНСКРИПЦИЯ:
 """
 
-pending = {}
-adobe_2fa_state = {}
 
-
-# ──────────────────────────────────────────────
-# HTTP-сервер (Render требует открытый порт)
-# + /screen показывает последний скриншот Adobe
-# ──────────────────────────────────────────────
-class DummyHandler(BaseHTTPRequestHandler):
+# ── HTTP сервер (Render требует порт) ──────────
+class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/screen':
-            for f in ['/tmp/adobe_before_upload.png', '/tmp/adobe_error.png', '/tmp/adobe_state.png']:
+            for f in ['/tmp/adobe_last.png', '/tmp/adobe_error.png']:
                 if os.path.exists(f):
                     self.send_response(200)
                     self.send_header("Content-Type", "image/png")
                     self.end_headers()
                     self.wfile.write(open(f, 'rb').read())
                     return
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.end_headers()
-            self.wfile.write("Скриншот ещё не готов. Отправь голосовое боту.".encode())
-            return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write("Bot is alive! Скриншот Adobe: /screen".encode())
+        self.wfile.write("Bot alive. Screen: /screen".encode())
 
-    def log_message(self, format, *args):
+    def log_message(self, *a):
         return
 
 
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), DummyHandler)
-    print(f"✅ HTTP-сервер запущен на порту {port}")
-    server.serve_forever()
+def run_server():
+    HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), Handler).serve_forever()
 
 
-# ──────────────────────────────────────────────
-# 1. Скачать голосовое
-# ──────────────────────────────────────────────
-async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
+# ── Утилиты ────────────────────────────────────
+async def download_voice(update, context) -> Path:
     voice = update.message.voice or update.message.audio
-    file = await context.bot.get_file(voice.file_id)
+    f = await context.bot.get_file(voice.file_id)
     tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
-    await file.download_to_drive(tmp.name)
+    await f.download_to_drive(tmp.name)
     return Path(tmp.name)
 
 
-# ──────────────────────────────────────────────
-# 2. Конвертация OGG → MP3
-# ──────────────────────────────────────────────
-def convert_to_mp3(input_path: Path) -> Path:
-    mp3_path = input_path.with_suffix(".mp3")
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(input_path),
-         "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(mp3_path)],
-        capture_output=True, text=True
-    )
-    return mp3_path
+def to_mp3(src: Path) -> Path:
+    dst = src.with_suffix(".mp3")
+    subprocess.run(["ffmpeg", "-y", "-i", str(src),
+                    "-codec:a", "libmp3lame", "-b:a", "128k",
+                    "-ar", "44100", "-ac", "1", str(dst)],
+                   capture_output=True)
+    return dst
 
 
-# ──────────────────────────────────────────────
-# 3. Adobe Podcast Enhance через Playwright
-# ──────────────────────────────────────────────
-async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
-    if not ADOBE_EMAIL.strip() or not ADOBE_PASSWORD.strip():
-        raise RuntimeError("В Render не заданы ADOBE_EMAIL или ADOBE_PASSWORD")
+# ── Adobe Podcast ──────────────────────────────
+async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
+    adobe = mp3.parent / (mp3.stem + "_adobe.mp3")
+    out   = mp3.parent / (mp3.stem + "_studio.mp3")
 
-    adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
-    studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
+    async def shot(path, caption):
+        try:
+            await page.screenshot(path=path)
+            await notify(path, caption)
+        except Exception:
+            pass
 
-    async def notify(path: str, caption: str):
-        if send_screenshot and os.path.exists(path):
-            try:
-                await send_screenshot(path, caption)
-            except Exception:
-                pass
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,  # Xvfb даёт виртуальный экран
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                  '--disable-blink-features=AutomationControlled']
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=False,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"]
         )
-        context = await browser.new_context(
+        ctx = await browser.new_context(
             viewport={"width": 1366, "height": 768},
             locale="en-US",
-            timezone_id="America/New_York",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36",
         )
-        # Скрываем webdriver через init script (замена playwright-stealth)
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = {runtime: {}};
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+            Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});
+            Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+            window.chrome={runtime:{}};
         """)
+        page = await ctx.new_page()
 
-        page = await context.new_page()
         try:
-            # Загружаем куки если есть
-            if ADOBE_COOKIES_JSON:
-                try:
-                    await context.add_cookies(json.loads(ADOBE_COOKIES_JSON))
-                    print("Adobe: куки загружены")
-                except Exception as e:
-                    print(f"Adobe: куки не загрузились — {e}")
-
-            # Переходим на enhance
-            print("Adobe: переход на podcast.adobe.com/enhance...")
+            # ── 1. Открываем Adobe Podcast ──
+            print("Adobe: открываем enhance...")
             await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
             await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
+            await shot("/tmp/adobe_last.png", f"Adobe открыт. URL: {page.url}")
 
-            await page.screenshot(path="/tmp/adobe_state.png")
-            await notify("/tmp/adobe_state.png", f"Adobe: открыли страницу. URL: {page.url}")
-            print(f"Adobe: URL = {page.url}")
-
-            # Нажимаем Sign in если есть на странице
+            # ── 2. Нажимаем Sign In если нужно ──
             if "auth" not in page.url and "ims" not in page.url:
                 try:
                     await page.evaluate("""() => {
-                        const el = Array.from(document.querySelectorAll('a, button'))
-                            .find(e => e.innerText && e.innerText.trim().toLowerCase() === 'sign in');
+                        const el = [...document.querySelectorAll('a,button')]
+                            .find(e => /^sign in$/i.test(e.innerText?.trim()));
                         if (el) el.click();
                     }""")
                     await asyncio.sleep(4)
-                    print(f"Adobe: после Sign in клика URL = {page.url}")
+                    print(f"Adobe: после Sign In клика → {page.url}")
                 except Exception:
                     pass
 
-            # ── Авторизация ──
-            login_needed = await page.locator('input[type="email"], input[name="username"]').count() > 0
-            if not login_needed and ("auth" in page.url or "ims" in page.url):
-                login_needed = True
-
-            if login_needed:
+            # ── 3. Вводим email ──
+            if await page.locator('input[type="email"],input[name="username"]').count() > 0:
                 print("Adobe: вводим email...")
-                email_field = page.locator('input[type="email"], input[name="username"]').first
-                await email_field.wait_for(state="visible", timeout=15000)
-                await email_field.click()
+                field = page.locator('input[type="email"],input[name="username"]').first
+                await field.wait_for(state="visible", timeout=10000)
+                await field.click()
+                await asyncio.sleep(0.5)
+                await field.press_sequentially(ADOBE_EMAIL.strip(), delay=80)
                 await asyncio.sleep(1)
-                await email_field.press_sequentially(ADOBE_EMAIL.strip(), delay=80)
-                await asyncio.sleep(2)
 
-                # Continue
-                for sel in ['button:has-text("Continue")', 'button:has-text("Продолжить")',
-                            '#btn-id-forward', 'button[type="submit"]']:
+                for sel in ['button:has-text("Continue")', '#btn-id-forward', 'button[type="submit"]']:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
                             await el.click()
-                            print(f"Adobe: Continue нажат '{sel}'")
+                            print(f"Adobe: Continue нажат")
                             break
                     except Exception:
                         continue
                 await asyncio.sleep(4)
+                await shot("/tmp/adobe_last.png", "Adobe: после email")
 
-                # 2FA — подтверждение личности
-                if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
-                    print("Adobe: экран 2FA — нажимаем Continue для отправки кода...")
-                    btn = page.locator('button:has-text("Continue"), button:has-text("Продолжить")').first
-                    if await btn.count() > 0:
-                        await btn.click()
-                        await asyncio.sleep(4)
+            # ── 4. Экран подтверждения личности (перед кодом) ──
+            if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
+                print("Adobe: экран подтверждения — нажимаем Continue...")
+                btn = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
+                if await btn.count() > 0:
+                    await btn.click()
+                await asyncio.sleep(4)
 
-                # 2FA — ввод кода
-                code_input = page.locator('input[type="text"][autocomplete*="one-time"], input[name*="code"], input[maxlength="6"]').first
-                if await code_input.count() > 0:
-                    print("Adobe: запрашиваем 2FA код у пользователя...")
-                    await page.screenshot(path="/tmp/adobe_2fa.png")
-                    await notify("/tmp/adobe_2fa.png",
-                                 "⚠️ Adobe запросил 2FA код!\nПроверь почту и пришли мне код обычным текстом (2 минуты).")
-                    event = asyncio.Event()
-                    adobe_2fa_state[user_id] = {"event": event, "code": ""}
-                    try:
-                        await asyncio.wait_for(event.wait(), timeout=120.0)
-                        received_code = adobe_2fa_state[user_id]["code"].strip()
-                        await code_input.fill(received_code)
-                        await asyncio.sleep(1)
-                        sub = page.locator('button:has-text("Continue"), button:has-text("Submit"), button:has-text("Verify"), button[type="submit"]').first
-                        if await sub.count() > 0:
-                            await sub.click()
-                        await asyncio.sleep(5)
-                        print(f"Adobe: 2FA код '{received_code}' отправлен")
-                    except asyncio.TimeoutError:
-                        raise RuntimeError("Таймаут 2FA: код не пришёл за 2 минуты")
-                    finally:
-                        adobe_2fa_state.pop(user_id, None)
-
-                # Пароль
-                pwd = page.locator('input[type="password"], #password').first
-                if await pwd.count() > 0:
-                    print("Adobe: вводим пароль...")
-                    await pwd.click()
+            # ── 5. Ввод 2FA кода ──
+            code_sel = 'input[type="text"][maxlength="6"],input[name*="code"],input[autocomplete*="one-time"]'
+            if await page.locator(code_sel).count() > 0:
+                print("Adobe: нужен 2FA код...")
+                await shot("/tmp/adobe_last.png",
+                           "⚠️ Adobe запросил код с почты!\nПришли мне его обычным текстом (2 минуты).")
+                ev = asyncio.Event()
+                adobe_2fa_state[user_id] = {"event": ev, "code": ""}
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=120)
+                    code = adobe_2fa_state[user_id]["code"].strip()
+                    await page.locator(code_sel).first.fill(code)
                     await asyncio.sleep(1)
-                    await pwd.press_sequentially(ADOBE_PASSWORD.strip(), delay=80)
-                    await asyncio.sleep(2)
-                    for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")',
-                                'button:has-text("Войти")', 'button[type="submit"]']:
-                        try:
-                            el = page.locator(sel).first
-                            if await el.count() > 0:
-                                await el.click()
-                                print(f"Adobe: Sign in нажат '{sel}'")
-                                break
-                        except Exception:
-                            continue
-                    await asyncio.sleep(6)
+                    sub = page.locator('button:has-text("Continue"),button:has-text("Submit"),button:has-text("Verify"),button[type="submit"]').first
+                    if await sub.count() > 0:
+                        await sub.click()
+                    await asyncio.sleep(5)
+                    print(f"Adobe: 2FA код отправлен")
+                except asyncio.TimeoutError:
+                    raise RuntimeError("2FA таймаут: код не пришёл за 2 минуты")
+                finally:
+                    adobe_2fa_state.pop(user_id, None)
 
-                # Ждём редиректа на enhance
-                print("Adobe: ждём редиректа...")
-                for _ in range(20):
-                    url = page.url
-                    if "enhance" in url or "podcast.adobe.com" in url:
-                        break
-                    # Закрываем промежуточные экраны
+            # ── 6. Вводим пароль ──
+            if await page.locator('input[type="password"],#password').count() > 0:
+                print("Adobe: вводим пароль...")
+                pwd = page.locator('input[type="password"],#password').first
+                await pwd.click()
+                await asyncio.sleep(0.5)
+                await pwd.press_sequentially(ADOBE_PASSWORD.strip(), delay=80)
+                await asyncio.sleep(1)
+                for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
                     try:
-                        await page.evaluate("""() => {
-                            const btn = Array.from(document.querySelectorAll('button,a'))
-                                .find(e => /не сейчас|not now|skip|пропустить|продолжить|continue|yes|да/i.test(e.innerText));
-                            if (btn) btn.click();
-                        }""")
+                        el = page.locator(sel).first
+                        if await el.count() > 0:
+                            await el.click()
+                            print("Adobe: Sign in нажат")
+                            break
                     except Exception:
-                        pass
-                    await asyncio.sleep(1)
+                        continue
+                await asyncio.sleep(6)
+                await shot("/tmp/adobe_last.png", "Adobe: после пароля")
 
-            # Принудительный переход если не на enhance
+            # Закрываем промежуточные экраны
+            for _ in range(10):
+                try:
+                    await page.evaluate("""() => {
+                        const btn = [...document.querySelectorAll('button,a')]
+                            .find(e => /not now|skip|пропустить|continue|продолжить/i.test(e.innerText?.trim()));
+                        if (btn) btn.click();
+                    }""")
+                except Exception:
+                    pass
+                if "enhance" in page.url:
+                    break
+                await asyncio.sleep(1)
+
+            # Переходим на enhance если не там
             if "enhance" not in page.url:
-                print("Adobe: принудительный переход на enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(5)
+                await asyncio.sleep(4)
 
             # Проверяем что залогинились
-            if await page.locator('input[type="email"], input[name="username"]').count() > 0:
-                await page.screenshot(path="/tmp/adobe_error.png")
-                await notify("/tmp/adobe_error.png", "❌ Не удалось войти в Adobe. Проверь /screen")
-                raise RuntimeError("Adobe: не удалось войти — неверный email или пароль")
+            if await page.locator('input[type="email"],input[name="username"]').count() > 0:
+                await shot("/tmp/adobe_error.png", "❌ Не удалось войти в Adobe — проверь /screen")
+                raise RuntimeError("Adobe: не удалось войти. Проверь email/пароль в Render Variables")
 
             # Закрываем баннеры
             try:
                 await page.evaluate("""() => {
                     document.querySelectorAll('button').forEach(b => {
-                        if (/Accept|Agree|Got it|Понятно|Close|Skip/i.test(b.innerText)) b.click();
+                        if (/Accept|Agree|Got it|Close|Skip/i.test(b.innerText)) b.click();
                     });
                 }""")
                 await asyncio.sleep(2)
             except Exception:
                 pass
 
-            await page.screenshot(path="/tmp/adobe_before_upload.png")
-            await notify("/tmp/adobe_before_upload.png", "Adobe: залогинились, загружаем файл...")
-            print("Adobe: страница enhance открыта, загружаем файл...")
+            await shot("/tmp/adobe_last.png", "Adobe: залогинились! Загружаем файл...")
+            print("Adobe: залогинились, загружаем файл...")
 
-            # ── Загрузка файла (3 стратегии) ──
+            # ── 7. Загрузка файла (3 стратегии) ──
             uploaded = False
 
-            # Стратегия 1: скрытый input[type=file]
+            # Стратегия 1 — скрытый input
             for frame in page.frames:
                 try:
-                    inputs = await frame.locator('input[type="file"]').all()
-                    for inp in inputs:
+                    for inp in await frame.locator('input[type="file"]').all():
                         try:
-                            await inp.set_input_files(str(mp3_path), timeout=5000)
-                            print(f"✅ Файл загружен через input (фрейм: {frame.url[:40]})")
+                            await inp.set_input_files(str(mp3), timeout=5000)
+                            print("✅ Файл через input[type=file]")
                             uploaded = True
                             break
                         except Exception:
@@ -342,166 +287,115 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 except Exception:
                     continue
 
-            # Стратегия 2: file chooser через клик
+            # Стратегия 2 — file chooser
             if not uploaded:
-                print("Adobe: пробуем file chooser...")
                 for frame in page.frames:
                     try:
-                        btn = frame.locator('text=/Choose files|Выбрать|Upload/i').first
+                        btn = frame.locator('text=/Choose files|Upload/i').first
                         if await btn.count() > 0:
                             async with page.expect_file_chooser(timeout=5000) as fc_info:
                                 await btn.click(force=True)
-                            fc = await fc_info.value
-                            await fc.set_files(str(mp3_path))
-                            print("✅ Файл загружен через file chooser")
+                            await (await fc_info.value).set_files(str(mp3))
+                            print("✅ Файл через file chooser")
                             uploaded = True
                             break
                     except Exception:
                         continue
 
-            # Стратегия 3: drag-and-drop через JS
+            # Стратегия 3 — drag-and-drop JS
             if not uploaded:
-                print("Adobe: drag-and-drop через JS DataTransfer...")
-                with open(mp3_path, "rb") as f:
+                with open(mp3, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode()
                 await page.evaluate(f"""async () => {{
-                    const b64 = "{b64}";
-                    const bin = atob(b64);
-                    const arr = new Uint8Array(bin.length);
-                    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-                    const file = new File([arr], "{mp3_path.name}", {{type:"audio/mpeg"}});
-                    const dt = new DataTransfer();
-                    dt.items.add(file);
+                    const bin = atob("{b64}"), arr = new Uint8Array(bin.length);
+                    for (let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+                    const file = new File([arr],"{mp3.name}",{{type:"audio/mpeg"}});
+                    const dt = new DataTransfer(); dt.items.add(file);
                     ['dragenter','dragover','drop'].forEach(ev =>
-                        document.body.dispatchEvent(new DragEvent(ev, {{bubbles:true, cancelable:true, dataTransfer:dt}}))
+                        document.body.dispatchEvent(new DragEvent(ev,{{bubbles:true,cancelable:true,dataTransfer:dt}}))
                     );
                 }}""")
-                print("✅ Drag-and-drop выполнен")
+                print("✅ Файл через drag-and-drop JS")
                 uploaded = True
 
             await asyncio.sleep(3)
-            await page.screenshot(path="/tmp/adobe_uploaded.png")
-            await notify("/tmp/adobe_uploaded.png", "Adobe: файл отправлен, ждём обработки...")
+            await shot("/tmp/adobe_last.png", "Adobe: файл загружен, жмём Enhance...")
 
-            # Нажимаем Enhance
+            # ── 8. Нажимаем Enhance ──
             for frame in page.frames:
-                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")',
-                            'button:has-text("Clean up")', 'button[type="submit"]']:
+                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
                     try:
                         btn = frame.locator(sel).first
                         if await btn.count() > 0:
-                            await btn.evaluate("node => node.click()")
-                            print(f"Adobe: Enhance нажат '{sel}'")
+                            await btn.evaluate("n=>n.click()")
+                            print(f"Adobe: Enhance нажат")
                             break
                     except Exception:
                         continue
 
-            # Ждём кнопку Download (до 5 минут, скрины каждые 30 сек)
-            print("Adobe: ждём обработку (до 5 минут)...")
-            download_locator = None
+            # ── 9. Ждём Download (до 5 минут) ──
+            print("Adobe: ждём обработку...")
+            dl_btn = None
             for i in range(60):
                 await asyncio.sleep(5)
                 for frame in page.frames:
-                    dl = frame.locator('button:has-text("Download"), a:has-text("Download")').last
-                    if await dl.count() > 0:
-                        download_locator = dl
+                    b = frame.locator('button:has-text("Download"),a:has-text("Download")').last
+                    if await b.count() > 0:
+                        dl_btn = b
                         break
-                if download_locator:
+                if dl_btn:
                     print(f"Adobe: Download найден (шаг {i+1})")
                     break
+                # Скриншот каждые 30 сек
                 if i % 6 == 5:
-                    await page.screenshot(path=f"/tmp/adobe_wait_{i}.png")
-                    await notify(f"/tmp/adobe_wait_{i}.png", f"Adobe: обрабатываем... ({(i+1)*5} сек)")
-                    print(f"Adobe: ждём ({i+1}/60)")
+                    await shot("/tmp/adobe_last.png", f"Adobe: обрабатываем... {(i+1)*5} сек")
 
-            if not download_locator:
-                await page.screenshot(path="/tmp/adobe_timeout.png")
-                await notify("/tmp/adobe_timeout.png", "Adobe: таймаут 5 минут — Download не появился")
-                raise RuntimeError("Adobe: кнопка Download не появилась за 5 минут")
+            if not dl_btn:
+                await shot("/tmp/adobe_error.png", "Adobe: таймаут — Download не появился за 5 минут")
+                raise RuntimeError("Adobe: Download не появился за 5 минут")
 
-            await page.screenshot(path="/tmp/adobe_done.png")
-            await notify("/tmp/adobe_done.png", "Adobe: обработка завершена, скачиваем!")
+            await shot("/tmp/adobe_last.png", "✅ Adobe обработал! Скачиваем...")
 
-            # Скачиваем
+            # ── 10. Скачиваем ──
             async with page.expect_download(timeout=120000) as dl_info:
-                await download_locator.evaluate("node => node.click()")
+                await dl_btn.evaluate("n=>n.click()")
             dl = await dl_info.value
-            await dl.save_as(str(adobe_path))
-            size = adobe_path.stat().st_size
-            print(f"Adobe: скачан файл {size} байт")
+            await dl.save_as(str(adobe))
+            size = adobe.stat().st_size
+            print(f"Adobe: скачан {size} байт")
 
             if size < 10000:
-                raise RuntimeError(f"Adobe вернул слишком маленький файл ({size} байт)")
+                raise RuntimeError(f"Adobe вернул пустой файл ({size} байт)")
 
-            # loudnorm поверх Adobe
-            result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(adobe_path),
+            # loudnorm
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(adobe),
                  "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                 "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
-                 str(studio_path)],
-                capture_output=True, text=True
+                 "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out)],
+                capture_output=True
             )
-            if result.returncode == 0 and studio_path.exists():
-                print(f"Adobe+loudnorm: {studio_path.stat().st_size} байт")
-                return studio_path
-            return adobe_path
+            return out if r.returncode == 0 and out.exists() else adobe
 
         except Exception as e:
             try:
                 await page.screenshot(path="/tmp/adobe_error.png")
-                await notify("/tmp/adobe_error.png", f"❌ Adobe ошибка: {str(e)[:100]}")
+                await notify("/tmp/adobe_error.png", f"❌ Adobe ошибка: {str(e)[:120]}")
             except Exception:
                 pass
-            raise RuntimeError(f"Adobe: {str(e)[:200]}")
+            raise RuntimeError(f"Adobe: {e}")
         finally:
             await browser.close()
 
 
-# ──────────────────────────────────────────────
-# 4. Транскрипция Whisper
-# ──────────────────────────────────────────────
-def transcribe(mp3_path: Path) -> str:
-    client = openai.OpenAI(api_key=OPENAI_KEY)
-    safe = mp3_path.parent / (mp3_path.stem + "_w.mp3")
-    shutil.copy2(mp3_path, safe)
-    with open(safe, "rb") as f:
-        return client.audio.transcriptions.create(
-            model="whisper-1", file=f, language="ru"
-        ).text
-
-
-# ──────────────────────────────────────────────
-# 5. Генерация метаданных GPT-4o
-# ──────────────────────────────────────────────
-def generate_metadata(transcript: str) -> tuple[str, str]:
-    client = openai.OpenAI(api_key=OPENAI_KEY)
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": STYLE_PROMPT + transcript}],
-        max_tokens=512, temperature=0.7
-    )
-    text = resp.choices[0].message.content
-    title = description = ""
-    for line in text.splitlines():
-        clean = line.strip().replace("**", "")
-        if clean.upper().startswith("ЗАГОЛОВОК:"):
-            title = clean[10:].strip()
-        elif clean.upper().startswith("ОПИСАНИЕ:"):
-            description = clean[9:].strip()
-    return title, description
-
-
-# ──────────────────────────────────────────────
-# 6. Загрузка в mave.digital
-# ──────────────────────────────────────────────
-async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+# ── mave.digital ───────────────────────────────
+async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
             headless=False,
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
         )
-        context = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
-        page = await context.new_page()
+        ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
+        page = await ctx.new_page()
         try:
             await page.goto("https://app.mave.digital/login")
             await page.fill('input[type="email"]', MAVE_EMAIL)
@@ -511,28 +405,28 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             await asyncio.sleep(4)
 
             await page.evaluate("""() => {
-                document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e => e.remove());
-                document.querySelectorAll('.q-overlay, .q-dialog__backdrop').forEach(e => e.remove());
-                document.body.classList.remove('q-body--prevent-scroll', 'q-body--force-scrollbar-x');
+                document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e=>e.remove());
+                document.querySelectorAll('.q-overlay,.q-dialog__backdrop').forEach(e=>e.remove());
+                document.body.classList.remove('q-body--prevent-scroll','q-body--force-scrollbar-x');
             }""")
             await asyncio.sleep(1)
-
             await page.locator('text=Добавить выпуск').first.click()
             await asyncio.sleep(3)
+
             await page.wait_for_selector('input[type="file"]', state='attached', timeout=15000)
-            await page.set_input_files('input[type="file"]', str(mp3_path))
+            await page.set_input_files('input[type="file"]', str(mp3))
             await asyncio.sleep(2)
 
             for sel in ['button:has-text("Загрузить файл")', 'button:has-text("Загрузить")']:
                 try:
                     btn = page.locator(sel).first
                     if await btn.count() > 0:
-                        await btn.evaluate("node => node.click()")
+                        await btn.evaluate("n=>n.click()")
                         break
                 except Exception:
                     continue
 
-            for i in range(36):
+            for _ in range(36):
                 await asyncio.sleep(5)
                 html = await page.content()
                 if any(x in html for x in ["Название выпуска", "episode-title", "upload-progress-done"]):
@@ -553,17 +447,17 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
                     el = page.locator(sel).first
                     if await el.count() > 0:
                         await el.click()
-                        await el.fill(description)
+                        await el.fill(desc)
                         break
                 except Exception:
                     continue
 
             published = False
-            for btn_text in ["Опубликовать", "Сохранить выпуск", "Сохранить"]:
+            for txt in ["Опубликовать", "Сохранить выпуск", "Сохранить"]:
                 try:
-                    btn = page.locator(f'button:has-text("{btn_text}")').first
+                    btn = page.locator(f'button:has-text("{txt}")').first
                     if await btn.count() > 0:
-                        await btn.evaluate("node => node.click()")
+                        await btn.evaluate("n=>n.click()")
                         published = True
                         break
                 except Exception:
@@ -576,175 +470,184 @@ async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
             return True
         except Exception as e:
             await page.screenshot(path="/tmp/mave_error.png")
-            raise RuntimeError(f"{e}")
+            raise RuntimeError(str(e))
         finally:
             await browser.close()
 
 
-# ──────────────────────────────────────────────
-# Telegram handlers
-# ──────────────────────────────────────────────
-async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+# ── Транскрипция ───────────────────────────────
+def transcribe(mp3: Path) -> str:
+    client = openai.OpenAI(api_key=OPENAI_KEY)
+    safe = mp3.parent / (mp3.stem + "_w.mp3")
+    shutil.copy2(mp3, safe)
+    with open(safe, "rb") as f:
+        return client.audio.transcriptions.create(model="whisper-1", file=f, language="ru").text
+
+
+# ── Метаданные ─────────────────────────────────
+def generate_metadata(transcript: str) -> tuple[str, str]:
+    client = openai.OpenAI(api_key=OPENAI_KEY)
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": STYLE_PROMPT + transcript}],
+        max_tokens=512, temperature=0.7
+    )
+    text = resp.choices[0].message.content
+    title = desc = ""
+    for line in text.splitlines():
+        c = line.strip().replace("**", "")
+        if c.upper().startswith("ЗАГОЛОВОК:"):
+            title = c[10:].strip()
+        elif c.upper().startswith("ОПИСАНИЕ:"):
+            desc = c[9:].strip()
+    return title, desc
+
+
+# ── Telegram handlers ──────────────────────────
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if ALLOWED_USER_ID and uid != ALLOWED_USER_ID:
         return
-    msg = await update.message.reply_text("⏳ Начинаю обработку...")
+    msg = await update.message.reply_text("⏳ Начинаю...")
     try:
-        ogg = await download_voice(update, tg_context)
-        await msg.edit_text("🔄 Конвертирую в MP3...")
-        mp3 = convert_to_mp3(ogg)
+        ogg = await download_voice(update, ctx)
+        await msg.edit_text("🔄 MP3...")
+        mp3 = to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Adobe Podcast: улучшаю звук (3-5 минут)...")
+        await msg.edit_text("🎙️ Adobe Podcast Enhance (3-5 мин)...")
 
-        async def send_screenshot(path: str, caption: str):
+        async def notify(path, caption):
             try:
                 if os.path.exists(path):
                     await update.message.reply_photo(photo=open(path, "rb"), caption=f"ℹ️ {caption}")
             except Exception:
                 pass
 
-        studio_mp3 = await enhance_audio(mp3, user_id=user_id, send_screenshot=send_screenshot)
+        studio = await enhance_audio(mp3, uid, notify)
 
-        await msg.edit_text("📝 Транскрибирую (Whisper)...")
-        transcript = transcribe(studio_mp3)
+        await msg.edit_text("📝 Whisper транскрипция...")
+        text = transcribe(studio)
 
-        await msg.edit_text("✍️ Генерирую заголовок и описание (GPT-4o)...")
-        title, description = generate_metadata(transcript)
+        await msg.edit_text("✍️ GPT-4o заголовок...")
+        title, desc = generate_metadata(text)
 
-        pending[user_id] = {"mp3": studio_mp3, "title": title, "description": description}
+        pending[uid] = {"mp3": studio, "title": title, "description": desc}
         await msg.delete()
 
-        keyboard = InlineKeyboardMarkup([[
+        kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Опубликовать в mave", callback_data="publish"),
             InlineKeyboardButton("✏️ Изменить", callback_data="edit"),
         ], [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
-        preview = (f"🎙 *Готов к публикации*\n\n"
-                   f"*Заголовок:*\n{title}\n\n*Описание:*\n{description}\n\nОдобряешь?")
-        await update.message.reply_document(document=open(studio_mp3, "rb"), filename=f"{title[:40]}.mp3")
-        await update.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+
+        await update.message.reply_document(document=open(studio, "rb"), filename=f"{title[:40]}.mp3")
+        await update.message.reply_text(
+            f"🎙 *Готов*\n\n*Заголовок:*\n{title}\n\n*Описание:*\n{desc}\n\nОдобряешь?",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
 
-async def handle_global_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перехватывает 2FA код от пользователя"""
-    user_id = update.effective_user.id
-    if user_id in adobe_2fa_state:
-        code = update.message.text.strip()
-        adobe_2fa_state[user_id]["code"] = code
-        adobe_2fa_state[user_id]["event"].set()
-        await update.message.reply_text("✅ Код принят, отправляю в Adobe...")
+async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in adobe_2fa_state:
+        adobe_2fa_state[uid]["code"] = update.message.text.strip()
+        adobe_2fa_state[uid]["event"].set()
+        await update.message.reply_text("✅ Код принят!")
 
 
-async def button_publish(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = pending.get(user_id)
+async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = pending.get(uid)
     if not data:
-        await query.edit_message_text("❌ Сессия устарела. Запиши заново.")
+        await q.edit_message_text("❌ Сессия устарела.")
         return
-    await query.edit_message_text("⏳ Загружаю в mave.digital...")
+    await q.edit_message_text("⏳ Загружаю в mave...")
     try:
         await upload_to_mave(data["mp3"], data["title"], data["description"])
-        caption = f"✅ *Опубликовано!*\n\n_{data['title']}_\n\nСкоро на Spotify и Apple Podcasts."
+        caption = f"✅ *Опубликовано!*\n\n_{data['title']}_"
         if os.path.exists("/tmp/mave_done.png"):
-            await query.message.reply_photo(
-                photo=open("/tmp/mave_done.png", "rb"),
-                caption=caption, parse_mode=ParseMode.MARKDOWN
-            )
-            await query.message.delete()
+            await q.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"),
+                                        caption=caption, parse_mode=ParseMode.MARKDOWN)
+            await q.message.delete()
         else:
-            await query.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
-        pending.pop(user_id, None)
+            await q.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
+        pending.pop(uid, None)
     except Exception as e:
         if os.path.exists("/tmp/mave_error.png"):
-            await query.message.reply_photo(
-                photo=open("/tmp/mave_error.png", "rb"),
-                caption=f"❌ Ошибка mave: {e}"
-            )
-            await query.message.delete()
+            await q.message.reply_photo(photo=open("/tmp/mave_error.png", "rb"),
+                                        caption=f"❌ mave ошибка: {e}")
+            await q.message.delete()
         else:
-            await query.edit_message_text(f"❌ Ошибка: {e}")
+            await q.edit_message_text(f"❌ Ошибка: {e}")
 
 
-async def button_edit(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = pending.get(query.from_user.id)
-    await query.edit_message_text(
-        f"✏️ Заголовок:\n*{data['title']}*\n\nНапиши новый (или /skip):",
-        parse_mode=ParseMode.MARKDOWN
-    )
+async def btn_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = pending.get(q.from_user.id)
+    await q.edit_message_text(f"✏️ Заголовок:\n*{data['title']}*\n\nНовый (или /skip):",
+                              parse_mode=ParseMode.MARKDOWN)
     return EDIT_TITLE
 
 
-async def edit_title(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def edit_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     if update.message.text != "/skip":
-        pending[user_id]["title"] = update.message.text
-    data = pending[user_id]
+        pending[uid]["title"] = update.message.text
     await update.message.reply_text(
-        f"📝 Описание:\n_{data['description']}_\n\nНапиши новое (или /skip):",
-        parse_mode=ParseMode.MARKDOWN
-    )
+        f"📝 Описание:\n_{pending[uid]['description']}_\n\nНовое (или /skip):",
+        parse_mode=ParseMode.MARKDOWN)
     return EDIT_DESC
 
 
-async def edit_desc(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def edit_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     if update.message.text != "/skip":
-        pending[user_id]["description"] = update.message.text
-    data = pending[user_id]
-    keyboard = InlineKeyboardMarkup([[
+        pending[uid]["description"] = update.message.text
+    d = pending[uid]
+    kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Опубликовать", callback_data="publish"),
-        InlineKeyboardButton("❌ Отмена", callback_data="cancel")
+        InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
     ]])
     await update.message.reply_text(
-        f"🎙 *Обновлено:*\n\n*Заголовок:* {data['title']}\n*Описание:* {data['description']}\n\nПубликуем?",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-    )
+        f"*Заголовок:* {d['title']}\n*Описание:* {d['description']}\n\nПубликуем?",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     return ConversationHandler.END
 
 
-async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    pending.pop(query.from_user.id, None)
-    await query.edit_message_text("❌ Отменено.")
+async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pending.pop(q.from_user.id, None)
+    await q.edit_message_text("❌ Отменено.")
     return ConversationHandler.END
 
 
-# ──────────────────────────────────────────────
-# Запуск
-# ──────────────────────────────────────────────
+# ── Запуск ─────────────────────────────────────
 def main():
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-
-    print("🚀 Запускаем бота...")
+    threading.Thread(target=run_server, daemon=True).start()
+    print("🚀 Бот запускается...")
     try:
         app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-        # 2FA перехватчик — высокий приоритет (group=-1)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text), group=-1)
-
         conv = ConversationHandler(
-            entry_points=[CallbackQueryHandler(button_edit, pattern="^edit$")],
+            entry_points=[CallbackQueryHandler(btn_edit, pattern="^edit$")],
             states={
                 EDIT_TITLE: [MH(filters.TEXT & ~filters.COMMAND, edit_title)],
                 EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
             },
-            fallbacks=[CallbackQueryHandler(button_cancel, pattern="^cancel$")],
+            fallbacks=[CallbackQueryHandler(btn_cancel, pattern="^cancel$")],
             per_chat=True,
         )
         app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
         app.add_handler(conv)
-        app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
-        app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
-
+        app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
+        app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
         print("✅ Бот запущен!")
         app.run_polling()
-
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
         while True:
