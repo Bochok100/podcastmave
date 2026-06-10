@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + FileChooser Fix)
-- Использование нативного file_chooser вместо хака скрытого input
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Multi-lang Upload)
+- Мультиязычный поиск кнопки загрузки (Choose/Выбрать/Загрузить)
+- Жесткий таймаут для резервной загрузки (защита от зависаний)
 - Исправлен тайминг после ввода пароля
-- Поддержка русского интерфейса авторизации
 - Интерактивный перехват 2FA-кода
 """
 
@@ -238,28 +238,39 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
 
-                print("Adobe: Личный кабинет открыт! Ищем кнопку 'Choose files'...")
+                print("Adobe: Личный кабинет открыт! Ищем кнопку выбора файла...")
                 
-                # === НОВЫЙ СПОСОБ ЗАГРУЗКИ (Нативный File Chooser Playwright) ===
+                # === МУЛЬТИЯЗЫЧНАЯ ЗАГРУЗКА И БЕЗОПАСНЫЙ ФОЛБЭК ===
                 try:
-                    # Ждем, пока браузер сам перехватит окно выбора файла
-                    async with page.expect_file_chooser(timeout=20000) as fc_info:
-                        # Кликаем по кнопке или всей фиолетовой зоне загрузки
-                        await page.locator('button:has-text("Choose files"), label:has-text("Choose files")').first.click()
+                    # Попытка 1: Нативный File Chooser (Умный клик по кнопке на Рус/Англ)
+                    async with page.expect_file_chooser(timeout=15000) as fc_info:
+                        await page.evaluate("""() => {
+                            const elements = Array.from(document.querySelectorAll('button, label, span, div[role="button"]'));
+                            const btn = elements.find(el => {
+                                const t = el.innerText ? el.innerText.trim().toLowerCase() : '';
+                                return t.includes('choose') || t.includes('выбрать') || t.includes('загрузить') || t.includes('upload');
+                            });
+                            if (btn) btn.click();
+                        }""")
                     
                     file_chooser = await fc_info.value
                     await file_chooser.set_files(str(mp3_path))
-                    print("Adobe: Файл передан через системный диалог!")
+                    print("Adobe: Файл успешно передан через системный диалог!")
+                    
                 except Exception as e:
-                    print(f"Adobe: Клик по Choose files не сработал. Ошибка: {e}. Пробуем старый метод...")
-                    # Резервный метод на всякий случай
+                    print(f"Adobe: File Chooser не сработал. Ошибка: {e}. Пробуем прямой инжект...")
+                    
+                    # Попытка 2: Принудительный показ скрытого инпута
                     await page.evaluate("""() => {
-                        document.querySelectorAll('input[type="file"]').forEach(el => {
-                            el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
-                        });
+                        let inp = document.querySelector('input[type="file"]');
+                        if (inp) {
+                            inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
+                        }
                     }""")
                     await asyncio.sleep(1)
-                    await page.set_input_files('input[type="file"]', str(mp3_path))
+                    # Жесткий таймаут в 10 секунд, чтобы скрипт больше не висел бесконечно
+                    await page.set_input_files('input[type="file"]', str(mp3_path), timeout=10000)
+                    print("Adobe: Файл загружен через скрытый input!")
                 # =================================================================
 
                 await asyncio.sleep(3)
@@ -274,7 +285,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
-                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download")').last
+                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
                     if await dl_btn.count() > 0:
                         download_locator = dl_btn
                         break
