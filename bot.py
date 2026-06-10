@@ -1,10 +1,9 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Global JS Click)
-- Запуск Xvfb в фоне через Docker
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + RU Locators)
+- Поддержка русского интерфейса авторизации Adobe ("Продолжить", "Войти")
+- Интеллектуальное ожидание редиректа после логина
 - Безопасные скриншоты (timeout=5000)
-- Честный HTTP-сервер для прохождения пинга Render
 - Интерактивный перехват 2FA-кода из чата Telegram
-- Глобальный JS-клик для обхода перерисовок DOM на Adobe
 """
 
 import os
@@ -59,7 +58,7 @@ STYLE_PROMPT = """
 """
 
 pending = {}
-adobe_2fa_state = {}  # Глобальное хранилище для перехвата 2FA-кода из чата
+adobe_2fa_state = {}  # Глобальное хранилище для перехвата 2FA-кода
 
 # ──────────────────────────────────────────────
 # ЧЕСТНЫЙ HTTP-СЕРВЕР ДЛЯ СЛУЖБЫ ПОДДЕРЖКИ RENDER
@@ -97,7 +96,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Adobe Podcast с обходом 2FA)
+# 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -138,7 +137,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                # === ГЛОБАЛЬНЫЙ JS-КЛИК БЕЗ ЛОКАТОРОВ PLAYWRIGHT ===
+                # Глобальный JS-клик для обхода перерисовок
                 if "auth" not in page.url:
                     print("Adobe: Ищем кнопку Sign In глобальным скриптом...")
                     try:
@@ -149,18 +148,17 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                                 signIn.click();
                             }
                         }""")
-                        await asyncio.sleep(5) # Ждем, пока сработает редирект
+                        await asyncio.sleep(5)
                     except Exception as e:
-                        print(f"Adobe: JS-клик пропущен: {e}")
-                # ====================================================
+                        pass
 
-                # Ввод Email / Пароля
+                # Ввод Email / Пароля с поддержкой РУССКОГО интерфейса
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Вводим почту...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
                     await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
                     
-                    for sel in ['button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
+                    for sel in ['button:has-text("Продолжить")', 'button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
                         try:
                             el = page.locator(sel).first
                             if await el.count() > 0: await el.evaluate("node => node.click()"); break
@@ -168,7 +166,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                     await asyncio.sleep(4)
                     
-                    # === ИНТЕРАКТИВНЫЙ ОБХОД 2FA (Проверка личности) ===
+                    # 2FA (Проверка личности)
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
                         print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем код...")
                         try:
@@ -182,18 +180,17 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         try:
                             await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
                             if send_screenshot:
-                                await send_screenshot("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Скопируй его и пришли мне сюда ОБЫЧНЫМ ТЕКСТОМ в течение 2 минут.")
-                        except Exception as screenshot_err:
-                            print(f"Ошибка скриншота 2FA (пропускаем): {screenshot_err}")
+                                await send_screenshot("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
+                        except Exception:
+                            pass
                         
-                        # Создаем событие ожидания ответа из чата Телеграм
                         event = asyncio.Event()
                         adobe_2fa_state[user_id] = {"event": event, "code": ""}
                         
                         try:
                             await asyncio.wait_for(event.wait(), timeout=120.0)
                             received_code = adobe_2fa_state[user_id]["code"].strip()
-                            print(f"Adobe: Перехватили код из чата: {received_code}. Заполняем форму...")
+                            print(f"Adobe: Перехватили код: {received_code}. Заполняем форму...")
                             
                             code_field = page.locator('input[type="text"], input[type="number"], input[name*="code"]').first
                             await code_field.fill(received_code)
@@ -207,26 +204,34 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             await page.wait_for_load_state("domcontentloaded")
                             await asyncio.sleep(5)
                         except asyncio.TimeoutError:
-                            raise RuntimeError("Таймаут: ты не успел прислать код за 2 минут.")
+                            raise RuntimeError("Таймаут: вы не успели прислать код за 2 минуты.")
                         finally:
                             adobe_2fa_state.pop(user_id, None)
-                    # ===================================================
 
-                    # Обычный ввод пароля
+                    # Ввод пароля
                     if await page.locator('input[type="password"], #password').count() > 0:
                         print("Adobe: Вводим пароль...")
                         await page.locator('input[type="password"], #password').first.fill(ADOBE_PASSWORD)
-                        for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
+                        for sel in ['button:has-text("Продолжить")', 'button:has-text("Войти")', 'button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
                             try:
                                 el = page.locator(sel).first
                                 if await el.count() > 0: await el.evaluate("node => node.click()"); break
                             except Exception: continue
 
-                    await asyncio.sleep(5)
+                    # === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Ждем редиректа 15 секунд ===
+                    print("Adobe: Ждем завершения авторизации и загрузки интерфейса...")
+                    for _ in range(15):
+                        if "enhance" in page.url and "auth" not in page.url:
+                            break
+                        await asyncio.sleep(1)
+                    await asyncio.sleep(4)
 
-                if "enhance" not in page.url:
+                # Если редирект не сработал или мы застряли — принудительно идем на Enhance
+                if "enhance" not in page.url or "auth" in page.url:
+                    print("Adobe: Принудительный переход на Enhance...")
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("domcontentloaded")
+                    await asyncio.sleep(5)
 
                 print("Adobe: Ожидаем поле загрузки...")
                 await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
@@ -240,7 +245,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                 await page.set_input_files('input[type="file"]', str(mp3_path))
                 print(f"Adobe: Файл загружен в инпут")
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
                     try:
