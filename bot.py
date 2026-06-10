@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Xvfb + Strict Login + Ultimate Drag-and-Drop)
-- Жесткий контроль авторизации (предотвращает слепую загрузку на экране логина)
-- Ультимативный обход загрузки: эмуляция перетаскивания файла мышкой (Drag & Drop)
-- Защита от мгновенных падений (Application exited early)
+Podcast Bot v2 (Strict Login + Iframe Scanner + Token Conflict Safe)
+- Сканирование ВСЕХ фреймов на скрытые поля input[type="file"]
+- Предварительный скриншот экрана загрузки
+- Жесткий контроль авторизации
 """
 
 import os
@@ -100,7 +100,6 @@ def convert_to_mp3(input_path: Path) -> Path:
 # 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
-    # Жесткая проверка переменных окружения
     if not ADOBE_EMAIL or not ADOBE_PASSWORD:
         raise RuntimeError("❌ ОШИБКА: В Render не заполнены переменные ADOBE_EMAIL или ADOBE_PASSWORD!")
 
@@ -109,7 +108,11 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
     async def notify(path: str, caption: str):
         if send_screenshot and os.path.exists(path):
-            await send_screenshot(path, caption)
+            try:
+                await send_screenshot(path, caption)
+                print(f"📸 Скриншот успешно отправлен: {caption}")
+            except Exception as e:
+                print(f"❌ Сбой отправки скриншота в Телеграм: {e}")
 
     try:
         print("Adobe: Открываем Chromium в HEADED режиме (Дисплей :99)...")
@@ -167,7 +170,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await continue_btn.click()
                     await asyncio.sleep(5)
                     
-                    # Проверка на 2FA
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
                         print("Adobe: Запрашиваем 2FA код...")
                         try:
@@ -179,8 +181,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         
                         try:
                             await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
-                            if send_screenshot:
-                                await send_screenshot("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
+                            await notify("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
                         except Exception:
                             pass
                         
@@ -204,7 +205,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         finally:
                             adobe_2fa_state.pop(user_id, None)
 
-                    # Проверка на ввод пароля
                     if await page.locator('input[type="password"], #password').count() > 0:
                         print("Adobe: Вводим пароль...")
                         pwd_field = page.locator('input[type="password"], #password').first
@@ -239,42 +239,62 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
                     
-                # ЖЕСТКАЯ ПРОВЕРКА (чтобы не пытаться грузить файл на странице логина)
                 if "auth" in page.url or "login" in page.url:
-                    raise RuntimeError("❌ Бот застрял на странице авторизации! Проверьте правильность ADOBE_EMAIL и ADOBE_PASSWORD в настройках Render.")
+                    raise RuntimeError("❌ Бот застрял на странице авторизации! Проверьте правильность ADOBE_EMAIL и ADOBE_PASSWORD.")
 
                 # =================================================================
-                # УЛЬТИМАТИВНАЯ ЗАГРУЗКА: 3 СТУПЕНИ
+                # ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
                 # =================================================================
-                print("Adobe: Кабинет открыт. Инициируем алгоритм загрузки...")
+                print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
+                try:
+                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
+                    await notify("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой файла. Ищу кнопки...")
+                except Exception as e:
+                    print(f"Не удалось сделать предварительный скриншот: {e}")
+
+                # =================================================================
+                # МУЛЬТИ-ЗАГРУЗКА: ФРЕЙМЫ + СКРЫТЫЕ ПОЛЯ + DRAG&DROP
+                # =================================================================
                 uploaded = False
                 
-                try:
-                    print("Шаг 1: Ищем интерфейс загрузки на экране...")
-                    target = page.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').first
-                    await target.wait_for(state="visible", timeout=5000)
-                    async with page.expect_file_chooser(timeout=5000) as fc_info:
-                        await target.click(force=True)
-                    file_chooser = await fc_info.value
-                    await file_chooser.set_files(str(mp3_path))
-                    print("✅ Файл загружен через системное окно!")
-                    uploaded = True
-                except Exception as e:
-                    print(f"Шаг 1 пропущен ({e}).")
-
-                if not uploaded:
+                # ШАГ 1: Поиск скрытых полей input[type="file"] ВЕЗДЕ (во всех фреймах)
+                print("Шаг 1: Ищем скрытый input[type='file'] во всех фреймах...")
+                for frame in page.frames:
                     try:
-                        print("Шаг 2: Ищем скрытый input...")
-                        inp = page.locator('input[type="file"]').first
-                        await inp.set_input_files(str(mp3_path), timeout=5000)
-                        print("✅ Файл загружен через скрытый input!")
-                        uploaded = True
-                    except Exception as e:
-                        print(f"Шаг 2 пропущен ({e}).")
+                        file_inputs = await frame.locator('input[type="file"]').all()
+                        for inp in file_inputs:
+                            try:
+                                await inp.set_input_files(str(mp3_path), timeout=5000)
+                                print(f"✅ Файл загружен в скрытый input (фрейм: {frame.url[:30]})")
+                                uploaded = True
+                                break
+                            except Exception:
+                                pass
+                        if uploaded: break
+                    except Exception:
+                        continue
 
+                # ШАГ 2: Системный File Chooser через клик (если скрытые поля не сработали)
                 if not uploaded:
+                    print("Шаг 2: Пробуем кликнуть по кнопке Choose files...")
+                    for frame in page.frames:
+                        try:
+                            target = frame.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').first
+                            if await target.count() > 0:
+                                async with page.expect_file_chooser(timeout=5000) as fc_info:
+                                    await target.click(force=True)
+                                file_chooser = await fc_info.value
+                                await file_chooser.set_files(str(mp3_path))
+                                print("✅ Файл загружен через системное окно!")
+                                uploaded = True
+                                break
+                        except Exception:
+                            continue
+
+                # ШАГ 3: Ультимативный Drag-and-Drop (насильный сброс файла)
+                if not uploaded:
+                    print("Шаг 3: Активируем Drag-and-Drop...")
                     try:
-                        print("Шаг 3: Активируем ультимативный Drag-and-Drop...")
                         with open(mp3_path, "rb") as f:
                             file_base64 = base64.b64encode(f.read()).decode("utf-8")
                         
@@ -283,7 +303,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             const res = await fetch(dataUrl);
                             const blob = await res.blob();
                             const file = new File([blob], filename, { type: mime });
-                            
                             const dt = new DataTransfer();
                             dt.items.add(file);
                             
@@ -296,31 +315,35 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             document.body.dispatchEvent(dropEvent);
                         }""", [file_base64, mp3_path.name, "audio/mpeg"])
                         
-                        print("✅ УСПЕХ! Файл физически сброшен в окно браузера!")
+                        print("✅ Файл физически сброшен в окно браузера!")
                         uploaded = True
                         await asyncio.sleep(4)
                     except Exception as e:
                         print(f"Шаг 3 завершился ошибкой: {e}")
 
                 if not uploaded:
-                    raise RuntimeError("Adobe заблокировал интерфейс загрузки. Все 3 метода исчерпаны.")
+                    raise RuntimeError("Adobe заблокировал интерфейс загрузки. Все методы исчерпаны.")
                 # =================================================================
 
                 await asyncio.sleep(3)
 
-                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
-                    except Exception: continue
+                for frame in page.frames:
+                    for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
+                        try:
+                            btn = frame.locator(sel).first
+                            if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
+                        except Exception: continue
 
                 print("Adobe: Ожидание скачивания готового аудио (до 5 минут)...")
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
-                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
-                    if await dl_btn.count() > 0:
-                        download_locator = dl_btn
+                    for frame in page.frames:
+                        dl_btn = frame.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
+                        if await dl_btn.count() > 0:
+                            download_locator = dl_btn
+                            break
+                    if download_locator:
                         break
 
                 if not download_locator:
@@ -346,8 +369,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 print(f"Сработал except: {original_error}")
                 try:
                     await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
-                    if send_screenshot:
-                        await send_screenshot("/tmp/adobe_error.png", f"Критический сбой Adobe:")
+                    await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
                 except Exception:
                     pass
                 raise RuntimeError(f"{original_error}")
