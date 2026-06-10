@@ -105,45 +105,99 @@ def convert_to_mp3(input_path: Path) -> Path:
 #    Шаг 1: ElevenLabs Audio Isolation — убирает ВСЁ кроме голоса
 #    Шаг 2: FFmpeg мастеринг — делает голос радийным/студийным
 # ──────────────────────────────────────────────
-async def enhance_audio(mp3_path: Path) -> Path:
+async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     """
-    Шаг 1: Adobe Podcast Enhance Speech через браузер (Playwright)
-            Заходим на сайт, загружаем файл, скачиваем результат.
-    Шаг 2: FFmpeg loudnorm — стандарт громкости подкастов (-16 LUFS)
+    Adobe Podcast Enhance Speech через Playwright.
+    Если Adobe недоступен — FFmpeg мастеринг как запасной.
+    send_screenshot: async callable(path) для отправки скрина в Telegram при ошибке
     """
-    adobe_path = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
+    adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
     studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
-
-    # ── ШАГ 1: Adobe Podcast через браузер ──
     adobe_success = False
+
     try:
         print("Adobe Podcast: запускаем браузер...")
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(viewport={"width": 1280, "height": 900})
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                accept_downloads=True,
+            )
             page = await context.new_page()
             try:
-                # Открываем Adobe Podcast Enhance Speech
                 await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
                 await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(2)
-                print(f"Adobe Podcast: страница загружена, URL={page.url}")
+                await asyncio.sleep(3)
+                print(f"Adobe: URL={page.url}")
                 await page.screenshot(path="/tmp/adobe_01.png")
 
-                # Ищем поле загрузки файла
-                await page.wait_for_selector('input[type="file"]', timeout=15000)
-                await page.set_input_files('input[type="file"]', str(mp3_path))
-                print(f"Adobe Podcast: файл загружен {mp3_path.name}")
+                # Adobe использует скрытый input — нужно диспатчить событие напрямую
+                # Сначала находим любой input[type=file] включая скрытые
+                file_input = page.locator('input[type="file"]').first
+                input_count = await page.locator('input[type="file"]').count()
+                print(f"Adobe: найдено input[type=file]: {input_count}")
+
+                if input_count > 0:
+                    # Снимаем display:none и visibility:hidden через JS
+                    await page.evaluate("""() => {
+                        const inputs = document.querySelectorAll('input[type="file"]');
+                        inputs.forEach(el => {
+                            el.style.display = 'block';
+                            el.style.visibility = 'visible';
+                            el.style.opacity = '1';
+                            el.style.width = '100px';
+                            el.style.height = '100px';
+                            el.style.position = 'fixed';
+                            el.style.top = '0';
+                            el.style.left = '0';
+                            el.style.zIndex = '99999';
+                        });
+                    }""")
+                    await asyncio.sleep(1)
+                    await page.set_input_files('input[type="file"]', str(mp3_path))
+                    print(f"Adobe: файл передан через input: {mp3_path.name}")
+                else:
+                    # Пробуем drag-and-drop через JS FileList
+                    print("Adobe: input не найден, пробуем drag-and-drop через JS...")
+                    with open(mp3_path, "rb") as f:
+                        file_bytes = f.read()
+                    import base64
+                    b64 = base64.b64encode(file_bytes).decode()
+                    await page.evaluate(f"""async () => {{
+                        const b64 = "{b64}";
+                        const byteChars = atob(b64);
+                        const byteArr = new Uint8Array(byteChars.length);
+                        for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+                        const file = new File([byteArr], "{mp3_path.name}", {{type: "audio/mpeg"}});
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+                        // Ищем drop-зону
+                        const dropZone = document.querySelector(
+                            '[class*="drop"], [class*="upload"], [class*="drag"], section, main'
+                        );
+                        if (dropZone) {{
+                            const ev = new DragEvent("drop", {{bubbles: true, dataTransfer: dt}});
+                            dropZone.dispatchEvent(ev);
+                        }}
+                    }}""")
+                    print("Adobe: drag-and-drop отправлен")
+
                 await asyncio.sleep(3)
                 await page.screenshot(path="/tmp/adobe_02.png")
 
-                # Нажимаем кнопку Enhance / Улучшить
-                for btn in ["Enhance speech", "Enhance", "Upload", "Start", "Process"]:
+                # Ищем и нажимаем кнопку Enhance
+                for sel in [
+                    'button:has-text("Enhance speech")',
+                    'button:has-text("Enhance")',
+                    'button:has-text("Clean up speech")',
+                    '[data-testid*="enhance"]',
+                    'button[type="submit"]',
+                ]:
                     try:
-                        el = page.locator(f'button:has-text("{btn}"), [role="button"]:has-text("{btn}")').first
+                        el = page.locator(sel).first
                         if await el.count() > 0:
                             await el.click()
-                            print(f"Adobe Podcast: кнопка '{btn}' нажата")
+                            print(f"Adobe: кнопка '{sel}' нажата")
                             break
                     except Exception:
                         continue
@@ -151,69 +205,68 @@ async def enhance_audio(mp3_path: Path) -> Path:
                 await asyncio.sleep(3)
                 await page.screenshot(path="/tmp/adobe_03.png")
 
-                # Ждём обработки (до 5 минут)
-                print("Adobe Podcast: ждём обработки...")
+                # Ждём обработки до 5 минут
+                print("Adobe: ждём обработки...")
                 for i in range(60):
                     await asyncio.sleep(5)
                     html = await page.content()
-                    # Ищем кнопку скачивания
-                    if any(x in html for x in ["Download", "download", "Скачать", "enhanced"]):
-                        print(f"Adobe Podcast: обработка завершена (шаг {i+1})")
+                    url  = page.url
+                    if any(x in html.lower() for x in ["download", "enhanced", "готово", "complete"]):
+                        print(f"Adobe: обработка завершена (шаг {i+1})")
                         await page.screenshot(path="/tmp/adobe_04_done.png")
                         break
-                    print(f"Adobe Podcast: ждём... ({i+1}/60)")
+                    print(f"Adobe: ждём... ({i+1}/60) URL={url}")
+
+                await page.screenshot(path="/tmp/adobe_04_done.png")
 
                 # Скачиваем результат
-                download_btn = None
                 for sel in [
                     'a[download]',
                     'button:has-text("Download")',
                     'a:has-text("Download")',
+                    'button:has-text("Скачать")',
                     '[href*=".mp3"]',
                     '[data-testid*="download"]',
                 ]:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
-                            download_btn = el
-                            print(f"Adobe Podcast: кнопка скачивания найдена → {sel}")
+                            print(f"Adobe: скачиваем через '{sel}'...")
+                            async with page.expect_download(timeout=60000) as dl_info:
+                                await el.click()
+                            dl = await dl_info.value
+                            await dl.save_as(str(adobe_path))
+                            size = adobe_path.stat().st_size
+                            print(f"Adobe: файл скачан {size} байт")
+                            if size > 10000:
+                                adobe_success = True
                             break
-                    except Exception:
+                    except Exception as ex:
+                        print(f"Adobe download sel {sel}: {ex}")
                         continue
 
-                if download_btn:
-                    # Перехватываем скачивание
-                    async with page.expect_download(timeout=60000) as dl_info:
-                        await download_btn.click()
-                    download = await dl_info.value
-                    await download.save_as(str(adobe_path))
-                    size = adobe_path.stat().st_size
-                    print(f"Adobe Podcast: скачан файл {size} байт")
-                    if size > 10000:
-                        adobe_success = True
-                    else:
-                        print("Adobe Podcast: файл слишком маленький")
-                else:
-                    print("Adobe Podcast: кнопка скачивания не найдена")
-                    await page.screenshot(path="/tmp/adobe_no_download.png")
+                if not adobe_success:
                     html = await page.content()
-                    print(f"Adobe HTML: {html[500:2000]}")
+                    print(f"Adobe: кнопка скачивания не найдена")
+                    print(f"Adobe HTML[0:3000]: {html[:3000]}")
+                    await page.screenshot(path="/tmp/adobe_error.png")
+                    if send_screenshot:
+                        await send_screenshot("/tmp/adobe_error.png", "Adobe: не нашёл кнопку скачивания")
 
             except Exception as e:
-                print(f"Adobe Podcast браузер: {e}")
+                print(f"Adobe браузер исключение: {e}")
                 await page.screenshot(path="/tmp/adobe_error.png")
+                if send_screenshot:
+                    await send_screenshot("/tmp/adobe_error.png", f"Adobe ошибка: {e}")
             finally:
                 await browser.close()
 
     except Exception as e:
-        print(f"Adobe Podcast: исключение — {e}")
+        print(f"Adobe: внешнее исключение — {e}")
 
-    source = adobe_path if adobe_success else mp3_path
-    if adobe_success:
-        print(f"Adobe Podcast: успех, используем {adobe_path.name}")
-    else:
-        print("Adobe Podcast: не удалось, используем FFmpeg мастеринг")
-        # Запасной вариант — FFmpeg с полной цепочкой фильтров
+    # ── Запасной: FFmpeg мастеринг ──
+    if not adobe_success:
+        print("Adobe не удался → FFmpeg мастеринг...")
         audio_filters = ",".join([
             "afftdn=nf=-25:nt=w",
             "highpass=f=80",
@@ -232,11 +285,12 @@ async def enhance_audio(mp3_path: Path) -> Path:
             capture_output=True, text=True
         )
         if result.returncode == 0 and studio_path.exists():
-            print(f"FFmpeg запасной: готово {studio_path.stat().st_size} байт")
+            print(f"FFmpeg: готово {studio_path.stat().st_size} байт")
             return studio_path
         return mp3_path
 
-    # ── ШАГ 2: loudnorm поверх Adobe результата ──
+    # ── loudnorm поверх Adobe результата ──
+    source = adobe_path
     result = subprocess.run(
         ["ffmpeg", "-y", "-i", str(source),
          "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
@@ -247,7 +301,6 @@ async def enhance_audio(mp3_path: Path) -> Path:
     if result.returncode == 0 and studio_path.exists():
         print(f"loudnorm: готово {studio_path.stat().st_size} байт")
         return studio_path
-
     return source
 
 
@@ -448,7 +501,19 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         mp3 = convert_to_mp3(ogg)
 
         await msg.edit_text("🎙️ Adobe Podcast Enhance Speech...")
-        studio_mp3 = await enhance_audio(mp3)
+
+        # Функция отправки скриншота при ошибке Adobe
+        async def send_adobe_screenshot(path: str, caption: str):
+            try:
+                if os.path.exists(path):
+                    await update.message.reply_photo(
+                        photo=open(path, "rb"),
+                        caption=f"⚠️ {caption}"
+                    )
+            except Exception:
+                pass
+
+        studio_mp3 = await enhance_audio(mp3, send_screenshot=send_adobe_screenshot)
 
         await msg.edit_text("📝 Транскрибирую (Whisper)...")
         transcript = transcribe(studio_mp3)
