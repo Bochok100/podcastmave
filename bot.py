@@ -1,9 +1,9 @@
 """
-Podcast Bot v2 (Chromium Anti-Detect + Cookie Injection)
-- Полный обход Cloudflare через подстановку куков сессии (ADOBE_COOKIES_JSON)
-- Топовые анти-хинтинг флаги для Chromium
-- Оптимизация оперативной памяти под 512MB (Render)
-- Автоматическая загрузка в mave.digital
+Podcast Bot v2 (Xvfb Headed Bypass + Cookie Injection)
+- Запуск в Headed-режиме через виртуальный монитор (xvfb) для 100% обхода Cloudflare
+- Родные отпечатки браузера (без конфликтов User-Agent)
+- Оптимизация памяти под 512MB
+- Инжекция сессии ADOBE_COOKIES_JSON
 """
 
 import os
@@ -87,7 +87,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Chromium Anti-Detect + Cookies)
+# 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -98,31 +98,29 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             await send_screenshot(path, caption)
 
     try:
-        print("Adobe: Запуск Chromium в режиме максимальной маскировки...")
+        print("Adobe: Запуск Chromium в ВИДИМОМ (Headed) режиме с виртуальным дисплеем...")
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=True,
+                headless=False,  # КРИТИЧЕСКИ ВАЖНО: Выключаем headless, обманываем Cloudflare!
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage', # Экономия памяти Render
-                    '--disable-blink-features=AutomationControlled', # Прячем автоматизацию
-                    '--blink-settings=imagesEnabled=false' # Отключаем картинки для ускорения
+                    '--disable-dev-shm-usage'
                 ]
             )
             
+            # Убрали жесткий user_agent, чтобы избежать конфликтов версий (Cloudflare это сечет)
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 locale="ru-RU",
                 timezone_id="Europe/Moscow"
             )
             
             page = await context.new_page()
-            await Stealth().apply_stealth_async(page) # Маскировка отпечатков
+            await Stealth().apply_stealth_async(page)
             
             try:
-                # ШАГ 1: Инжектим куки, если они заданы в настройках Render
+                # Инжектим куки
                 if ADOBE_COOKIES_JSON:
                     print("Adobe: Обнаружены куки сессии! Загружаем в контекст браузера...")
                     try:
@@ -136,9 +134,9 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(2)
 
-                # ШАГ 2: Логин по логину/паролю (сработает ТОЛЬКО если куков нет или они протухли)
+                # Запасной логин, если куки не сработали
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
-                    print("Adobe: Куки отсутствуют или не подошли. Пробуем стандартный вход...")
+                    print("Adobe: Куки отсутствуют или протухли. Пробуем стандартный вход...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
                     await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
                     
@@ -165,15 +163,13 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                     await page.wait_for_load_state("networkidle")
                     await asyncio.sleep(4)
 
-                # Перестраховка перехода
                 if "enhance" not in page.url:
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("networkidle")
 
-                print("Adobe: Панель открыта! Ищем скрытое поле загрузки...")
+                print("Adobe: Панель открыта! Ищем поле загрузки...")
                 await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
                 
-                # Вытаскиваем input наружу для Playwright
                 await page.evaluate("""() => {
                     document.querySelectorAll('input[type="file"]').forEach(el => {
                         el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
@@ -182,10 +178,9 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await asyncio.sleep(1)
 
                 await page.set_input_files('input[type="file"]', str(mp3_path))
-                print(f"Adobe: Файл {mp3_path.name} отправлен")
+                print(f"Adobe: Файл отправлен")
                 await asyncio.sleep(2)
 
-                # Нажимаем кнопку запуска ИИ обработки
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
                     try:
                         btn = page.locator(sel).first
@@ -254,8 +249,11 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
 
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'])
-        context = await browser.new_context(viewport={"width": 1280, "height": 900}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+        browser = await p.chromium.launch(
+            headless=False, # Mave тоже запустим в Headed-режиме на всякий случай
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        )
+        context = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
         page = await context.new_page()
         try:
             await page.goto("https://app.mave.digital/login")
@@ -328,7 +326,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Превращаю в MP3...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Загружаю в ИИ Adobe Podcast (Байпас Cloudflare)...")
+        await msg.edit_text("🎙️ Загружаю в ИИ Adobe Podcast (Обход Cloudflare v3)...")
 
         async def send_screenshot(path: str, caption: str):
             try:
