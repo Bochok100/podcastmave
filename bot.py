@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Two-Step 2FA + Visual Auth + Drag-and-Drop)
-- Исправлена логика двухшаговой 2FA (сначала клик "Продолжить", потом ввод кода)
+Podcast Bot v2 (Smart Web Camera + Hidden Field Bypass)
+- Веб-камера /screen теперь транслирует скриншот прямо в момент ошибки
+- Умный обход: если поле почты скрыто (предложен готовый аккаунт), бот просто жмет Продолжить
 - Эмуляция живого ввода клавиатуры
-- Встроенный веб-сервер транслирует экран по адресу /screen
 """
 
 import os
@@ -62,29 +62,36 @@ pending = {}
 adobe_2fa_state = {}
 
 # ──────────────────────────────────────────────
-# ЧЕСТНЫЙ HTTP-СЕРВЕР (ВЕБ-КАМЕРА)
+# ЧЕСТНЫЙ HTTP-СЕРВЕР (ПРОКАЧАННАЯ ВЕБ-КАМЕРА)
 # ──────────────────────────────────────────────
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/screen':
-            try:
-                with open('/tmp/adobe_before_upload.png', 'rb') as f:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.end_headers()
-                    self.wfile.write(f.read())
-                    return
-            except FileNotFoundError:
-                self.send_response(404)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(b"Screenshot is not ready yet. Send an audio to the bot first!")
-                return
+            # Ищем самый свежий скриншот, начиная с экрана ошибки
+            screens = ['/tmp/adobe_error.png', '/tmp/adobe_before_upload.png', '/tmp/adobe_2fa_input.png']
+            for s in screens:
+                if os.path.exists(s):
+                    try:
+                        with open(s, 'rb') as f:
+                            self.send_response(200)
+                            self.send_header("Content-Type", "image/png")
+                            self.end_headers()
+                            self.wfile.write(f.read())
+                        return
+                    except Exception:
+                        pass
+            
+            # Если скриншотов нет вообще
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Screenshot is not ready yet. Send an audio to the bot first, or wait for an error!")
+            return
 
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot is alive! To see the Adobe screen, go to: /screen")
+        self.wfile.write(b"Bot is alive! To see the latest Adobe screen, go to: /screen")
         
     def log_message(self, format, *args):
         return
@@ -170,12 +177,12 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         pass
 
                 # =================================================================
-                # УМНЫЙ ВИЗУАЛЬНЫЙ БЛОК АВТОРИЗАЦИИ
+                # БЛОК АВТОРИЗАЦИИ С ЗАЩИТОЙ ОТ СКРЫТЫХ ПОЛЕЙ
                 # =================================================================
                 print("Adobe: Ожидаем прогрузки интерфейса...")
                 login_found = False
                 for _ in range(15):
-                    if await page.locator('input[type="email"], input[name="username"]').count() > 0:
+                    if await page.locator('input[type="email"], input[name="username"], button:has-text("Продолжить"), button:has-text("Continue")').count() > 0:
                         login_found = True
                         break
                     if await page.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').count() > 0:
@@ -184,28 +191,31 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                 if login_found:
                     email_str = ADOBE_EMAIL.strip()
-                    print(f"Adobe: Экран авторизации. Вводим почту по буквам (Длина: {len(email_str)} симв.)")
-                    
                     email_field = page.locator('input[type="email"], input[name="username"]').first
-                    await email_field.wait_for(state="visible", timeout=15000)
                     
-                    await email_field.click()
-                    await asyncio.sleep(1)
-                    await email_field.press_sequentially(email_str, delay=100)
-                    await asyncio.sleep(2)
+                    try:
+                        # Пытаемся дождаться видимости поля 8 секунд
+                        await email_field.wait_for(state="visible", timeout=8000)
+                        print(f"Adobe: Поле почты видимо. Вводим: {email_str}")
+                        await email_field.click(force=True)
+                        await asyncio.sleep(1)
+                        await email_field.press_sequentially(email_str, delay=100)
+                        await asyncio.sleep(2)
+                    except Exception:
+                        print("Adobe: Поле почты скрыто или не найдено. Возможно, аккаунт уже предложен списком. Идем дальше...")
                     
                     continue_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue"), button[type="submit"], #btn-id-forward').first
                     if await continue_btn.count() > 0:
-                        await continue_btn.click()
+                        await continue_btn.click(force=True)
                     await asyncio.sleep(5)
                     
-                    # ПРОВЕРКА ДВУХШАГОВОЙ 2FA (Скриншот image_75ae7e)
+                    # ПРОВЕРКА ДВУХШАГОВОЙ 2FA
                     identity_text = page.locator('text=/Подтверждение личности|Verify your identity/i')
                     if await identity_text.count() > 0:
                         print("Adobe: Экран подтверждения личности. Нажимаем Продолжить для отправки кода...")
                         identity_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue")').first
                         if await identity_btn.count() > 0:
-                            await identity_btn.click()
+                            await identity_btn.click(force=True)
                             await asyncio.sleep(4)
 
                     # 2FA ВВОД КОДА
@@ -213,8 +223,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     if await code_input.count() > 0:
                         print("Adobe: Запрашиваем 2FA код...")
                         try:
-                            await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
-                            await notify("/tmp/adobe_before_upload.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
+                            await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
+                            await notify("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
                         except Exception: pass
                         
                         event = asyncio.Event()
@@ -228,7 +238,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             
                             sub_btn = page.locator('button:has-text("Продолжить"), button[type="submit"], button:has-text("Submit"), button:has-text("Verify")').first
                             if await sub_btn.count() > 0:
-                                await sub_btn.click()
+                                await sub_btn.click(force=True)
                             await asyncio.sleep(5)
                         except asyncio.TimeoutError:
                             raise RuntimeError("Таймаут: вы не успели прислать код за 2 минуты.")
@@ -238,17 +248,21 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     # ПАРОЛЬ
                     pwd_field = page.locator('input[type="password"], #password').first
                     if await pwd_field.count() > 0:
-                        pwd_str = ADOBE_PASSWORD.strip()
-                        print(f"Adobe: Вводим пароль по буквам (Длина: {len(pwd_str)} симв.)")
-                        await pwd_field.click()
-                        await asyncio.sleep(1)
-                        await pwd_field.press_sequentially(pwd_str, delay=100)
-                        await asyncio.sleep(2)
-                        
-                        login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
-                        if await login_btn.count() > 0:
-                            await login_btn.click()
-                        await asyncio.sleep(5)
+                        try:
+                            await pwd_field.wait_for(state="visible", timeout=8000)
+                            pwd_str = ADOBE_PASSWORD.strip()
+                            print(f"Adobe: Вводим пароль (Длина: {len(pwd_str)} симв.)")
+                            await pwd_field.click(force=True)
+                            await asyncio.sleep(1)
+                            await pwd_field.press_sequentially(pwd_str, delay=100)
+                            await asyncio.sleep(2)
+                            
+                            login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
+                            if await login_btn.count() > 0:
+                                await login_btn.click(force=True)
+                            await asyncio.sleep(5)
+                        except Exception as e:
+                            print(f"Adobe: Поле пароля скрыто или ошибка ввода: {e}")
 
                     print("Adobe: Ждем завершения редиректов (до 20 сек)...")
                     for _ in range(20):
@@ -274,14 +288,15 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(5)
                     
                 # =================================================================
-                # ЖЕСТКАЯ ПРОВЕРКА И ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
+                # ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
                 # =================================================================
+                print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
                 try:
                     await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
                 except Exception: pass
 
                 if await page.locator('input[type="email"], input[name="username"]').count() > 0:
-                    raise RuntimeError("❌ Бот не смог войти в аккаунт! Почта или пароль не приняты сайтом. Проверь /screen")
+                    raise RuntimeError("❌ Бот не смог войти в аккаунт! Открой ссылку /screen для просмотра ошибки.")
 
                 try:
                     await page.evaluate("""() => {
@@ -291,13 +306,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     }""")
                     await asyncio.sleep(2)
                 except: pass
-
-                print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
-                try:
-                    await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
-                    await notify("/tmp/adobe_before_upload.png", "ℹ️ Экран перед загрузкой. Если не видно, зайди на /screen")
-                except Exception as e:
-                    pass
 
                 # =================================================================
                 # МУЛЬТИ-ЗАГРУЗКА
@@ -411,8 +419,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 original_error = str(e)[:150]
                 print(f"Сработал except: {original_error}")
                 try:
+                    # Сохраняем скриншот ошибки специально для веб-сервера
                     await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
-                    await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
                 except Exception:
                     pass
                 raise RuntimeError(f"{original_error}")
