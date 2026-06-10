@@ -31,41 +31,41 @@ OPENAI_KEY         = os.getenv("OPENAI_API_KEY")
 MAVE_EMAIL         = os.getenv("MAVE_EMAIL")
 MAVE_PASSWORD      = os.getenv("MAVE_PASSWORD")
 MAVE_PODCAST_ID    = os.getenv("MAVE_PODCAST_ID")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 EDIT_TITLE, EDIT_DESC = range(2)
 
 STYLE_PROMPT = """
-Ты — профессиональный редактор и автор подкастов про криптовалюту, инвестиции и технологии.
-Я отправляю тебе черновую текстовую расшифровку аудиосообщения.
+Ты — редактор подкаста Василия. Темы бывают разные: крипта, ИИ, технологии, семья, жизнь, бытовые вопросы — всё что угодно.
 
-ТВОЯ ЗАДАЧА:
-1. Внимательно изучить смысл текста.
-2. Придумать цепляющий Заголовок.
-3. Написать краткое Описание подкаста.
+ТВОЯ ЗАДАЧА: по расшифровке придумать заголовок и описание.
 
-=== ПРАВИЛА ДЛЯ ЗАГОЛОВКА ===
-Он должен быть интригующим, коротким и понятным новичкам. Избегай дешевого кликбейта.
-Ориентируйся на этот стиль (это ТОЛЬКО примеры стиля, не копируй их!):
+=== СТИЛЬ ЗАГОЛОВКА ===
+Учись у этих примеров (это стиль, не копируй их):
 - Как на самом деле работают сделки
-- RWA: почему реальные активы — самый спокойный рост в крипте
 - Что такое Long и Short на самом деле
-- Кто такие «киты» в криптовалюте — мифические богачи или нечто иное?
 - Будущие тренды в крипте: куда смотреть до хайпа
-- Стейкинг и фарминг: объясняю на пальцах
+- Агенты ИИ: почему без них уже нельзя
+- Майнинг в России: быть или не быть?
+- Кто такие «киты» — мифические богачи или нечто иное?
 
-=== ПРАВИЛА ДЛЯ ОПИСАНИЯ ===
-Описание должно состоять из 2-3 предложений. Раскрой суть подкаста, задай интригующий вопрос
-или укажи, какую пользу получит слушатель.
+Закономерности стиля:
+- Конкретно, без воды, понятно новичку
+- Иногда "на самом деле" — снимает мифы
+- Иногда риторический вопрос
+- НЕ пиши "топ", "секреты", "шокирующий"
+- Тема диктует заголовок — не тяни всё к крипте если тема другая
+
+=== СТИЛЬ ОПИСАНИЯ ===
+2 предложения: суть выпуска + зачем слушать. Разговорный тон.
 
 === ФОРМАТ ОТВЕТА (СТРОГО!) ===
-Твой ответ должен содержать только две строки, без лишних приветствий, символов и кавычек:
+Только две строки, без лишних слов:
 
-ЗАГОЛОВОК: [Твой придуманный заголовок]
-ОПИСАНИЕ: [Твое придуманное описание]
+ЗАГОЛОВОК: [заголовок]
+ОПИСАНИЕ: [описание]
 
-ТРАНСКРИПЦИЯ АУДИО ДЛЯ ОБРАБОТКИ:
+ТРАНСКРИПЦИЯ:
 """
 
 pending = {}
@@ -107,84 +107,136 @@ def convert_to_mp3(input_path: Path) -> Path:
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path) -> Path:
     """
-    Шаг 1: Adobe Podcast Enhancement API — студийное качество голоса
+    Шаг 1: Adobe Podcast Enhance Speech через браузер (Playwright)
+            Заходим на сайт, загружаем файл, скачиваем результат.
     Шаг 2: FFmpeg loudnorm — стандарт громкости подкастов (-16 LUFS)
     """
-    isolated_path = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
-    studio_path   = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
+    adobe_path = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
+    studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
 
-    # ── ШАГ 1: Adobe Podcast Enhancement ──
-    # Бесплатный публичный API — улучшает голос как Adobe Podcast Enhance Speech
+    # ── ШАГ 1: Adobe Podcast через браузер ──
+    adobe_success = False
     try:
-        print("Adobe Podcast: отправляем файл...")
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            with open(mp3_path, "rb") as f:
-                resp = await client.post(
-                    "https://podcast.adobe.com/api/v1/enhance",
-                    files={"file": (mp3_path.name, f, "audio/mpeg")},
-                )
-            print(f"Adobe Podcast: HTTP {resp.status_code}")
+        print("Adobe Podcast: запускаем браузер...")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(viewport={"width": 1280, "height": 900})
+            page = await context.new_page()
+            try:
+                # Открываем Adobe Podcast Enhance Speech
+                await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
+                await page.wait_for_load_state("networkidle")
+                await asyncio.sleep(2)
+                print(f"Adobe Podcast: страница загружена, URL={page.url}")
+                await page.screenshot(path="/tmp/adobe_01.png")
 
-            if resp.status_code in (200, 201):
-                data = resp.json()
-                print(f"Adobe Podcast: ответ = {str(data)[:200]}")
-                job_id = data.get("jobId") or data.get("id") or data.get("job_id")
+                # Ищем поле загрузки файла
+                await page.wait_for_selector('input[type="file"]', timeout=15000)
+                await page.set_input_files('input[type="file"]', str(mp3_path))
+                print(f"Adobe Podcast: файл загружен {mp3_path.name}")
+                await asyncio.sleep(3)
+                await page.screenshot(path="/tmp/adobe_02.png")
 
-                if job_id:
-                    print(f"Adobe Podcast: job_id={job_id}, ждём...")
-                    for attempt in range(60):
-                        await asyncio.sleep(5)
-                        status_resp = await client.get(
-                            f"https://podcast.adobe.com/api/v1/enhance/{job_id}",
-                        )
-                        sd = status_resp.json()
-                        status = sd.get("status", "unknown")
-                        print(f"Adobe Podcast: статус {attempt+1} = {status}")
-
-                        if status in ("succeeded", "completed", "done"):
-                            url = sd.get("url") or sd.get("download_url") or sd.get("outputUrl")
-                            if url:
-                                r = await client.get(url)
-                                isolated_path.write_bytes(r.content)
-                                size = isolated_path.stat().st_size
-                                print(f"Adobe Podcast: файл {size} байт")
-                                if size > 10000:
-                                    source = isolated_path
-                                    break
-                            print("Adobe Podcast: нет URL")
-                            source = mp3_path
+                # Нажимаем кнопку Enhance / Улучшить
+                for btn in ["Enhance speech", "Enhance", "Upload", "Start", "Process"]:
+                    try:
+                        el = page.locator(f'button:has-text("{btn}"), [role="button"]:has-text("{btn}")').first
+                        if await el.count() > 0:
+                            await el.click()
+                            print(f"Adobe Podcast: кнопка '{btn}' нажата")
                             break
-                        if status in ("failed", "error"):
-                            print("Adobe Podcast: ошибка задания")
-                            source = mp3_path
+                    except Exception:
+                        continue
+
+                await asyncio.sleep(3)
+                await page.screenshot(path="/tmp/adobe_03.png")
+
+                # Ждём обработки (до 5 минут)
+                print("Adobe Podcast: ждём обработки...")
+                for i in range(60):
+                    await asyncio.sleep(5)
+                    html = await page.content()
+                    # Ищем кнопку скачивания
+                    if any(x in html for x in ["Download", "download", "Скачать", "enhanced"]):
+                        print(f"Adobe Podcast: обработка завершена (шаг {i+1})")
+                        await page.screenshot(path="/tmp/adobe_04_done.png")
+                        break
+                    print(f"Adobe Podcast: ждём... ({i+1}/60)")
+
+                # Скачиваем результат
+                download_btn = None
+                for sel in [
+                    'a[download]',
+                    'button:has-text("Download")',
+                    'a:has-text("Download")',
+                    '[href*=".mp3"]',
+                    '[data-testid*="download"]',
+                ]:
+                    try:
+                        el = page.locator(sel).first
+                        if await el.count() > 0:
+                            download_btn = el
+                            print(f"Adobe Podcast: кнопка скачивания найдена → {sel}")
                             break
+                    except Exception:
+                        continue
+
+                if download_btn:
+                    # Перехватываем скачивание
+                    async with page.expect_download(timeout=60000) as dl_info:
+                        await download_btn.click()
+                    download = await dl_info.value
+                    await download.save_as(str(adobe_path))
+                    size = adobe_path.stat().st_size
+                    print(f"Adobe Podcast: скачан файл {size} байт")
+                    if size > 10000:
+                        adobe_success = True
                     else:
-                        print("Adobe Podcast: таймаут")
-                        source = mp3_path
+                        print("Adobe Podcast: файл слишком маленький")
                 else:
-                    # Может сразу вернул файл
-                    url = data.get("url") or data.get("download_url")
-                    if url:
-                        r = await client.get(url)
-                        isolated_path.write_bytes(r.content)
-                        if isolated_path.stat().st_size > 10000:
-                            source = isolated_path
-                        else:
-                            source = mp3_path
-                    else:
-                        print("Adobe Podcast: нет job_id и нет url")
-                        source = mp3_path
-            else:
-                print(f"Adobe Podcast: ошибка HTTP {resp.status_code}: {resp.text[:200]}")
-                source = mp3_path
+                    print("Adobe Podcast: кнопка скачивания не найдена")
+                    await page.screenshot(path="/tmp/adobe_no_download.png")
+                    html = await page.content()
+                    print(f"Adobe HTML: {html[500:2000]}")
 
-    except Exception as ex:
-        print(f"Adobe Podcast: исключение — {ex}, используем исходный")
-        source = mp3_path
+            except Exception as e:
+                print(f"Adobe Podcast браузер: {e}")
+                await page.screenshot(path="/tmp/adobe_error.png")
+            finally:
+                await browser.close()
 
-    # ── ШАГ 2: FFmpeg loudnorm — стандарт громкости подкастов ──
-    # Только нормализация громкости, не трогаем тембр (Adobe уже всё сделал)
-    print(f"FFmpeg loudnorm: обрабатываем {source.name}...")
+    except Exception as e:
+        print(f"Adobe Podcast: исключение — {e}")
+
+    source = adobe_path if adobe_success else mp3_path
+    if adobe_success:
+        print(f"Adobe Podcast: успех, используем {adobe_path.name}")
+    else:
+        print("Adobe Podcast: не удалось, используем FFmpeg мастеринг")
+        # Запасной вариант — FFmpeg с полной цепочкой фильтров
+        audio_filters = ",".join([
+            "afftdn=nf=-25:nt=w",
+            "highpass=f=80",
+            "lowpass=f=16000",
+            "equalizer=f=300:width_type=o:width=2:g=-4",
+            "equalizer=f=3500:width_type=o:width=2:g=4",
+            "equalizer=f=10000:width_type=o:width=2:g=2",
+            "acompressor=threshold=-20dB:ratio=4:attack=5:release=80:makeup=3",
+            "loudnorm=I=-16:TP=-1.5:LRA=11",
+        ])
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(mp3_path),
+             "-af", audio_filters,
+             "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
+             str(studio_path)],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0 and studio_path.exists():
+            print(f"FFmpeg запасной: готово {studio_path.stat().st_size} байт")
+            return studio_path
+        return mp3_path
+
+    # ── ШАГ 2: loudnorm поверх Adobe результата ──
     result = subprocess.run(
         ["ffmpeg", "-y", "-i", str(source),
          "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
@@ -192,13 +244,11 @@ async def enhance_audio(mp3_path: Path) -> Path:
          str(studio_path)],
         capture_output=True, text=True
     )
+    if result.returncode == 0 and studio_path.exists():
+        print(f"loudnorm: готово {studio_path.stat().st_size} байт")
+        return studio_path
 
-    if result.returncode != 0 or not studio_path.exists():
-        print(f"FFmpeg: ошибка — {result.stderr[-200:]}")
-        return source
-
-    print(f"FFmpeg: готово {studio_path.stat().st_size} байт")
-    return studio_path
+    return source
 
 
 def transcribe(mp3_path: Path) -> str:
@@ -397,7 +447,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ ElevenLabs изоляция + студийный мастеринг...")
+        await msg.edit_text("🎙️ Adobe Podcast Enhance Speech...")
         studio_mp3 = await enhance_audio(mp3)
 
         await msg.edit_text("📝 Транскрибирую (Whisper)...")
@@ -561,7 +611,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
 
-    print("Бот v2 запущен (ElevenLabs + FFmpeg мастеринг + фотоотчёт)...")
+    print("Бот v2 запущен (Adobe Podcast + FFmpeg + фотоотчёт)...")
     app.run_polling()
 
 
