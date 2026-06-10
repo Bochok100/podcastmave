@@ -1,8 +1,9 @@
 """
-Podcast Bot v2 (Firefox Bypass Mode)
+Podcast Bot v2 (Firefox Bypass Mode + Render Port Fix)
 - Обход Cloudflare через смену движка на Firefox
 - Полностью автоматический Adobe Podcast Enhance
 - Загрузка в mave.digital через Chromium
+- Dummy-сервер для обхода таймаутов Render
 """
 
 import os
@@ -10,6 +11,8 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -50,13 +53,6 @@ STYLE_PROMPT = """
 - Майнинг в России: быть или не быть?
 - Кто такие «киты» — мифические богачи или нечто иное?
 
-Закономерности стиля:
-- Конкретно, без воды, понятно новичку
-- Иногда "на самом деле" — снимает мифы
-- Иногда риторический вопрос
-- НЕ пиши "топ", "секреты", "шокирующий"
-- Тема диктует заголовок — не тяни всё к крипте если тема другая
-
 === СТИЛЬ ОПИСАНИЯ ===
 2 предложения: суть выпуска + зачем слушать. Разговорный тон.
 
@@ -70,6 +66,21 @@ STYLE_PROMPT = """
 """
 
 pending = {}
+
+# ──────────────────────────────────────────────
+# ВЕБ-ЗАГЛУШКА ДЛЯ RENDER (Чтобы не было Timed Out)
+# ──────────────────────────────────────────────
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and kicking!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    print(f"Dummy-сервер запущен на порту {port}")
+    server.serve_forever()
 
 async def download_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
     voice = update.message.voice or update.message.audio
@@ -106,13 +117,11 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     try:
         print("Adobe: Запуск браузера Firefox (Обход Cloudflare)...")
         async with async_playwright() as p:
-            # ИСПОЛЬЗУЕМ FIREFOX ВМЕСТО CHROMIUM
             browser = await p.firefox.launch(
                 headless=True,
                 args=['--no-sandbox']
             )
             
-            # Маскируемся под живого юзера с Firefox
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
@@ -124,7 +133,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             page = await context.new_page()
             
             try:
-                # Имитируем поведение человека: заходим на главную, ждем, идем на enhance
                 print("Adobe: заходим на главную страницу (имитация)...")
                 await page.goto("https://podcast.adobe.com/", timeout=60000)
                 await asyncio.sleep(4)
@@ -133,7 +141,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("networkidle")
                 
-                # Клик на Start enhancing, если мы на витрине
                 try:
                     start_btn = page.locator('a:has-text("Start enhancing"), button:has-text("Start enhancing")').first
                     if await start_btn.count() > 0:
@@ -143,7 +150,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 except Exception:
                     pass
 
-                # Логин
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Обход Cloudflare прошел, вводим данные...")
                     await page.wait_for_selector('input[type="email"], input[name="username"], #username', timeout=15000)
@@ -185,7 +191,6 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("networkidle")
 
-                # Загружаем файл
                 print("Adobe: ищем форму загрузки...")
                 await page.wait_for_selector('text="Choose files", input[type="file"]', timeout=30000)
                 
@@ -199,15 +204,13 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await page.set_input_files('input[type="file"]', str(mp3_path))
                 print(f"Adobe: файл {mp3_path.name} загружен на сайт")
 
-                # Ждем обработки
                 print("Adobe: Ждем появления кнопки Download...")
                 download_locator = page.locator('button:has-text("Download"), a:has-text("Download")').last
-                await download_locator.wait_for(state="visible", timeout=600000) # Ждем до 10 минут
+                await download_locator.wait_for(state="visible", timeout=600000) 
                 
                 await page.screenshot(path="/tmp/adobe_done.png")
                 await notify("/tmp/adobe_done.png", "Adobe: Звук обработан! Скачиваем...")
 
-                # Скачиваем результат
                 async with page.expect_download(timeout=120000) as dl_info:
                     await download_locator.click()
                 dl = await dl_info.value
@@ -469,6 +472,9 @@ async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
+    # ЗАПУСКАЕМ ВЕБ-ЗАГЛУШКУ В ФОНОВОМ ПОТОКЕ ДЛЯ RENDER
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -497,7 +503,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
 
-    print("Бот v2 запущен (Firefox Bypass Mode для Adobe)...")
+    print("Бот v2 запущен (Docker + Dummy Server + Firefox Hack)...")
     app.run_polling()
 
 if __name__ == "__main__":
