@@ -1,6 +1,7 @@
 """
-Podcast Bot v2 (Firefox Bypass Mode + Render Port Fix)
-- Обход Cloudflare через смену движка на Firefox
+Podcast Bot v2 (Chromium Stealth + Low RAM Mode)
+- Обход Cloudflare через Chromium + playwright-stealth
+- Оптимизация памяти для Render (512MB)
 - Полностью автоматический Adobe Podcast Enhance
 - Загрузка в mave.digital через Chromium
 - Dummy-сервер для обхода таймаутов Render
@@ -25,6 +26,7 @@ from telegram.constants import ParseMode
 
 import openai
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth  # Тот самый плащ-невидимка для Chromium
 
 # ──────────────────────────────────────────────
 # Настройки
@@ -104,7 +106,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Улучшение звука через Adobe Podcast (FIREFOX HACK)
+# 3. Улучшение звука через Adobe Podcast (CHROMIUM + STEALTH)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -115,22 +117,31 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             await send_screenshot(path, caption)
 
     try:
-        print("Adobe: Запуск браузера Firefox (Обход Cloudflare)...")
+        print("Adobe: Запуск Chromium (Stealth + Оптимизация памяти)...")
         async with async_playwright() as p:
-            browser = await p.firefox.launch(
+            browser = await p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox']
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage', # СПАСАЕТ ОТ ПАДЕНИЯ ПО ПАМЯТИ НА RENDER
+                    '--disable-blink-features=AutomationControlled', # ОБХОД CLOUDFLARE
+                    '--disable-infobars'
+                ]
             )
             
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 768},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 locale="ru-RU",
                 timezone_id="Europe/Moscow",
                 accept_downloads=True
             )
             
             page = await context.new_page()
+            
+            # Включаем Stealth режим для текущей страницы
+            await Stealth().apply_stealth_async(page)
             
             try:
                 print("Adobe: заходим на главную страницу (имитация)...")
@@ -186,24 +197,14 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
 
                     await page.wait_for_url("**/enhance**", timeout=60000)
                     await page.wait_for_load_state("networkidle")
-                    await asyncio.sleep(5)
-                    await page.screenshot(path="/tmp/adobe_login_done.png")
-                    print(f"Adobe: логин успешен, URL={page.url}")
 
                 if "enhance" not in page.url:
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("networkidle")
 
                 print("Adobe: ищем форму загрузки...")
-                # Ждём появления либо input[type=file] либо зоны загрузки
-                await page.wait_for_selector(
-                    'input[type="file"], [class*="drop"], [class*="upload"]',
-                    timeout=30000
-                )
-                await page.screenshot(path="/tmp/adobe_upload_form.png")
-                await notify("/tmp/adobe_upload_form.png", "Adobe: форма загрузки")
-
-                # Делаем input[type=file] видимым
+                await page.wait_for_selector('input[type="file"], [class*="drop"], [class*="upload"]', timeout=30000)
+                
                 await page.evaluate("""() => {
                     document.querySelectorAll('input[type="file"]').forEach(el => {
                         el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:100px!important;height:100px!important;';
@@ -214,9 +215,7 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                 await page.set_input_files('input[type="file"]', str(mp3_path))
                 print(f"Adobe: файл {mp3_path.name} передан")
                 await asyncio.sleep(3)
-                await page.screenshot(path="/tmp/adobe_file_set.png")
 
-                # Нажимаем кнопку Enhance если она есть
                 for sel in [
                     'button:has-text("Enhance speech")',
                     'button:has-text("Enhance")',
@@ -234,33 +233,26 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                         continue
 
                 await asyncio.sleep(3)
-                await page.screenshot(path="/tmp/adobe_enhancing.png")
-                await notify("/tmp/adobe_enhancing.png", "Adobe: начал обработку")
 
-                # Ждём кнопку Download — максимум 3 минуты, с промежуточными скринами
-                print("Adobe: ждём кнопку Download (до 3 минут)...")
+                print("Adobe: ждём кнопку Download (до 5 минут)...")
                 download_locator = None
-                for i in range(36):  # 36 × 5 сек = 3 минуты
+                for i in range(60):  # 60 × 5 сек = 5 минут
                     await asyncio.sleep(5)
                     html = await page.content()
 
-                    # Ищем кнопку Download
                     dl_btn = page.locator('button:has-text("Download"), a:has-text("Download")').last
                     if await dl_btn.count() > 0:
                         download_locator = dl_btn
                         print(f"Adobe: кнопка Download найдена (шаг {i+1})")
                         break
 
-                    # Каждые 30 секунд шлём скриншот
                     if i % 6 == 5:
-                        await page.screenshot(path=f"/tmp/adobe_wait_{i}.png")
-                        await notify(f"/tmp/adobe_wait_{i}.png", f"Adobe: ждём обработку ({(i+1)*5} сек)")
-                        print(f"Adobe: ждём... ({i+1}/36), URL={page.url}")
+                        print(f"Adobe: ждём... ({i+1}/60)")
 
                 if not download_locator:
                     await page.screenshot(path="/tmp/adobe_timeout.png")
-                    await notify("/tmp/adobe_timeout.png", "Adobe: таймаут 3 минуты — кнопка Download не появилась")
-                    raise RuntimeError("Adobe: кнопка Download не появилась за 3 минуты")
+                    await notify("/tmp/adobe_timeout.png", "Adobe: таймаут 5 минут — кнопка Download не появилась")
+                    raise RuntimeError("Adobe: кнопка Download не появилась за 5 минут")
 
                 await page.screenshot(path="/tmp/adobe_done.png")
                 await notify("/tmp/adobe_done.png", "Adobe: обработка готова, скачиваем...")
@@ -324,7 +316,11 @@ def generate_metadata(transcript: str) -> tuple[str, str]:
 
 async def upload_to_mave(mp3_path: Path, title: str, description: str) -> bool:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # Здесь тоже добавляем флаги памяти для безопасности
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+        )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -423,7 +419,7 @@ async def handle_voice(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("🔄 Конвертирую аудио...")
         mp3 = convert_to_mp3(ogg)
 
-        await msg.edit_text("🎙️ Захожу в Adobe Podcast через Firefox (ждем 3-5 минут)...")
+        await msg.edit_text("🎙️ Захожу в Adobe Podcast (Stealth Chromium, ждем 3-5 минут)...")
 
         async def send_adobe_screenshot(path: str, caption: str):
             try:
@@ -557,7 +553,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
     app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
 
-    print("Бот v2 запущен (Docker + Dummy Server + Firefox Hack)...")
+    print("Бот v2 запущен (Docker + Dummy Server + Chromium Stealth + Low RAM)...")
     app.run_polling()
 
 if __name__ == "__main__":
