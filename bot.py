@@ -1,9 +1,8 @@
 """
-Podcast Bot v2 (Xvfb + 2FA Bypass + Ultimate Drag-and-Drop)
+Podcast Bot v2 (Xvfb + Strict Login + Ultimate Drag-and-Drop)
+- Жесткий контроль авторизации (предотвращает слепую загрузку на экране логина)
 - Ультимативный обход загрузки: эмуляция перетаскивания файла мышкой (Drag & Drop)
-- Конвертация файлов через Data URI для работы с тяжелыми MP3
 - Защита от мгновенных падений (Application exited early)
-- Интерактивный перехват 2FA-кода
 """
 
 import os
@@ -101,6 +100,10 @@ def convert_to_mp3(input_path: Path) -> Path:
 # 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
+    # Жесткая проверка переменных окружения
+    if not ADOBE_EMAIL or not ADOBE_PASSWORD:
+        raise RuntimeError("❌ ОШИБКА: В Render не заполнены переменные ADOBE_EMAIL или ADOBE_PASSWORD!")
+
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
     studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
 
@@ -150,27 +153,28 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     except Exception:
                         pass
 
+                # =================================================================
+                # ЖЕСТКИЙ БЛОК АВТОРИЗАЦИИ
+                # =================================================================
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
-                    print("Adobe: Вводим почту...")
-                    await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
-                    await page.fill('input[type="email"], input[name="username"]', ADOBE_EMAIL)
+                    print(f"Adobe: Экран авторизации. Вводим почту: {ADOBE_EMAIL}")
+                    email_field = page.locator('input[type="email"], input[name="username"]').first
+                    await email_field.wait_for(state="visible", timeout=15000)
+                    await email_field.fill(ADOBE_EMAIL)
+                    await asyncio.sleep(2)
                     
-                    for sel in ['button:has-text("Продолжить")', 'button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
-                        try:
-                            el = page.locator(sel).first
-                            if await el.count() > 0: await el.evaluate("node => node.click()"); break
-                        except Exception: continue
-
-                    await asyncio.sleep(4)
+                    continue_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue"), button[type="submit"], #btn-id-forward').first
+                    await continue_btn.click()
+                    await asyncio.sleep(5)
                     
+                    # Проверка на 2FA
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
                         print("Adobe: Запрашиваем 2FA код...")
                         try:
-                            await page.locator('button:has-text("Продолжить")').first.evaluate("node => node.click()")
+                            await page.locator('button:has-text("Продолжить")').first.click()
                         except:
                             pass
                             
-                        await page.wait_for_load_state("domcontentloaded")
                         await asyncio.sleep(4)
                         
                         try:
@@ -191,28 +195,26 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             await code_field.fill(received_code)
                             await asyncio.sleep(1)
                             
-                            for sub_sel in ['button:has-text("Продолжить")', 'button[type="submit"]', 'button:has-text("Submit")']:
-                                if await page.locator(sub_sel).count() > 0:
-                                    await page.locator(sub_sel).first.evaluate("node => node.click()")
-                                    break
+                            sub_btn = page.locator('button:has-text("Продолжить"), button[type="submit"], button:has-text("Submit")').first
+                            await sub_btn.click()
                             
-                            await page.wait_for_load_state("domcontentloaded")
                             await asyncio.sleep(5)
                         except asyncio.TimeoutError:
                             raise RuntimeError("Таймаут: вы не успели прислать код за 2 минуты.")
                         finally:
                             adobe_2fa_state.pop(user_id, None)
 
+                    # Проверка на ввод пароля
                     if await page.locator('input[type="password"], #password').count() > 0:
                         print("Adobe: Вводим пароль...")
-                        await page.locator('input[type="password"], #password').first.fill(ADOBE_PASSWORD)
-                        for sel in ['button:has-text("Продолжить")', 'button:has-text("Войти")', 'button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
-                            try:
-                                el = page.locator(sel).first
-                                if await el.count() > 0: await el.evaluate("node => node.click()"); break
-                            except Exception: continue
+                        pwd_field = page.locator('input[type="password"], #password').first
+                        await pwd_field.fill(ADOBE_PASSWORD)
+                        await asyncio.sleep(1)
+                        
+                        login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
+                        await login_btn.click()
 
-                    print("Adobe: Ждем завершения редиректов...")
+                    print("Adobe: Ждем завершения редиректов (до 20 сек)...")
                     for _ in range(20):
                         if "enhance" in page.url and "auth" not in page.url and "ims" not in page.url:
                             break
@@ -232,10 +234,14 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(3)
 
                 if "enhance" not in page.url or "auth" in page.url:
-                    print("Adobe: Делаем чистый переход на панель Enhance...")
+                    print("Adobe: Принудительный переход на панель Enhance...")
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
+                    
+                # ЖЕСТКАЯ ПРОВЕРКА (чтобы не пытаться грузить файл на странице логина)
+                if "auth" in page.url or "login" in page.url:
+                    raise RuntimeError("❌ Бот застрял на странице авторизации! Проверьте правильность ADOBE_EMAIL и ADOBE_PASSWORD в настройках Render.")
 
                 # =================================================================
                 # УЛЬТИМАТИВНАЯ ЗАГРУЗКА: 3 СТУПЕНИ
@@ -243,7 +249,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 print("Adobe: Кабинет открыт. Инициируем алгоритм загрузки...")
                 uploaded = False
                 
-                # СТУПЕНЬ 1: Умный клик по кнопке (Native File Chooser)
                 try:
                     print("Шаг 1: Ищем интерфейс загрузки на экране...")
                     target = page.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').first
@@ -257,7 +262,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 except Exception as e:
                     print(f"Шаг 1 пропущен ({e}).")
 
-                # СТУПЕНЬ 2: Прямой инжект в скрытое поле
                 if not uploaded:
                     try:
                         print("Шаг 2: Ищем скрытый input...")
@@ -268,17 +272,13 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     except Exception as e:
                         print(f"Шаг 2 пропущен ({e}).")
 
-                # СТУПЕНЬ 3: БЕЗОТКАЗНЫЙ DRAG AND DROP (Сбрасываем файл в окно браузера)
                 if not uploaded:
                     try:
                         print("Шаг 3: Активируем ультимативный Drag-and-Drop...")
-                        # Читаем файл в base64
                         with open(mp3_path, "rb") as f:
                             file_base64 = base64.b64encode(f.read()).decode("utf-8")
                         
-                        # Выполняем инжект в браузер: создаем файл из base64 и эмулируем бросок мыши
                         await page.evaluate("""async ([base64, filename, mime]) => {
-                            // Быстрая и безопасная конвертация через fetch
                             const dataUrl = `data:${mime};base64,${base64}`;
                             const res = await fetch(dataUrl);
                             const blob = await res.blob();
@@ -287,12 +287,10 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             const dt = new DataTransfer();
                             dt.items.add(file);
                             
-                            // Генерируем события мыши
                             const enterEvent = new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt });
                             const overEvent = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt });
                             const dropEvent = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });
                             
-                            // Бросаем прямо в тело сайта (перехватит глобальный слушатель Adobe)
                             document.body.dispatchEvent(enterEvent);
                             document.body.dispatchEvent(overEvent);
                             document.body.dispatchEvent(dropEvent);
