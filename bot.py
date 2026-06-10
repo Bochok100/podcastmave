@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Iframe Scanner Fix)
-- Сканирование абсолютно всех фреймов (page.frames) для прорыва сквозь iframe-защиту Adobe
-- Мультиязычный поиск кнопок загрузки внутри под-фреймов
-- Безопасные скриншоты (timeout=5000)
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Iframe Scanner Fix + Anti-Crash)
+- Защита от мгновенных падений (Application exited early)
+- Сканирование абсолютно всех фреймов для прорыва сквозь iframe-защиту Adobe
+- Мультиязычный поиск кнопок загрузки
 - Интерактивный перехват 2FA-кода из чата Telegram
 """
 
@@ -13,6 +13,7 @@ import tempfile
 import subprocess
 import shutil
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -236,7 +237,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(5)
 
                 # =================================================================
-                # КРИТИЧЕСКИЙ ФИКС: СКАНИРОВАНИЕ ВСЕХ СЛОЕВ И ФРЕЙМОВ (IFRAMES)
+                # СКАНИРОВАНИЕ ВСЕХ СЛОЕВ И ФРЕЙМОВ (IFRAMES)
                 # =================================================================
                 print("Adobe: Кабинет открыт. Запускаем сканирование фреймов...")
                 uploaded = False
@@ -265,7 +266,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     print("Adobe: Прямой инжект заблокирован. Ищем кнопку Choose files внутри фреймов...")
                     for frame in page.frames:
                         try:
-                            # Ищем кнопку по мультиязычному регулярному выражению прямо внутри фрейма
                             upload_btn = frame.locator('text=/choose|выбрать|загрузить|upload/i').first
                             if await upload_btn.count() > 0:
                                 print(f"Adobe: Нашли кнопку загрузки во фрейме {frame.url[:40]}, запускаем File Chooser...")
@@ -285,7 +285,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                 await asyncio.sleep(3)
 
-                # Ищем кнопку запуска ИИ-обработки по всем фреймам
                 for frame in page.frames:
                     for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
                         try:
@@ -297,7 +296,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
-                    # Ищем кнопку скачивания по всем фреймам страницы
                     for frame in page.frames:
                         dl_btn = frame.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
                         if await dl_btn.count() > 0:
@@ -514,3 +512,42 @@ async def edit_desc(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
 async def button_cancel(update: Update, tg_context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    pending.pop(query.from_user.id, None)
+    await query.edit_message_text("❌ Отменено.")
+    return ConversationHandler.END
+
+def main():
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    print("🚀 Запускаем Telegram-бота...")
+    try:
+        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text), group=-1)
+
+        conv = ConversationHandler(
+            entry_points=[CallbackQueryHandler(button_edit, pattern="^edit$")],
+            states={
+                EDIT_TITLE: [MH(filters.TEXT & ~filters.COMMAND, edit_title)],
+                EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
+            },
+            fallbacks=[CallbackQueryHandler(button_cancel, pattern="^cancel$")],
+            per_chat=True
+        )
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+        app.add_handler(conv)
+        app.add_handler(CallbackQueryHandler(button_publish, pattern="^publish$"))
+        app.add_handler(CallbackQueryHandler(button_cancel, pattern="^cancel$"))
+        
+        print("✅ Бот успешно подключился к серверам Telegram!")
+        app.run_polling()
+        
+    except Exception as e:
+        print(f"\n❌❌❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {e} ❌❌❌")
+        print("Бот остановлен. Проверьте, не запущен ли он на вашем компьютере!")
+        # Бесконечный цикл, чтобы удержать контейнер Render живым для показа логов
+        while True:
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
