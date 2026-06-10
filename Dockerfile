@@ -1,17 +1,17 @@
-# Берем официальный образ ТОЧНО ТОЙ ВЕРСИИ, которую просит система (v1.60.0)
+# Официальный образ Microsoft с предустановленным Chromium
 FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
 
 WORKDIR /app
 
-# Устанавливаем ffmpeg для работы со звуком
-RUN apt-get update && apt-get install -y ffmpeg
+# Устанавливаем ffmpeg для аудио и xvfb для виртуального монитора!
+RUN apt-get update && apt-get install -y ffmpeg xvfb
 
-# Копируем файл с библиотеками и устанавливаем их
+# Копируем и устанавливаем Python-библиотеки
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем остальной код нашего бота
+# Копируем остальной код
 COPY . .
 
-# Запускаем бота
-CMD ["python", "bot.py"]
+# ЗАПУСК ЧЕРЕЗ ВИРТУАЛЬНЫЙ МОНИТОР (xvfb-run)
+CMD ["xvfb-run", "-a", "python", "bot.py"]
