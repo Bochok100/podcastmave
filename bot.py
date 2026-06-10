@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.3 — JS Injection Auth + Session Persistence
-- Жесткий обход невидимых полей (JS Injection для пароля)
-- Сохранение куки (сессии) в adobe_state.json для обхода 2FA
-- block=False для параллельного приема проверочных кодов
+Podcast Bot v3.4 — Smart Wait + Full JS Injection
+- Исправлен баг пропуска email (заменен count() на wait_for())
+- JS Injection теперь используется и для email, и для пароля
+- Сохранение сессии для обхода 2FA
 """
 
 import os
@@ -149,25 +149,31 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await shot("/tmp/adobe_last.png", f"Adobe открыт. URL: {page.url}")
 
             # ── 2. Нажимаем Sign In если нужно ──
-            if "auth" not in page.url and "ims" not in page.url:
-                try:
-                    await page.evaluate("""() => {
-                        const el = [...document.querySelectorAll('a,button')]
-                            .find(e => /^sign in$/i.test(e.innerText?.trim()));
-                        if (el) el.click();
-                    }""")
-                    await asyncio.sleep(4)
-                except Exception:
-                    pass
+            try:
+                await page.evaluate("""() => {
+                    const el = [...document.querySelectorAll('a,button')]
+                        .find(e => /^sign in$/i.test(e.innerText?.trim()));
+                    if (el) el.click();
+                }""")
+                await asyncio.sleep(4)
+            except Exception:
+                pass
 
-            # ── 3. Вводим email ──
-            if await page.locator('input[type="email"],input[name="username"]').count() > 0:
-                print("Adobe: вводим email...")
-                field = page.locator('input[type="email"],input[name="username"]').first
-                await field.wait_for(state="attached", timeout=10000)
-                await field.click(force=True)
-                await asyncio.sleep(0.5)
-                await field.fill(ADOBE_EMAIL.strip())
+            # ── 3. Вводим email (С ОЖИДАНИЕМ И JS-ИНЖЕКТОМ) ──
+            try:
+                print("Adobe: ищем поле email...")
+                email_field = page.locator('input[type="email"],input[name="username"]').first
+                # Ждем до 10 секунд. Если мы уже залогинены по сессии, выскочит таймаут и пойдет дальше!
+                await email_field.wait_for(state="attached", timeout=10000)
+                print("Adobe: поле email найдено. Вводим через JS...")
+                
+                email_str = ADOBE_EMAIL.strip()
+                await email_field.evaluate(f"""(node) => {{
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(node, '{email_str}');
+                    node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}""")
                 await asyncio.sleep(1)
 
                 for sel in ['button:has-text("Continue")', '#btn-id-forward', 'button[type="submit"]']:
@@ -180,14 +186,18 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         continue
                 await asyncio.sleep(4)
                 await shot("/tmp/adobe_last.png", "Adobe: после email")
+            except Exception as e:
+                print(f"Adobe: Пропускаем ввод email (не найдено или уже залогинены)")
 
             # ── 4. Экран подтверждения личности (перед кодом) ──
-            if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
-                print("Adobe: экран подтверждения — нажимаем Continue...")
+            try:
                 btn = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
-                if await btn.count() > 0:
+                if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
+                    print("Adobe: экран подтверждения — нажимаем Continue...")
                     await btn.click(force=True)
-                await asyncio.sleep(4)
+                    await asyncio.sleep(4)
+            except Exception:
+                pass
 
             # ── 5. Ввод 2FA кода ──
             code_sel = 'input[type="text"][maxlength="6"],input[name*="code"],input[autocomplete*="one-time"]'
@@ -211,17 +221,17 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (СУПЕР-ЖЕСТКИЙ ОБХОД ЧЕРЕЗ JS БЕЗ КЛИКОВ) ──
-            if await page.locator('input[type="password"],#password').count() > 0:
-                print("Adobe: вводим пароль через JS...")
+            # ── 6. Вводим пароль (С ОЖИДАНИЕМ И JS-ИНЖЕКТОМ) ──
+            try:
+                print("Adobe: ищем поле пароля...")
                 pwd = page.locator('input[type="password"],#password').first
                 await pwd.wait_for(state="attached", timeout=10000)
+                print("Adobe: поле пароля найдено. Вводим через JS...")
                 
-                # Забиваем пароль напрямую в свойства элемента через JavaScript
                 pwd_str = ADOBE_PASSWORD.strip()
                 await pwd.evaluate(f"""(node) => {{
-                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    nativeInputValueSetter.call(node, '{pwd_str}');
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(node, '{pwd_str}');
                     node.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     node.dispatchEvent(new Event('change', {{ bubbles: true }}));
                 }}""")
@@ -236,6 +246,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     except Exception:
                         continue
                 await asyncio.sleep(6)
+            except Exception as e:
+                print(f"Adobe: Пропускаем ввод пароля")
 
             # Закрываем промежуточные экраны
             for _ in range(10):
