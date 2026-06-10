@@ -31,6 +31,8 @@ OPENAI_KEY         = os.getenv("OPENAI_API_KEY")
 MAVE_EMAIL         = os.getenv("MAVE_EMAIL")
 MAVE_PASSWORD      = os.getenv("MAVE_PASSWORD")
 MAVE_PODCAST_ID    = os.getenv("MAVE_PODCAST_ID")
+ADOBE_EMAIL        = os.getenv("ADOBE_EMAIL")
+ADOBE_PASSWORD     = os.getenv("ADOBE_PASSWORD")
 ALLOWED_USER_ID    = int(os.getenv("ALLOWED_USER_ID", "0"))
 
 EDIT_TITLE, EDIT_DESC = range(2)
@@ -107,13 +109,14 @@ def convert_to_mp3(input_path: Path) -> Path:
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
     """
-    Adobe Podcast Enhance Speech через Playwright.
-    Если Adobe недоступен — FFmpeg мастеринг как запасной.
-    send_screenshot: async callable(path) для отправки скрина в Telegram при ошибке
+    Adobe Podcast Enhance Speech через Playwright с авторизацией.
     """
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
     studio_path = mp3_path.parent / (mp3_path.stem + "_studio.mp3")
-    adobe_success = False
+
+    async def notify(path: str, caption: str):
+        if send_screenshot and os.path.exists(path):
+            await send_screenshot(path, caption)
 
     try:
         print("Adobe Podcast: запускаем браузер...")
@@ -125,106 +128,151 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
             )
             page = await context.new_page()
             try:
+                # ── 1. Логин через Adobe ID ──
+                print("Adobe: логинимся...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
                 await page.wait_for_load_state("networkidle")
                 await asyncio.sleep(3)
-                print(f"Adobe: URL={page.url}")
-                await page.screenshot(path="/tmp/adobe_01.png")
+                await page.screenshot(path="/tmp/adobe_01_start.png")
+                print(f"Adobe: URL после goto = {page.url}")
 
-                # Adobe использует скрытый input — нужно диспатчить событие напрямую
-                # Сначала находим любой input[type=file] включая скрытые
-                file_input = page.locator('input[type="file"]').first
+                # Если редиректнуло на логин
+                if "auth" in page.url or "login" in page.url or "ims" in page.url:
+                    print("Adobe: нужен логин, вводим данные...")
+                    await page.screenshot(path="/tmp/adobe_02_login.png")
+                    await notify("/tmp/adobe_02_login.png", "Adobe: страница логина")
+
+                    # Вводим email
+                    await page.wait_for_selector('input[type="email"], input[name="username"], #username', timeout=15000)
+                    await page.fill('input[type="email"], input[name="username"], #username', ADOBE_EMAIL)
+                    await page.screenshot(path="/tmp/adobe_03_email.png")
+
+                    # Кнопка Continue/Далее
+                    for sel in ['button:has-text("Continue")', 'button[type="submit"]', '#btn-id-forward']:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.count() > 0:
+                                await el.click()
+                                print(f"Adobe: email подтверждён через '{sel}'")
+                                break
+                        except Exception:
+                            continue
+
+                    await asyncio.sleep(3)
+                    await page.screenshot(path="/tmp/adobe_04_password.png")
+
+                    # Вводим пароль
+                    for sel in ['input[type="password"]', '#password']:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.count() > 0:
+                                await el.fill(ADOBE_PASSWORD)
+                                print("Adobe: пароль введён")
+                                break
+                        except Exception:
+                            continue
+
+                    # Кнопка Sign In
+                    for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
+                        try:
+                            el = page.locator(sel).first
+                            if await el.count() > 0:
+                                await el.click()
+                                print(f"Adobe: кнопка входа нажата '{sel}'")
+                                break
+                        except Exception:
+                            continue
+
+                    await asyncio.sleep(5)
+                    await page.wait_for_load_state("networkidle")
+                    await page.screenshot(path="/tmp/adobe_05_after_login.png")
+                    print(f"Adobe: URL после логина = {page.url}")
+                    await notify("/tmp/adobe_05_after_login.png", "Adobe: после логина")
+
+                    # Если не попали на enhance — переходим сами
+                    if "enhance" not in page.url:
+                        await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
+                        await page.wait_for_load_state("networkidle")
+                        await asyncio.sleep(3)
+
+                # ── 2. Страница enhance загружена ──
+                await page.screenshot(path="/tmp/adobe_06_enhance.png")
+                print(f"Adobe: на странице enhance, URL={page.url}")
+
+                # ── 3. Загружаем файл ──
+                # Снимаем скрытость со всех input[type=file]
+                await page.evaluate("""() => {
+                    document.querySelectorAll('input[type="file"]').forEach(el => {
+                        el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;width:100px!important;height:100px!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;';
+                    });
+                }""")
+                await asyncio.sleep(1)
+
                 input_count = await page.locator('input[type="file"]').count()
-                print(f"Adobe: найдено input[type=file]: {input_count}")
+                print(f"Adobe: input[type=file] найдено: {input_count}")
 
                 if input_count > 0:
-                    # Снимаем display:none и visibility:hidden через JS
-                    await page.evaluate("""() => {
-                        const inputs = document.querySelectorAll('input[type="file"]');
-                        inputs.forEach(el => {
-                            el.style.display = 'block';
-                            el.style.visibility = 'visible';
-                            el.style.opacity = '1';
-                            el.style.width = '100px';
-                            el.style.height = '100px';
-                            el.style.position = 'fixed';
-                            el.style.top = '0';
-                            el.style.left = '0';
-                            el.style.zIndex = '99999';
-                        });
-                    }""")
-                    await asyncio.sleep(1)
                     await page.set_input_files('input[type="file"]', str(mp3_path))
-                    print(f"Adobe: файл передан через input: {mp3_path.name}")
+                    print(f"Adobe: файл передан через input")
                 else:
-                    # Пробуем drag-and-drop через JS FileList
-                    print("Adobe: input не найден, пробуем drag-and-drop через JS...")
+                    # JS DataTransfer drag-and-drop
+                    print("Adobe: пробуем JS DataTransfer...")
                     with open(mp3_path, "rb") as f:
-                        file_bytes = f.read()
-                    import base64
-                    b64 = base64.b64encode(file_bytes).decode()
+                        import base64
+                        b64 = base64.b64encode(f.read()).decode()
                     await page.evaluate(f"""async () => {{
                         const b64 = "{b64}";
-                        const byteChars = atob(b64);
-                        const byteArr = new Uint8Array(byteChars.length);
-                        for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
-                        const file = new File([byteArr], "{mp3_path.name}", {{type: "audio/mpeg"}});
+                        const bin = atob(b64);
+                        const arr = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                        const file = new File([arr], "{mp3_path.name}", {{type:"audio/mpeg"}});
                         const dt = new DataTransfer();
                         dt.items.add(file);
-                        // Ищем drop-зону
-                        const dropZone = document.querySelector(
-                            '[class*="drop"], [class*="upload"], [class*="drag"], section, main'
-                        );
-                        if (dropZone) {{
-                            const ev = new DragEvent("drop", {{bubbles: true, dataTransfer: dt}});
-                            dropZone.dispatchEvent(ev);
-                        }}
+                        const zone = document.querySelector('[class*="drop"],[class*="upload"],[class*="drag"],section,main');
+                        if (zone) zone.dispatchEvent(new DragEvent("drop", {{bubbles:true, dataTransfer:dt}}));
                     }}""")
-                    print("Adobe: drag-and-drop отправлен")
 
                 await asyncio.sleep(3)
-                await page.screenshot(path="/tmp/adobe_02.png")
+                await page.screenshot(path="/tmp/adobe_07_uploaded.png")
 
-                # Ищем и нажимаем кнопку Enhance
+                # ── 4. Нажимаем Enhance ──
                 for sel in [
                     'button:has-text("Enhance speech")',
                     'button:has-text("Enhance")',
-                    'button:has-text("Clean up speech")',
-                    '[data-testid*="enhance"]',
+                    'button:has-text("Clean up")',
+                    'button[data-testid*="enhance"]',
                     'button[type="submit"]',
                 ]:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
                             await el.click()
-                            print(f"Adobe: кнопка '{sel}' нажата")
+                            print(f"Adobe: Enhance нажата '{sel}'")
                             break
                     except Exception:
                         continue
 
                 await asyncio.sleep(3)
-                await page.screenshot(path="/tmp/adobe_03.png")
+                await page.screenshot(path="/tmp/adobe_08_processing.png")
 
-                # Ждём обработки до 5 минут
+                # ── 5. Ждём обработки (до 5 минут) ──
                 print("Adobe: ждём обработки...")
                 for i in range(60):
                     await asyncio.sleep(5)
                     html = await page.content()
-                    url  = page.url
-                    if any(x in html.lower() for x in ["download", "enhanced", "готово", "complete"]):
-                        print(f"Adobe: обработка завершена (шаг {i+1})")
-                        await page.screenshot(path="/tmp/adobe_04_done.png")
+                    if any(x in html.lower() for x in ["download", "enhanced", "complete", "готово"]):
+                        print(f"Adobe: готово (шаг {i+1})")
                         break
-                    print(f"Adobe: ждём... ({i+1}/60) URL={url}")
+                    print(f"Adobe: {i+1}/60 ждём...")
 
-                await page.screenshot(path="/tmp/adobe_04_done.png")
+                await page.screenshot(path="/tmp/adobe_09_done.png")
+                await notify("/tmp/adobe_09_done.png", "Adobe: результат обработки")
 
-                # Скачиваем результат
+                # ── 6. Скачиваем результат ──
                 for sel in [
                     'a[download]',
                     'button:has-text("Download")',
                     'a:has-text("Download")',
-                    'button:has-text("Скачать")',
                     '[href*=".mp3"]',
                     '[data-testid*="download"]',
                 ]:
@@ -237,71 +285,40 @@ async def enhance_audio(mp3_path: Path, send_screenshot=None) -> Path:
                             dl = await dl_info.value
                             await dl.save_as(str(adobe_path))
                             size = adobe_path.stat().st_size
-                            print(f"Adobe: файл скачан {size} байт")
+                            print(f"Adobe: скачан {size} байт")
                             if size > 10000:
-                                adobe_success = True
-                            break
+                                # loudnorm поверх Adobe
+                                result = subprocess.run(
+                                    ["ffmpeg", "-y", "-i", str(adobe_path),
+                                     "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                                     "-codec:a", "libmp3lame", "-b:a", "128k",
+                                     "-ar", "44100", "-ac", "1", str(studio_path)],
+                                    capture_output=True, text=True
+                                )
+                                if result.returncode == 0 and studio_path.exists():
+                                    print(f"Adobe+loudnorm: {studio_path.stat().st_size} байт")
+                                    return studio_path
+                                return adobe_path
                     except Exception as ex:
-                        print(f"Adobe download sel {sel}: {ex}")
+                        print(f"Adobe download '{sel}': {ex}")
                         continue
 
-                if not adobe_success:
-                    html = await page.content()
-                    print(f"Adobe: кнопка скачивания не найдена")
-                    print(f"Adobe HTML[0:3000]: {html[:3000]}")
-                    await page.screenshot(path="/tmp/adobe_error.png")
-                    if send_screenshot:
-                        await send_screenshot("/tmp/adobe_error.png", "Adobe: не нашёл кнопку скачивания")
+                # Кнопка скачивания не найдена
+                html = await page.content()
+                print(f"Adobe HTML[0:1000]: {html[:1000]}")
+                await page.screenshot(path="/tmp/adobe_error.png")
+                await notify("/tmp/adobe_error.png", "Adobe: кнопка скачивания не найдена")
+                raise RuntimeError("Adobe: кнопка скачивания не найдена")
 
             except Exception as e:
-                print(f"Adobe браузер исключение: {e}")
                 await page.screenshot(path="/tmp/adobe_error.png")
-                if send_screenshot:
-                    await send_screenshot("/tmp/adobe_error.png", f"Adobe ошибка: {e}")
+                await notify("/tmp/adobe_error.png", f"Adobe ошибка: {str(e)[:100]}")
+                raise
             finally:
                 await browser.close()
 
     except Exception as e:
-        print(f"Adobe: внешнее исключение — {e}")
-
-    # ── Запасной: FFmpeg мастеринг ──
-    if not adobe_success:
-        print("Adobe не удался → FFmpeg мастеринг...")
-        audio_filters = ",".join([
-            "afftdn=nf=-25:nt=w",
-            "highpass=f=80",
-            "lowpass=f=16000",
-            "equalizer=f=300:width_type=o:width=2:g=-4",
-            "equalizer=f=3500:width_type=o:width=2:g=4",
-            "equalizer=f=10000:width_type=o:width=2:g=2",
-            "acompressor=threshold=-20dB:ratio=4:attack=5:release=80:makeup=3",
-            "loudnorm=I=-16:TP=-1.5:LRA=11",
-        ])
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(mp3_path),
-             "-af", audio_filters,
-             "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
-             str(studio_path)],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0 and studio_path.exists():
-            print(f"FFmpeg: готово {studio_path.stat().st_size} байт")
-            return studio_path
-        return mp3_path
-
-    # ── loudnorm поверх Adobe результата ──
-    source = adobe_path
-    result = subprocess.run(
-        ["ffmpeg", "-y", "-i", str(source),
-         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-         "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
-         str(studio_path)],
-        capture_output=True, text=True
-    )
-    if result.returncode == 0 and studio_path.exists():
-        print(f"loudnorm: готово {studio_path.stat().st_size} байт")
-        return studio_path
-    return source
+        raise RuntimeError(f"Adobe Podcast недоступен: {e}")
 
 
 def transcribe(mp3_path: Path) -> str:
