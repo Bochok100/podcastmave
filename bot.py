@@ -1,8 +1,8 @@
 """
-Podcast Bot v2 (Smart Web Camera + Hidden Field Bypass)
-- Веб-камера /screen теперь транслирует скриншот прямо в момент ошибки
-- Умный обход: если поле почты скрыто (предложен готовый аккаунт), бот просто жмет Продолжить
-- Эмуляция живого ввода клавиатуры
+Podcast Bot v2 (Bulletproof Auth + Quick Timeouts + Drag-and-Drop)
+- Быстрые таймауты (5 сек) на каждый клик, чтобы бот не висел по 30 секунд
+- Точные локаторы кнопок (без общих submit)
+- Встроенная веб-камера на /screen
 """
 
 import os
@@ -67,7 +67,6 @@ adobe_2fa_state = {}
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/screen':
-            # Ищем самый свежий скриншот, начиная с экрана ошибки
             screens = ['/tmp/adobe_error.png', '/tmp/adobe_before_upload.png', '/tmp/adobe_2fa_input.png']
             for s in screens:
                 if os.path.exists(s):
@@ -81,7 +80,6 @@ class DummyHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
             
-            # Если скриншотов нет вообще
             self.send_response(404)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
@@ -177,7 +175,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         pass
 
                 # =================================================================
-                # БЛОК АВТОРИЗАЦИИ С ЗАЩИТОЙ ОТ СКРЫТЫХ ПОЛЕЙ
+                # БЛОК АВТОРИЗАЦИИ (ЗАЩИТА ОТ ЗАВИСАНИЙ)
                 # =================================================================
                 print("Adobe: Ожидаем прогрузки интерфейса...")
                 login_found = False
@@ -194,75 +192,81 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     email_field = page.locator('input[type="email"], input[name="username"]').first
                     
                     try:
-                        # Пытаемся дождаться видимости поля 8 секунд
-                        await email_field.wait_for(state="visible", timeout=8000)
+                        await email_field.wait_for(state="visible", timeout=5000)
                         print(f"Adobe: Поле почты видимо. Вводим: {email_str}")
-                        await email_field.click(force=True)
+                        await email_field.click(timeout=3000, force=True)
                         await asyncio.sleep(1)
                         await email_field.press_sequentially(email_str, delay=100)
                         await asyncio.sleep(2)
                     except Exception:
-                        print("Adobe: Поле почты скрыто или не найдено. Возможно, аккаунт уже предложен списком. Идем дальше...")
+                        print("Adobe: Поле почты скрыто или не найдено. Идем дальше...")
                     
-                    continue_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue"), button[type="submit"], #btn-id-forward').first
-                    if await continue_btn.count() > 0:
-                        await continue_btn.click(force=True)
-                    await asyncio.sleep(5)
+                    try:
+                        continue_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue"), #btn-id-forward, [data-id="EmailPage-ContinueButton"]').first
+                        if await continue_btn.count() > 0:
+                            await continue_btn.click(timeout=5000, force=True)
+                        await asyncio.sleep(5)
+                    except Exception as e:
+                        print(f"Adobe: Клик 'Продолжить' не удался: {e}")
                     
                     # ПРОВЕРКА ДВУХШАГОВОЙ 2FA
-                    identity_text = page.locator('text=/Подтверждение личности|Verify your identity/i')
-                    if await identity_text.count() > 0:
-                        print("Adobe: Экран подтверждения личности. Нажимаем Продолжить для отправки кода...")
-                        identity_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue")').first
-                        if await identity_btn.count() > 0:
-                            await identity_btn.click(force=True)
-                            await asyncio.sleep(4)
+                    try:
+                        identity_text = page.locator('text=/Подтверждение личности|Verify your identity/i')
+                        if await identity_text.count() > 0:
+                            print("Adobe: Экран подтверждения личности. Нажимаем Продолжить для отправки кода...")
+                            identity_btn = page.locator('button:has-text("Продолжить"), button:has-text("Continue")').first
+                            if await identity_btn.count() > 0:
+                                await identity_btn.click(timeout=5000, force=True)
+                                await asyncio.sleep(4)
+                    except Exception: pass
 
                     # 2FA ВВОД КОДА
-                    code_input = page.locator('input[type="text"], input[type="number"], input[name*="code"]')
-                    if await code_input.count() > 0:
-                        print("Adobe: Запрашиваем 2FA код...")
-                        try:
-                            await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
-                            await notify("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
-                        except Exception: pass
-                        
-                        event = asyncio.Event()
-                        adobe_2fa_state[user_id] = {"event": event, "code": ""}
-                        
-                        try:
-                            await asyncio.wait_for(event.wait(), timeout=120.0)
-                            received_code = adobe_2fa_state[user_id]["code"].strip()
-                            await code_input.first.fill(received_code)
-                            await asyncio.sleep(1)
+                    try:
+                        code_input = page.locator('input[type="text"], input[type="number"], input[name*="code"]')
+                        if await code_input.count() > 0:
+                            print("Adobe: Запрашиваем 2FA код...")
+                            try:
+                                await page.screenshot(path="/tmp/adobe_2fa_input.png", timeout=5000)
+                                await notify("/tmp/adobe_2fa_input.png", "⚠️ Adobe отправил проверочный код на твою почту! Пришли мне его ОБЫЧНЫМ ТЕКСТОМ (в течение 2 минут).")
+                            except Exception: pass
                             
-                            sub_btn = page.locator('button:has-text("Продолжить"), button[type="submit"], button:has-text("Submit"), button:has-text("Verify")').first
-                            if await sub_btn.count() > 0:
-                                await sub_btn.click(force=True)
-                            await asyncio.sleep(5)
-                        except asyncio.TimeoutError:
-                            raise RuntimeError("Таймаут: вы не успели прислать код за 2 минуты.")
-                        finally:
-                            adobe_2fa_state.pop(user_id, None)
+                            event = asyncio.Event()
+                            adobe_2fa_state[user_id] = {"event": event, "code": ""}
+                            
+                            try:
+                                await asyncio.wait_for(event.wait(), timeout=120.0)
+                                received_code = adobe_2fa_state[user_id]["code"].strip()
+                                await code_input.first.fill(received_code, timeout=5000)
+                                await asyncio.sleep(1)
+                                
+                                sub_btn = page.locator('button:has-text("Продолжить"), button:has-text("Submit"), button:has-text("Verify")').first
+                                if await sub_btn.count() > 0:
+                                    await sub_btn.click(timeout=5000, force=True)
+                                await asyncio.sleep(5)
+                            except asyncio.TimeoutError:
+                                raise RuntimeError("Таймаут: вы не успели прислать код за 2 минуты.")
+                            finally:
+                                adobe_2fa_state.pop(user_id, None)
+                    except Exception: pass
 
                     # ПАРОЛЬ
-                    pwd_field = page.locator('input[type="password"], #password').first
-                    if await pwd_field.count() > 0:
-                        try:
-                            await pwd_field.wait_for(state="visible", timeout=8000)
+                    try:
+                        pwd_field = page.locator('input[type="password"], #password').first
+                        if await pwd_field.count() > 0:
+                            await pwd_field.wait_for(state="visible", timeout=5000)
                             pwd_str = ADOBE_PASSWORD.strip()
                             print(f"Adobe: Вводим пароль (Длина: {len(pwd_str)} симв.)")
-                            await pwd_field.click(force=True)
+                            await pwd_field.click(timeout=3000, force=True)
                             await asyncio.sleep(1)
                             await pwd_field.press_sequentially(pwd_str, delay=100)
                             await asyncio.sleep(2)
                             
-                            login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
+                            login_btn = page.locator('button:has-text("Продолжить"), button:has-text("Войти"), button:has-text("Sign in"), button:has-text("Continue")').first
                             if await login_btn.count() > 0:
-                                await login_btn.click(force=True)
+                                await login_btn.click(timeout=5000, force=True)
                             await asyncio.sleep(5)
-                        except Exception as e:
-                            print(f"Adobe: Поле пароля скрыто или ошибка ввода: {e}")
+                    except Exception as e:
+                        print(f"Adobe: Поле пароля скрыто или ошибка ввода: {e}")
 
                     print("Adobe: Ждем завершения редиректов (до 20 сек)...")
                     for _ in range(20):
@@ -288,9 +292,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(5)
                     
                 # =================================================================
-                # ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
+                # ЖЕСТКАЯ ПРОВЕРКА И ПРЕДВАРИТЕЛЬНЫЙ СКРИНШОТ
                 # =================================================================
-                print("Adobe: Кабинет открыт. Делаю снимок экрана перед загрузкой...")
                 try:
                     await page.screenshot(path="/tmp/adobe_before_upload.png", timeout=5000)
                 except Exception: pass
