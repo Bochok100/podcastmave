@@ -1,6 +1,6 @@
 """
-Podcast Bot v3.2 — Armor Auth + Session Persistence + Async Fix
-- Жесткий обход невидимых полей (force=True, state="attached")
+Podcast Bot v3.3 — JS Injection Auth + Session Persistence
+- Жесткий обход невидимых полей (JS Injection для пароля)
 - Сохранение куки (сессии) в adobe_state.json для обхода 2FA
 - block=False для параллельного приема проверочных кодов
 """
@@ -160,7 +160,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 except Exception:
                     pass
 
-            # ── 3. Вводим email (С ЖЕСТКИМ ОБХОДОМ) ──
+            # ── 3. Вводим email ──
             if await page.locator('input[type="email"],input[name="username"]').count() > 0:
                 print("Adobe: вводим email...")
                 field = page.locator('input[type="email"],input[name="username"]').first
@@ -211,14 +211,20 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (С ЖЕСТКИМ ОБХОДОМ) ──
+            # ── 6. Вводим пароль (СУПЕР-ЖЕСТКИЙ ОБХОД ЧЕРЕЗ JS БЕЗ КЛИКОВ) ──
             if await page.locator('input[type="password"],#password').count() > 0:
-                print("Adobe: вводим пароль...")
+                print("Adobe: вводим пароль через JS...")
                 pwd = page.locator('input[type="password"],#password').first
                 await pwd.wait_for(state="attached", timeout=10000)
-                await pwd.click(force=True)
-                await asyncio.sleep(0.5)
-                await pwd.fill(ADOBE_PASSWORD.strip())
+                
+                # Забиваем пароль напрямую в свойства элемента через JavaScript
+                pwd_str = ADOBE_PASSWORD.strip()
+                await pwd.evaluate(f"""(node) => {{
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputValueSetter.call(node, '{pwd_str}');
+                    node.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }}""")
                 await asyncio.sleep(1)
                 
                 for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
