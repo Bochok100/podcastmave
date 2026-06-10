@@ -1,5 +1,5 @@
-# Берем официальный образ, где УЖЕ установлены Firefox, Chromium и все скрытые библиотеки
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+# Берем официальный образ ТОЧНО ТОЙ ВЕРСИИ, которую просит система (v1.60.0)
+FROM mcr.microsoft.com/playwright/python:v1.60.0-jammy
 
 WORKDIR /app
 
