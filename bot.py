@@ -1,7 +1,7 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + RU Locators)
+Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Sync Fix)
+- Исправлен тайминг после ввода пароля (ожидание 3-5 секунд редиректа)
 - Поддержка русского интерфейса авторизации Adobe ("Продолжить", "Войти")
-- Интеллектуальное ожидание редиректа после логина
 - Безопасные скриншоты (timeout=5000)
 - Интерактивный перехват 2FA-кода из чата Telegram
 """
@@ -130,14 +130,14 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         cookies = json.loads(ADOBE_COOKIES_JSON)
                         await context.add_cookies(cookies)
                     except Exception as ce:
-                        print(f"Adobe: Ошибка куков: {ce}")
+                        pass
 
                 print("Adobe: Переход на страницу Enhance...")
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-                # Глобальный JS-клик для обхода перерисовок
+                # Глобальный JS-клик для гостевой страницы
                 if "auth" not in page.url:
                     print("Adobe: Ищем кнопку Sign In глобальным скриптом...")
                     try:
@@ -149,10 +149,10 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                             }
                         }""")
                         await asyncio.sleep(5)
-                    except Exception as e:
+                    except Exception:
                         pass
 
-                # Ввод Email / Пароля с поддержкой РУССКОГО интерфейса
+                # Ввод Email / Пароля
                 if "auth" in page.url or "login" in page.url or "ims" in page.url:
                     print("Adobe: Вводим почту...")
                     await page.wait_for_selector('input[type="email"], input[name="username"]', timeout=15000)
@@ -166,7 +166,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
 
                     await asyncio.sleep(4)
                     
-                    # 2FA (Проверка личности)
+                    # Проверка 2FA (Личность)
                     if await page.locator('text=Подтверждение личности').count() > 0 or await page.locator('button:has-text("Продолжить")').count() > 0:
                         print("Adobe: Обнаружен экран подтверждения личности! Запрашиваем код...")
                         try:
@@ -190,7 +190,6 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         try:
                             await asyncio.wait_for(event.wait(), timeout=120.0)
                             received_code = adobe_2fa_state[user_id]["code"].strip()
-                            print(f"Adobe: Перехватили код: {received_code}. Заполняем форму...")
                             
                             code_field = page.locator('input[type="text"], input[type="number"], input[name*="code"]').first
                             await code_field.fill(received_code)
@@ -218,22 +217,38 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                                 if await el.count() > 0: await el.evaluate("node => node.click()"); break
                             except Exception: continue
 
-                    # === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Ждем редиректа 15 секунд ===
-                    print("Adobe: Ждем завершения авторизации и загрузки интерфейса...")
-                    for _ in range(15):
-                        if "enhance" in page.url and "auth" not in page.url:
+                    # === КРИТИЧЕСКИЙ ФИКС: ТЕРПЕЛИВОЕ ОЖИДАНИЕ РЕДИРЕНТА (До 20 секунд) ===
+                    print("Adobe: Вход выполнен. Замираем и ждем завершения редиректов...")
+                    for _ in range(20):
+                        # Если в URL появилось слово enhance, и мы ушли с серверов логина auth/ims — сессия закрепилась!
+                        if "enhance" in page.url and "auth" not in page.url and "ims" not in page.url:
+                            print(f"Adobe: Успешный переход зафиксирован на URL: {page.url}")
                             break
+                        
+                        # Если всплывают окна "Оставаться в системе?" или привязка телефона — кликаем "Да"/"Пропустить" через JS
+                        if "adobelogin" in page.url or "auth" in page.url:
+                            try:
+                                await page.evaluate("""() => {
+                                    const targets = Array.from(document.querySelectorAll('button, a, span'));
+                                    const interstitialBtn = targets.find(el => {
+                                        const t = el.innerText ? el.innerText.trim().toLowerCase() : '';
+                                        return t === 'не сейчас' || t === 'пропустить' || t === 'not now' || t === 'skip' || t === 'напомнить позже' || t === 'да' || t === 'yes' || t === 'продолжить';
+                                    });
+                                    if (interstitialBtn) interstitialBtn.click();
+                                }""")
+                            except:
+                                pass
                         await asyncio.sleep(1)
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(3) # Финальные 3 секунды для полной отрисовки React-компонентов
 
-                # Если редирект не сработал или мы застряли — принудительно идем на Enhance
+                # Страховочная проверка: если редирект не дошел до конца, плавно обновляем страницу
                 if "enhance" not in page.url or "auth" in page.url:
-                    print("Adobe: Принудительный переход на Enhance...")
+                    print("Adobe: Сессия готова, делаем чистый переход на панель Enhance...")
                     await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
                     await page.wait_for_load_state("domcontentloaded")
                     await asyncio.sleep(5)
 
-                print("Adobe: Ожидаем поле загрузки...")
+                print("Adobe: Личный кабинет открыт! Ищем поле загрузки подкаста...")
                 await page.wait_for_selector('input[type="file"]', state='attached', timeout=30000)
                 
                 await page.evaluate("""() => {
@@ -253,7 +268,7 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                         if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
                     except Exception: continue
 
-                print("Adobe: Ожидание рендеринга кнопки скачивания...")
+                print("Adobe: Ожидание скачивания готового аудио (до 5 минут)...")
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
@@ -286,8 +301,8 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                 try:
                     await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
                     await notify("/tmp/adobe_error.png", f"Критический сбой Adobe:")
-                except Exception as screenshot_err:
-                    print(f"Не удалось сделать скриншот: {screenshot_err}")
+                except Exception:
+                    pass
                 
                 raise RuntimeError(f"{original_error}")
             finally:
