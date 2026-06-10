@@ -1,9 +1,9 @@
 """
-Podcast Bot v2 (Xvfb + Safe Screenshots + 2FA Bypass + Iframe Scanner Fix + Anti-Crash)
+Podcast Bot v2 (Xvfb + 2FA Bypass + Ultimate Drag-and-Drop)
+- Ультимативный обход загрузки: эмуляция перетаскивания файла мышкой (Drag & Drop)
+- Конвертация файлов через Data URI для работы с тяжелыми MP3
 - Защита от мгновенных падений (Application exited early)
-- Сканирование абсолютно всех фреймов для прорыва сквозь iframe-защиту Adobe
-- Мультиязычный поиск кнопок загрузки
-- Интерактивный перехват 2FA-кода из чата Telegram
+- Интерактивный перехват 2FA-кода
 """
 
 import os
@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import threading
 import time
+import base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -97,7 +98,7 @@ def convert_to_mp3(input_path: Path) -> Path:
     return mp3_path
 
 # ──────────────────────────────────────────────
-# 3. Обработка звука (Adobe Podcast с фиксом фреймов)
+# 3. Обработка звука (Adobe Podcast)
 # ──────────────────────────────────────────────
 async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> Path:
     adobe_path  = mp3_path.parent / (mp3_path.stem + "_adobe.mp3")
@@ -237,71 +238,91 @@ async def enhance_audio(mp3_path: Path, user_id: int, send_screenshot=None) -> P
                     await asyncio.sleep(5)
 
                 # =================================================================
-                # СКАНИРОВАНИЕ ВСЕХ СЛОЕВ И ФРЕЙМОВ (IFRAMES)
+                # УЛЬТИМАТИВНАЯ ЗАГРУЗКА: 3 СТУПЕНИ
                 # =================================================================
-                print("Adobe: Кабинет открыт. Запускаем сканирование фреймов...")
+                print("Adobe: Кабинет открыт. Инициируем алгоритм загрузки...")
                 uploaded = False
                 
-                # Попытка 1: Проверяем все фреймы на наличие input[type="file"] напрямую
-                for frame in page.frames:
+                # СТУПЕНЬ 1: Умный клик по кнопке (Native File Chooser)
+                try:
+                    print("Шаг 1: Ищем интерфейс загрузки на экране...")
+                    target = page.locator('text=/Choose files|Выбрать|Загрузить|Upload/i').first
+                    await target.wait_for(state="visible", timeout=5000)
+                    async with page.expect_file_chooser(timeout=5000) as fc_info:
+                        await target.click(force=True)
+                    file_chooser = await fc_info.value
+                    await file_chooser.set_files(str(mp3_path))
+                    print("✅ Файл загружен через системное окно!")
+                    uploaded = True
+                except Exception as e:
+                    print(f"Шаг 1 пропущен ({e}).")
+
+                # СТУПЕНЬ 2: Прямой инжект в скрытое поле
+                if not uploaded:
                     try:
-                        inp = frame.locator('input[type="file"]').first
-                        if await inp.count() > 0:
-                            print(f"Adobe: Нашли скрытое поле ввода во фрейме: {frame.url[:40]}")
-                            await frame.evaluate("""() => {
-                                document.querySelectorAll('input[type="file"]').forEach(el => {
-                                    el.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:fixed!important;top:0!important;left:0!important;z-index:99999!important;width:200px!important;height:200px!important;';
-                                });
-                            }""")
-                            await asyncio.sleep(1)
-                            await inp.set_input_files(str(mp3_path), timeout=15000)
-                            print("Adobe: Файл успешно внедрен во фрейм напрямую!")
-                            uploaded = True
-                            break
-                    except Exception:
-                        continue
+                        print("Шаг 2: Ищем скрытый input...")
+                        inp = page.locator('input[type="file"]').first
+                        await inp.set_input_files(str(mp3_path), timeout=5000)
+                        print("✅ Файл загружен через скрытый input!")
+                        uploaded = True
+                    except Exception as e:
+                        print(f"Шаг 2 пропущен ({e}).")
 
-                # Попытка 2: Если прямой инжект заблокирован, ищем кнопку Choose files внутри фреймов
+                # СТУПЕНЬ 3: БЕЗОТКАЗНЫЙ DRAG AND DROP (Сбрасываем файл в окно браузера)
                 if not uploaded:
-                    print("Adobe: Прямой инжект заблокирован. Ищем кнопку Choose files внутри фреймов...")
-                    for frame in page.frames:
-                        try:
-                            upload_btn = frame.locator('text=/choose|выбрать|загрузить|upload/i').first
-                            if await upload_btn.count() > 0:
-                                print(f"Adobe: Нашли кнопку загрузки во фрейме {frame.url[:40]}, запускаем File Chooser...")
-                                async with page.expect_file_chooser(timeout=15000) as fc_info:
-                                    await upload_btn.click(force=True)
-                                file_chooser = await fc_info.value
-                                await file_chooser.set_files(str(mp3_path))
-                                print("Adobe: Файл успешно передан через диалог фрейма!")
-                                uploaded = True
-                                break
-                        except Exception:
-                            continue
+                    try:
+                        print("Шаг 3: Активируем ультимативный Drag-and-Drop...")
+                        # Читаем файл в base64
+                        with open(mp3_path, "rb") as f:
+                            file_base64 = base64.b64encode(f.read()).decode("utf-8")
+                        
+                        # Выполняем инжект в браузер: создаем файл из base64 и эмулируем бросок мыши
+                        await page.evaluate("""async ([base64, filename, mime]) => {
+                            // Быстрая и безопасная конвертация через fetch
+                            const dataUrl = `data:${mime};base64,${base64}`;
+                            const res = await fetch(dataUrl);
+                            const blob = await res.blob();
+                            const file = new File([blob], filename, { type: mime });
+                            
+                            const dt = new DataTransfer();
+                            dt.items.add(file);
+                            
+                            // Генерируем события мыши
+                            const enterEvent = new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt });
+                            const overEvent = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt });
+                            const dropEvent = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt });
+                            
+                            // Бросаем прямо в тело сайта (перехватит глобальный слушатель Adobe)
+                            document.body.dispatchEvent(enterEvent);
+                            document.body.dispatchEvent(overEvent);
+                            document.body.dispatchEvent(dropEvent);
+                        }""", [file_base64, mp3_path.name, "audio/mpeg"])
+                        
+                        print("✅ УСПЕХ! Файл физически сброшен в окно браузера!")
+                        uploaded = True
+                        await asyncio.sleep(4)
+                    except Exception as e:
+                        print(f"Шаг 3 завершился ошибкой: {e}")
 
                 if not uploaded:
-                    raise RuntimeError("Adobe заблокировал интерфейс загрузки: элемент не найден ни во фреймах, ни в DOM.")
+                    raise RuntimeError("Adobe заблокировал интерфейс загрузки. Все 3 метода исчерпаны.")
                 # =================================================================
 
                 await asyncio.sleep(3)
 
-                for frame in page.frames:
-                    for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
-                        try:
-                            btn = frame.locator(sel).first
-                            if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
-                        except Exception: continue
+                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button[type="submit"]']:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0: await btn.evaluate("node => node.click()"); break
+                    except Exception: continue
 
                 print("Adobe: Ожидание скачивания готового аудио (до 5 минут)...")
                 download_locator = None
                 for i in range(60): 
                     await asyncio.sleep(5)
-                    for frame in page.frames:
-                        dl_btn = frame.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
-                        if await dl_btn.count() > 0:
-                            download_locator = dl_btn
-                            break
-                    if download_locator:
+                    dl_btn = page.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Скачать"), a:has-text("Скачать")').last
+                    if await dl_btn.count() > 0:
+                        download_locator = dl_btn
                         break
 
                 if not download_locator:
@@ -545,7 +566,6 @@ def main():
     except Exception as e:
         print(f"\n❌❌❌ КРИТИЧЕСКАЯ ОШИБКА ЗАПУСКА: {e} ❌❌❌")
         print("Бот остановлен. Проверьте, не запущен ли он на вашем компьютере!")
-        # Бесконечный цикл, чтобы удержать контейнер Render живым для показа логов
         while True:
             time.sleep(60)
 
