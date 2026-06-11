@@ -96,10 +96,20 @@ async def download_voice(update, context) -> Path:
 
 def to_mp3(src: Path) -> Path:
     dst = src.with_suffix(".mp3")
-    subprocess.run(["ffmpeg", "-y", "-i", str(src),
-                    "-codec:a", "libmp3lame", "-b:a", "128k",
-                    "-ar", "44100", "-ac", "1", str(dst)],
-                   capture_output=True)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-codec:a", "libmp3lame", "-b:a", "128k",
+             "-ar", "44100", "-ac", "1", str(dst)],
+            capture_output=True,
+            timeout=60  # таймаут 60 секунд
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg ошибка: {result.stderr[-200:]}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ffmpeg завис — таймаут 60 секунд")
+    if not dst.exists() or dst.stat().st_size < 1000:
+        raise RuntimeError("ffmpeg не создал MP3 файл")
     return dst
 
 # ── Adobe Podcast ──────────────────────────────
@@ -463,7 +473,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 ["ffmpeg", "-y", "-i", str(adobe),
                  "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
                  "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out)],
-                capture_output=True
+                capture_output=True,
+                timeout=120
             )
             return out if r.returncode == 0 and out.exists() else adobe
 
