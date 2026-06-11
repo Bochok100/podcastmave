@@ -1,8 +1,10 @@
 """
-Podcast Bot v3.25 — Fully Asynchronous Core
-- FFmpeg, OpenAI Whisper и GPT-4 переведены на асинхронный режим (устранено зависание бота)
-- Логика авторизации из v3.24
-- Интегрирована максимальная оптимизация памяти
+Podcast Bot v3.26 — The Laser Focus
+- Возвращена стабильная логика ввода через page.keyboard.type()
+- Заменен click(force=True) на надежный .focus(), который игнорирует перекрывающие слои
+- Таймауты ожидания полей увеличены до 30 секунд для медленных серверов
+- Добавлены обязательные скриншоты при пропуске шагов логина
+- Сохранена полная асинхронность и максимальная экономия оперативной памяти
 """
 
 import os
@@ -196,12 +198,13 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email ──
+            # ── 3. Email (НАДЕЖНЫЙ ПОИСК + ФОКУС) ──
             try:
-                print("Adobe: ждем появление поля email...")
+                print("Adobe: ждем появление поля email (до 30 сек)...")
                 email_target = None
-                for _ in range(15):
-                    inputs = await page.locator('input[type="email"], input[name="username"], input[id*="email" i]').all()
+                for _ in range(30):
+                    # Ищем только по типу и имени, чтобы не зацепить скрытые ловушки
+                    inputs = await page.locator('input[type="email"], input[name="username"]').all()
                     for inp in inputs:
                         if await inp.is_visible():
                             email_target = inp
@@ -211,19 +214,21 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(1)
 
                 if email_target:
-                    print("Adobe: видимое поле email найдено. Вводим...")
-                    await email_target.click(force=True)
+                    print("Adobe: видимое поле email найдено. Фокусируемся...")
+                    await email_target.focus()
                     await asyncio.sleep(0.5)
-                    await email_target.fill(ADOBE_EMAIL.strip(), force=True)
+                    await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
                     await asyncio.sleep(1)
                     
                     print("Adobe: Жмем Enter...")
-                    await email_target.press("Enter")
+                    await page.keyboard.press("Enter")
                     await asyncio.sleep(6)
                     await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
                 else:
+                    await shot("/tmp/adobe_last.png", "⚠️ Adobe: Поле email не найдено за 30 сек. Пропускаем шаг.")
                     print("Adobe: Видимое поле email не найдено. Идем дальше.")
             except Exception as e:
+                await shot("/tmp/adobe_error.png", f"❌ Ошибка при вводе email: {str(e)[:50]}")
                 print(f"Adobe email error: {str(e)[:100]}")
 
             # ── 4. Экран подтверждения ──
@@ -254,8 +259,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             break
                     
                     if first_input:
-                        print("Adobe: вводим код...")
-                        await first_input.click(force=True)
+                        print("Adobe: фокусируемся на поле кода...")
+                        await first_input.focus()
+                        await asyncio.sleep(0.5)
                         await page.keyboard.type(code, delay=150)
                         await asyncio.sleep(1)
                         await page.keyboard.press("Enter")
@@ -275,11 +281,11 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Пароль ──
+            # ── 6. Пароль (НАДЕЖНЫЙ ПОИСК + ФОКУС) ──
             try:
-                print("Adobe: ждем появление поля пароля...")
+                print("Adobe: ждем появление поля пароля (до 30 сек)...")
                 pwd_target = None
-                for _ in range(15):
+                for _ in range(30):
                     inputs = await page.locator('input[type="password"], #password').all()
                     for inp in inputs:
                         if await inp.is_visible():
@@ -290,19 +296,21 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(1)
 
                 if pwd_target:
-                    print("Adobe: поле пароля найдено. Вводим...")
-                    await pwd_target.click(force=True)
+                    print("Adobe: поле пароля найдено. Фокусируемся...")
+                    await pwd_target.focus()
                     await asyncio.sleep(0.5)
-                    await pwd_target.fill(ADOBE_PASSWORD.strip(), force=True)
+                    await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
                     await asyncio.sleep(1)
                     
                     print("Adobe: Жмем Enter...")
-                    await pwd_target.press("Enter")
+                    await page.keyboard.press("Enter")
                     await asyncio.sleep(8)
                     await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
                 else:
+                    await shot("/tmp/adobe_last.png", "⚠️ Adobe: Поле пароля не найдено за 30 сек. Пропускаем шаг.")
                     print("Adobe: Видимое поле пароля не найдено. Идем дальше.")
             except Exception as e:
+                await shot("/tmp/adobe_error.png", f"❌ Ошибка при вводе пароля: {str(e)[:50]}")
                 print(f"Adobe password error: {str(e)[:100]}")
 
             gc.collect()
@@ -436,22 +444,15 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             if size < 10000:
                 raise RuntimeError(f"Adobe вернул пустой файл ({size} байт)")
-            
-            print("Adobe: запускаем loudnorm...")
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-i", str(adobe),
-                    "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                    "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-                if proc.returncode != 0:
-                    err_msg = stderr.decode('utf-8', errors='ignore')[-200:]
-                    print(f"ffmpeg loudnorm error: {err_msg}")
-            except Exception as e:
-                print(f"ffmpeg exc: {e}")
+
+            r = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", str(adobe),
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(r.communicate(), timeout=120)
 
             return out if out.exists() else adobe
 
