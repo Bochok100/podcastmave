@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.24 — Classic Auth + Memory Diet
-- Откачена логика авторизации к проверенной версии (без JS-костылей очистки)
-- Надежный .fill(force=True) для email и пароля, который 100% пробивает React
-- Сохранены все оптимизации ОЗУ (GC, лимиты кэша, удаление Base64, очистка File Descriptors)
+Podcast Bot v3.25 — Fully Asynchronous Core
+- FFmpeg, OpenAI Whisper и GPT-4 переведены на асинхронный режим (устранено зависание бота)
+- Логика авторизации из v3.24
+- Интегрирована максимальная оптимизация памяти
 """
 
 import os
@@ -95,24 +95,30 @@ async def download_voice(update, context) -> Path:
     await f.download_to_drive(tmp.name)
     return Path(tmp.name)
 
-def to_mp3(src: Path) -> Path:
+async def to_mp3(src: Path) -> Path:
     dst = src.with_suffix(".mp3")
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(src),
-             "-codec:a", "libmp3lame", "-b:a", "128k",
-             "-ar", "44100", "-ac", "1", str(dst)],
-            capture_output=True,
-            timeout=60
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(src),
+            "-codec:a", "libmp3lame", "-b:a", "128k",
+            "-ar", "44100", "-ac", "1", str(dst),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg ошибка: {result.stderr[-200:]}")
-    except subprocess.TimeoutExpired:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            err_msg = stderr.decode('utf-8', errors='ignore')[-200:]
+            raise RuntimeError(f"ffmpeg ошибка: {err_msg}")
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except: pass
         raise RuntimeError("ffmpeg завис — таймаут 60 секунд")
+    
     if not dst.exists() or dst.stat().st_size < 1000:
         raise RuntimeError("ffmpeg не создал MP3 файл")
     
-    gc.collect() # Очищаем память после конвертации
+    gc.collect() 
     return dst
 
 # ── Adobe Podcast ──────────────────────────────
@@ -142,8 +148,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 "--disable-software-rasterizer",
                 "--renderer-process-limit=1",
                 "--js-flags=--max-old-space-size=150 --expose-gc",
-                "--disable-site-isolation-trials",                 # Экономия памяти
-                "--disk-cache-size=5242880",                       # Лимит кэша
+                "--disable-site-isolation-trials",                 
+                "--disk-cache-size=5242880",                       
                 "--disable-blink-features=AutomationControlled",
                 "--disable-extensions",
                 "--disable-background-networking",
@@ -190,7 +196,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email (НАДЕЖНЫЙ ВВОД ИЗ РАБОЧИХ ВЕРСИЙ) ──
+            # ── 3. Email ──
             try:
                 print("Adobe: ждем появление поля email...")
                 email_target = None
@@ -208,7 +214,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     print("Adobe: видимое поле email найдено. Вводим...")
                     await email_target.click(force=True)
                     await asyncio.sleep(0.5)
-                    # Используем надежный .fill(force=True) вместо JS-костылей
                     await email_target.fill(ADOBE_EMAIL.strip(), force=True)
                     await asyncio.sleep(1)
                     
@@ -270,7 +275,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Пароль (НАДЕЖНЫЙ ВВОД) ──
+            # ── 6. Пароль ──
             try:
                 print("Adobe: ждем появление поля пароля...")
                 pwd_target = None
@@ -288,7 +293,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     print("Adobe: поле пароля найдено. Вводим...")
                     await pwd_target.click(force=True)
                     await asyncio.sleep(0.5)
-                    # Используем надежный .fill(force=True)
                     await pwd_target.fill(ADOBE_PASSWORD.strip(), force=True)
                     await asyncio.sleep(1)
                     
@@ -301,7 +305,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception as e:
                 print(f"Adobe password error: {str(e)[:100]}")
 
-            gc.collect() # Очистка памяти перед переходом в студию
+            gc.collect()
 
             # ── 7. Промежуточные экраны ──
             for _ in range(10):
@@ -380,7 +384,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     );
                 }}""")
                 uploaded = True
-                del b64 # Освобождаем память от тяжелой строки
+                del b64 
                 gc.collect()
 
             await asyncio.sleep(3)
@@ -401,7 +405,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             for i in range(36):
                 await asyncio.sleep(5)
                 
-                # Сборщик мусора во время простоя (OOM Fix)
                 try:
                     await page.evaluate("try { window.gc(); } catch(e) {}")
                 except Exception:
@@ -433,15 +436,24 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             if size < 10000:
                 raise RuntimeError(f"Adobe вернул пустой файл ({size} байт)")
+            
+            print("Adobe: запускаем loudnorm...")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", str(adobe),
+                    "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                    "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+                if proc.returncode != 0:
+                    err_msg = stderr.decode('utf-8', errors='ignore')[-200:]
+                    print(f"ffmpeg loudnorm error: {err_msg}")
+            except Exception as e:
+                print(f"ffmpeg exc: {e}")
 
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(adobe),
-                 "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                 "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out)],
-                capture_output=True,
-                timeout=120
-            )
-            return out if r.returncode == 0 and out.exists() else adobe
+            return out if out.exists() else adobe
 
         except Exception as e:
             try:
@@ -557,13 +569,14 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
             gc.collect()
 
 # ── Транскрипция ───────────────────────────────
-def transcribe(mp3: Path) -> str:
-    client = openai.OpenAI(api_key=OPENAI_KEY)
+async def transcribe(mp3: Path) -> str:
+    client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
     safe = mp3.parent / (mp3.stem + "_w.mp3")
     shutil.copy2(mp3, safe)
     
     with open(safe, "rb") as f:
-        res = client.audio.transcriptions.create(model="whisper-1", file=f, language="ru").text
+        res = await client.audio.transcriptions.create(model="whisper-1", file=f, language="ru")
+        text_result = res.text
         
     try:
         safe.unlink()
@@ -571,12 +584,12 @@ def transcribe(mp3: Path) -> str:
         pass
     
     gc.collect()
-    return res
+    return text_result
 
 # ── Метаданные ─────────────────────────────────
-def generate_metadata(transcript: str) -> tuple[str, str]:
-    client = openai.OpenAI(api_key=OPENAI_KEY)
-    resp = client.chat.completions.create(
+async def generate_metadata(transcript: str) -> tuple[str, str]:
+    client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
+    resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": STYLE_PROMPT + transcript}],
         max_tokens=512, temperature=0.7
@@ -597,7 +610,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         ogg = await download_voice(update, ctx)
         await msg.edit_text("🔄 MP3...")
-        mp3 = to_mp3(ogg)
+        mp3 = await to_mp3(ogg)
 
         await msg.edit_text("🎙️ Adobe Podcast Enhance (3-5 мин)...")
 
@@ -619,10 +632,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         gc.collect()
 
         await msg.edit_text("📝 Whisper транскрипция...")
-        text = transcribe(studio)
+        text = await transcribe(studio)
 
         await msg.edit_text("✍️ GPT-4o заголовок...")
-        title, desc = generate_metadata(text)
+        title, desc = await generate_metadata(text)
         
         del text 
         gc.collect()
