@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.49 — The Final Vanguard
-- Исправлена ошибка Conflict: добавлено drop_pending_updates=True для жесткого убийства старых сессий/двойников.
-- Устранен "зомби-режим": возвращен быстрый стоп (Fast-Fail), если не удалось перейти на страницу авторизации.
-- Добавлен скрипт уничтожения невидимых баннеров и Cookie-уведомлений, которые блокировали клик по Sign In.
-- Сохранен лучший механизм загрузки файлов (прямой инжект в input без окон) и ручной ввод 2FA.
+Podcast Bot v3.50 — The Anti-Zombie
+- ИСПРАВЛЕН БАГ ДОЛГОГО ЗАВИСАНИЯ: переход на Sign In теперь осуществляется прямым извлечением ссылки (goto href), а не кликом.
+- Внедрен жесткий Fast-Fail (15 секунд): если страница логина не открылась, бот сразу выдает ошибку, а не ищет поля вслепую по 3-5 минут.
+- Логика 2FA работает через глобальный keyboard.type с задержкой, что идеально обходит 6-ячеечную защиту Adobe.
+- Устранена ошибка Conflict: добавлено drop_pending_updates=True для жесткого обрыва старых сессий.
 """
 
 import os
@@ -196,47 +196,45 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Уничтожение баннеров и Умный клик по Sign In ──
-            print("Adobe: Нажимаем Sign In...")
-            auth_reached = False
-            for attempts in range(3):
-                try:
-                    # Вырезаем куки-баннеры и нажимаем скрытую системную ссылку
+            # ── 2. Переход к логину (БЕЗ КЛИКОВ, ПРЯМОЙ ПЕРЕХОД) ──
+            print("Adobe: Переходим на страницу логина...")
+            try:
+                auth_url = await page.evaluate("""() => {
+                    const link = Array.from(document.querySelectorAll('a')).find(a => a.href && (a.href.includes('auth.services') || a.href.includes('login')));
+                    return link ? link.href : null;
+                }""")
+                
+                if auth_url:
+                    print(f"Adobe: Найдена ссылка авторизации. Переходим...")
+                    await page.goto(auth_url, timeout=30000)
+                else:
+                    print("Adobe: Ссылка не найдена, пробуем клик...")
                     await page.evaluate("""() => {
-                        document.querySelectorAll('[id*="onetrust"], [class*="cookie"], [class*="overlay"]').forEach(e => e.remove());
-                        const authLink = Array.from(document.querySelectorAll('a')).find(a => a.href && (a.href.includes('auth.services') || a.href.includes('login') || a.href.includes('signin')));
-                        if (authLink) {
-                            authLink.click();
-                            return;
-                        }
-                        const el = [...document.querySelectorAll('a,button')].find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
+                        const el = [...document.querySelectorAll('a,button')].find(e => /sign in|entrar|log in/i.test(e.innerText));
                         if (el) el.click();
                     }""")
-                except Exception:
-                    pass
-                
-                # Даем время на загрузку и проверяем URL
-                for _ in range(6):
-                    await asyncio.sleep(1)
-                    if "auth" in page.url or "login" in page.url or "signin" in page.url:
-                        auth_reached = True
-                        break
-                
-                if auth_reached:
+            except Exception as e:
+                print(f"Ошибка при переходе на логин: {e}")
+
+            # ЖЕСТКАЯ ПРОВЕРКА ПЕРЕХОДА (Fast-Fail 15 секунд)
+            auth_reached = False
+            for _ in range(15):
+                if "auth" in page.url or "login" in page.url or "signin" in page.url:
+                    auth_reached = True
                     break
-            
-            # ЖЕСТКИЙ СТОП, ЕСЛИ КЛИК НЕ СРАБОТАЛ (Защита от 5-минутного "зомби-режима")
+                await asyncio.sleep(1)
+                
             if not auth_reached:
-                await shot("/tmp/adobe_error.png", "❌ Adobe: Кнопка 'Sign In' заблокирована. Интерфейс не пускает на логин.")
-                raise RuntimeError("Сбой навигации: не удалось перейти на страницу авторизации Adobe.")
+                await shot("/tmp/adobe_error.png", "❌ Adobe: Не удалось открыть форму входа (кнопка Sign In не сработала). Запустите заново.")
+                raise RuntimeError("Сбой навигации: не удалось перейти на логин.")
 
             print(f"Adobe: Успешно перешли на логин. URL: {page.url}")
 
             # ── 3. Email ──
             try:
-                print("Adobe: ищем поле email (до 30 сек)...")
+                print("Adobe: ищем поле email...")
                 email_target = None
-                for _ in range(30):
+                for _ in range(15):
                     inputs = await page.locator('input[type="email"], input[name="username"], input[id*="email" i], input[name="email" i]').all()
                     for inp in inputs:
                         if await inp.is_visible():
@@ -332,26 +330,22 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
 
                     all_inputs = await page.locator('input[type="text"], input[type="number"], input[type="tel"]').all()
-                    visible_inputs = []
-                    for inp in all_inputs:
-                        if await inp.is_visible():
-                            visible_inputs.append(inp)
+                    visible_inputs = [inp for inp in all_inputs if await inp.is_visible()]
                     
                     if len(visible_inputs) > 0:
-                        print("Adobe: Найдено поле(я) 2FA. Вводим код в первую ячейку...")
+                        print("Adobe: Найдено поле(я) 2FA. Кликаем в первое...")
                         await visible_inputs[0].click(force=True)
-                        await visible_inputs[0].press_sequentially(code, delay=250)
-                    else:
-                        print("Adobe: Поля не найдены, печатаем вслепую...")
-                        await page.keyboard.type(code, delay=250)
                     
-                    print("Adobe: Код напечатан. Ожидаем авто-отправку...")
+                    print("Adobe: Печатаем код как человек...")
+                    await page.keyboard.type(code, delay=250)
+                    
+                    print("Adobe: Код напечатан. Ожидаем авто-отправку (3 сек)...")
                     await asyncio.sleep(3)
                     
                     try:
                         v_btn = page.locator('button:has-text("Verify"), button:has-text("Verificar"), button:has-text("Submit"), button:has-text("Continue"), button:has-text("Continuar")').first
                         if await v_btn.is_visible():
-                            print("Adobe: Авто-отправка не произошла, нажимаем кнопку подтверждения...")
+                            print("Adobe: Авто-отправка не сработала, жму кнопку подтверждения...")
                             await v_btn.click(force=True)
                     except: pass
                     
@@ -391,7 +385,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 try:
                     print("Adobe: ждем появление поля пароля...")
                     pwd_target = None
-                    for _ in range(30):
+                    for _ in range(15):
                         inputs = await page.locator('input[type="password"]').all()
                         for inp in inputs:
                             if await inp.is_visible():
@@ -417,11 +411,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await asyncio.sleep(8)
                         await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
                     else:
-                        await shot("/tmp/adobe_last.png", "⚠️ Adobe: Поле пароля не найдено за 30 сек.")
                         print("Adobe: Видимое поле пароля не найдено. Идем дальше.")
                 except Exception as e:
-                    await shot("/tmp/adobe_error.png", f"❌ Ошибка при вводе пароля: {str(e)[:50]}")
-                    print(f"Adobe password error: {str(e)[:100]}")
+                    print(f"Adobe password error: {e}")
 
             gc.collect()
 
@@ -895,7 +887,6 @@ def main():
         return
 
     try:
-        # 🔥 drop_pending_updates=True убивает двойников и решает ошибку Conflict 🔥
         app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
         
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text, block=False), group=1)
@@ -915,6 +906,7 @@ def main():
         app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
         
         print("✅ Бот запущен!")
+        # 🔥 drop_pending_updates=True жестко убивает двойников и устраняет ошибку Conflict 🔥
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
