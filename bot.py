@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.17 — Password Screen Transition Fix
-- Умный переход: если после 2FA мгновенно появляется пароль, бот не жмет лишний раз Enter
-- Очистка поля пароля (.fill("")) перед вводом для защиты от случайных нажатий
-- Улучшен детектор ошибок 2FA
+Podcast Bot v3.18 — The Diet Update (OOM Fix)
+- Mave переведен в headless=True для экономии ~150MB RAM
+- Добавлены жесткие лимиты памяти для Chromium (--renderer-process-limit=1, --js-flags)
+- Принудительная сборка мусора (gc.collect()) после каждого этапа
 """
 
 import os
@@ -14,6 +14,7 @@ import shutil
 import threading
 import time
 import base64
+import gc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -111,17 +112,25 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
     async def shot(path, caption):
         try:
-            await page.screenshot(path=path)
-            await notify(path, caption)
+            if 'page' in locals() and not page.is_closed():
+                await page.screenshot(path=path)
+                await notify(path, caption)
         except Exception:
             pass
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=False,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu", 
+                "--disable-software-rasterizer",
+                "--renderer-process-limit=1",
+                "--js-flags=--max-old-space-size=256",
+                "--disable-blink-features=AutomationControlled"
+            ]
         )
         
         context_args = {
@@ -220,15 +229,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await page.keyboard.type(code, delay=150)
                     await asyncio.sleep(1)
                     
-                    # Если мы все еще на экране 2FA, жмем Enter
                     if await page.locator('text=/Verify your identity|Confirm your number/i').count() > 0:
                         print("Adobe: Жмем Enter для 2FA...")
                         await page.keyboard.press("Enter")
                     
-                    # Проверяем успешность
                     for _ in range(12):
                         await asyncio.sleep(1)
-                        # Если появилось поле пароля - код принят, выходим из цикла!
                         if await page.locator('input[type="password"]').count() > 0:
                             break
                         if await page.locator('text=/invalid code|incorrect code/i').count() > 0 and await page.locator('text=/Verify your identity/i').count() > 0:
@@ -259,7 +265,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 print("Adobe: видимое поле пароля найдено. Очищаем и вводим...")
                 await pwd_target.click()
                 await asyncio.sleep(0.5)
-                # ОЧИЩАЕМ ПОЛЕ перед вводом, чтобы стереть случайные нажатия
                 await pwd_target.fill("")
                 await pwd_target.press_sequentially(ADOBE_PASSWORD.strip(), delay=100)
                 await asyncio.sleep(1)
@@ -414,14 +419,27 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception: pass
             raise RuntimeError(f"Adobe: {e}")
         finally:
+            # ОЧИСТКА ПАМЯТИ
+            try:
+                if 'ctx' in locals(): await ctx.close()
+                if 'page' in locals() and not page.is_closed(): await page.close()
+            except: pass
             await browser.close()
+            gc.collect() # Собираем мусор Python
 
 # ── mave.digital ───────────────────────────────
 async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
     async with async_playwright() as pw:
+        # Для Mave графика не нужна, запускаем headless=True (экономит ~150МБ RAM)
         browser = await pw.chromium.launch(
-            headless=False,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            headless=True, 
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--renderer-process-limit=1"
+            ]
         )
         ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
         page = await ctx.new_page()
@@ -496,7 +514,12 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
             await page.screenshot(path="/tmp/mave_error.png")
             raise RuntimeError(str(e))
         finally:
+            try:
+                if 'ctx' in locals(): await ctx.close()
+                if 'page' in locals() and not page.is_closed(): await page.close()
+            except: pass
             await browser.close()
+            gc.collect()
 
 # ── Транскрипция ───────────────────────────────
 def transcribe(mp3: Path) -> str:
