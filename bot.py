@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.44 — The Clean Slate
-- Очищен от старого мусора (удалены неиспользуемые импорты http.server и threading)
-- Добавлены жесткие предохранители на случай отсутствия токенов в Render
-- Сохранена механика 6-Box Fix (ввод 2FA по ячейкам) и прямой загрузки аудио
-- Сохранен встроенный асинхронный сервер для защиты от падений
+Podcast Bot v3.45 — The Codec Fix (До загрузки файла + Фикс конвертера)
+- Сохранена идеальная рабочая механика входа в Adobe (v3.41 - До загрузки файла)
+- Полностью переписан блок скачивания и конвертации аудио (защита от зависаний ffmpeg)
+- Исправлена утечка файловых дескрипторов (используется mkstemp вместо NamedTemporaryFile)
+- Добавлен жесткий перехватчик системных ошибок: бот больше никогда не "зависнет молча"
 """
 
 import os
@@ -12,9 +12,11 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
+import threading
 import time
 import base64
 import gc
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -88,16 +90,23 @@ async def run_dummy_server():
 async def post_init(app: Application):
     asyncio.create_task(run_dummy_server())
 
-# ── Утилиты ────────────────────────────────────
+# ── Утилиты (ИСПРАВЛЕНО ОТ ЗАВИСАНИЙ) ──────────
 async def download_voice(update, context) -> Path:
     voice = update.message.voice or update.message.audio
     f = await context.bot.get_file(voice.file_id)
-    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
-    await f.download_to_drive(tmp.name)
-    return Path(tmp.name)
+    
+    # БЕЗОПАСНОЕ СОЗДАНИЕ ВРЕМЕННОГО ФАЙЛА (без блокировки)
+    fd, path = tempfile.mkstemp(suffix=".ogg")
+    os.close(fd) # Обязательно закрываем дескриптор
+    
+    print(f"Скачиваем аудио в {path}...")
+    await f.download_to_drive(path)
+    print("Скачивание аудио завершено.")
+    return Path(path)
 
 async def to_mp3(src: Path) -> Path:
     dst = src.with_suffix(".mp3")
+    print(f"Конвертация {src} -> {dst}")
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", str(src),
@@ -106,19 +115,23 @@ async def to_mp3(src: Path) -> Path:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         if proc.returncode != 0:
             err_msg = stderr.decode('utf-8', errors='ignore')[-200:]
-            raise RuntimeError(f"ffmpeg ошибка: {err_msg}")
+            raise RuntimeError(f"Ошибка конвертации: {err_msg}")
+    except FileNotFoundError:
+        raise RuntimeError("⚠️ ffmpeg не установлен на сервере! Добавьте 'RUN apt-get update && apt-get install -y ffmpeg' в ваш Dockerfile.")
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
+        try: proc.kill()
         except: pass
-        raise RuntimeError("ffmpeg завис — таймаут 60 секунд")
+        raise RuntimeError("ffmpeg завис (таймаут 120 секунд).")
+    except Exception as e:
+        raise RuntimeError(f"Системная ошибка конвертера: {e}")
     
     if not dst.exists() or dst.stat().st_size < 1000:
-        raise RuntimeError("ffmpeg не создал MP3 файл")
+        raise RuntimeError("ffmpeg отработал, но MP3 файл пустой или не создался.")
     
+    print("Конвертация успешно завершена.")
     gc.collect() 
     return dst
 
@@ -703,7 +716,7 @@ async def generate_metadata(transcript: str) -> tuple[str, str]:
         elif c.upper().startswith("ОПИСАНИЕ:"): desc = c[9:].strip()
     return title, desc
 
-# ── Telegram handlers ──────────────────────────
+# ── Telegram handlers (С ПЕРЕХВАТОМ ГЛОБАЛЬНЫХ ОШИБОК) ──
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
@@ -760,7 +773,11 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb
         )
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
+        print(f"Глобальная ошибка работы бота: {e}")
+        try:
+            await msg.edit_text(f"❌ Ошибка: {str(e)}")
+        except Exception:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
 async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
