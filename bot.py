@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.40 — The Dropdown Fix
-- Исправлен критический баг "ложной авторизации": удален поиск по CSS классу "drop", который ложно срабатывал на "dropdown" меню главной страницы.
-- Теперь готовность интерфейса подтверждается строго наличием поля "Choose files".
-- Нажатие на стартовую кнопку "Sign In" переписано на жесткий нативный клик (force=True) для пробития перекрывающих баннеров.
-- Сохранен глобальный таймер (10 мин) и умный F5 для защиты от багов.
+Podcast Bot v3.41 — До загрузки файла (The Perfect Upload)
+- ПОЛНОСТЬЮ СОХРАНЕНА рабочая механика логина (v3.39)
+- Полностью переписан блок загрузки аудио: вместо клика по кнопке (который вешал браузер системным окном) используется прямая инъекция в <input type="file">
+- Добавлены 3 уровня резервной загрузки (Input -> Chooser -> Drag&Drop)
+- Бот обрабатывает португальские элементы (Escolher arquivos), но отчитывается на русском
 """
 
 import os
@@ -185,25 +185,19 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Жесткий клик по Sign In ──
+            # ── 2. Старый добрый клик по Sign In ──
             print("Adobe: Нажимаем Sign In...")
             try:
-                for txt in ["Sign In", "Sign in", "Entrar", "Log in"]:
-                    btn = page.locator(f'a:has-text("{txt}"), button:has-text("{txt}")').first
-                    if await btn.count() > 0 and await btn.is_visible():
-                        await btn.click(force=True)
-                        break
-                else:
-                    await page.evaluate("""() => {
-                        const el = [...document.querySelectorAll('a,button')]
-                            .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
-                        if (el) el.click();
-                    }""")
+                await page.evaluate("""() => {
+                    const el = [...document.querySelectorAll('a,button')]
+                        .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
+                    if (el) el.click();
+                }""")
                 await asyncio.sleep(5)
             except Exception:
                 pass
 
-            # ── 3. Email (Простая старая механика) ──
+            # ── 3. Email (Старая механика: is_visible -> click -> type) ──
             try:
                 print("Adobe: ищем поле email (до 30 сек)...")
                 email_target = None
@@ -237,7 +231,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception as e:
                 print(f"Adobe email error: {str(e)[:100]}")
 
-            # ── 4. Умный навигатор ──
+            # ── 4. Умный навигатор (Что Adobe покажет дальше?) ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
             for _ in range(30):
@@ -265,9 +259,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 if "enhance" in page.url and "auth" not in page.url:
                     ui_ready = False
                     if await page.locator('input[type="file"]').count() > 0: ui_ready = True
-                    # ИСПРАВЛЕНИЕ: Удален поиск по слову "drop", ищем только точные слова
                     if await page.locator('text=/Choose files|Escolher arquivos/i').count() > 0: ui_ready = True
-                    
                     if ui_ready:
                         step = "done"
                         break
@@ -340,7 +332,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 7. Пароль ──
+            # ── 7. Пароль (Старая механика) ──
             if step == "password":
                 try:
                     print("Adobe: ждем появление поля пароля...")
@@ -405,7 +397,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             for attempts in range(25):
                 ui_ready = False
                 
-                # ИСПРАВЛЕНИЕ: Никаких "drop". Только строгие совпадения кнопок.
                 if await page.locator('text=/Choose files|Escolher arquivos/i').count() > 0:
                     ui_ready = True
                 if await page.locator('input[type="file"]').count() > 0:
@@ -414,7 +405,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 if ui_ready: 
                     break
                 
-                # Умный F5 от багов Adobe
                 if attempts == 12:
                     print("Adobe: долгая загрузка студии, принудительно обновляем (F5)...")
                     try:
@@ -430,47 +420,64 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
             await ctx.storage_state(path=STATE_FILE)
 
-            # ── 11. Загрузка файла ──
+            # ── 11. ИСПРАВЛЕННАЯ ЗАГРУЗКА ФАЙЛА (БЕЗ СИСТЕМНОГО ОКНА) ──
+            print("Adobe: начинаем загрузку файла...")
             uploaded = False
-            for frame in page.frames:
-                try:
-                    for inp in await frame.locator('input[type="file"]').all():
-                        try:
-                            await inp.set_input_files(str(mp3), timeout=5000)
-                            uploaded = True
-                            break
-                        except Exception: pass
-                    if uploaded: break
-                except Exception: continue
-
-            if not uploaded:
-                for frame in page.frames:
-                    try:
-                        btn = frame.locator('button:has-text("Choose files"), button:has-text("Escolher arquivos"), label:has-text("Choose"), .spectrum-Button').first
-                        if await btn.count() > 0:
-                            async with page.expect_file_chooser(timeout=8000) as fc_info:
-                                await btn.click(force=True)
-                            await (await fc_info.value).set_files(str(mp3))
-                            uploaded = True
-                            break
-                    except Exception: continue
-
-            if not uploaded:
-                with open(mp3, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode()
-                await asyncio.wait_for(page.evaluate(f"""async () => {{
-                    const bin = atob("{b64}"), arr = new Uint8Array(bin.length);
-                    for (let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
-                    const file = new File([arr],"{mp3.name}",{{type:"audio/mpeg"}});
-                    const dt = new DataTransfer(); dt.items.add(file);
-                    ['dragenter','dragover','drop'].forEach(ev =>
-                        document.body.dispatchEvent(new DragEvent(ev,{{bubbles:true,cancelable:true,dataTransfer:dt}}))
-                    );
-                }}"""), timeout=15.0)
+            
+            # Попытка 1: Прямая вставка в невидимый input (Самый надежный способ, не вызывает системных окон)
+            try:
+                file_input = page.locator('input[type="file"]').first
+                await file_input.wait_for(state="attached", timeout=10000)
+                await file_input.evaluate("node => node.style.display = 'block'")
+                await file_input.set_input_files(str(mp3), timeout=15000)
                 uploaded = True
-                del b64 
-                gc.collect()
+                print("Adobe: Файл загружен через прямой input!")
+            except Exception as e:
+                print(f"Adobe: Прямой input не сработал: {e}")
 
+            # Попытка 2: Перехватчик Playwright
+            if not uploaded:
+                try:
+                    async with page.expect_file_chooser(timeout=8000) as fc_info:
+                        btn = page.locator('button:has-text("Choose files"), button:has-text("Escolher arquivos")').first
+                        await btn.click(force=True)
+                    fc = await fc_info.value
+                    await fc.set_files(str(mp3), timeout=15000)
+                    uploaded = True
+                    print("Adobe: Файл загружен через file_chooser!")
+                except Exception as e:
+                    print(f"Adobe: Перехватчик не сработал: {e}")
+
+            # Попытка 3: Экстремальный Drag & Drop (если ничего не помогло)
+            if not uploaded:
+                try:
+                    with open(mp3, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    await page.evaluate(f"""async () => {{
+                        const bin = atob("{b64}");
+                        const arr = new Uint8Array(bin.length);
+                        for (let i=0; i<bin.length; i++) arr[i] = bin.charCodeAt(i);
+                        const file = new File([arr], "{mp3.name}", {{type: "audio/mpeg"}});
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+                        
+                        const dropZone = document.querySelector('[class*="upload"], [class*="drop"]') || document.body;
+                        ['dragenter', 'dragover', 'drop'].forEach(evName => {{
+                            dropZone.dispatchEvent(new DragEvent(evName, {{bubbles: true, cancelable: true, dataTransfer: dt}}));
+                        }});
+                    }}""")
+                    uploaded = True
+                    del b64
+                    gc.collect()
+                    print("Adobe: Файл загружен через Drag & Drop!")
+                except Exception as e:
+                    print(f"Adobe: Drag & Drop не сработал: {e}")
+
+            if not uploaded:
+                await shot("/tmp/adobe_error.png", "❌ Ошибка: не удалось передать файл в Adobe.")
+                raise RuntimeError("Adobe: все 3 метода загрузки файла провалились.")
+            
+            await shot("/tmp/adobe_last.png", "✅ Adobe: Файл передан! Ждем обработки...")
             await asyncio.sleep(3)
             
             # Нажимаем Enhance
@@ -849,4 +856,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
