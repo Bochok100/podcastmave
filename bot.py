@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.8 — Smart 6-Digit 2FA & Blindness Protection
-- Ввод 2FA кода по одной цифре в каждую ячейку
-- Жесткая проверка успешности логина перед загрузкой файла
-- Защита от бесконечного ожидания на экране авторизации
+Podcast Bot v3.9 — Ultimate Human Auth + Smart 2FA
+- Возвращена имитация клавиатуры (page.keyboard.type) для email и пароля
+- Убраны `try...except...pass`, чтобы бот не уходил в "слепоту"
+- Умный ввод 2FA по ячейкам
 """
 
 import os
@@ -159,34 +159,30 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Вводим email ──
-            try:
-                email_field = page.locator('input[type="email"],input[name="username"]').first
+            # ── 3. Вводим email (Human Typing) ──
+            email_loc = page.locator('input[type="email"],input[name="username"]')
+            if await email_loc.count() > 0:
+                print("Adobe: поле email найдено. Вводим через клавиатуру...")
+                email_field = email_loc.first
                 await email_field.wait_for(state="attached", timeout=10000)
-                await email_field.evaluate("node => node.click()")
-                await email_field.fill(ADOBE_EMAIL.strip(), force=True)
+                await email_field.evaluate("node => node.focus()")
+                await asyncio.sleep(0.5)
+                # Человеческий ввод
+                await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
                 await asyncio.sleep(1)
 
-                for sel in ['button:has-text("Continue")', '#btn-id-forward', 'button[type="submit"]']:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.count() > 0:
-                            await el.evaluate("node => node.click()")
-                            break
-                    except Exception:
-                        continue
+                btn = page.locator('button:has-text("Continue"), #btn-id-forward, button[type="submit"]').first
+                if await btn.count() > 0:
+                    await btn.evaluate("node => node.click()")
                 await asyncio.sleep(4)
-            except Exception as e:
-                pass
+                await shot("/tmp/adobe_last.png", "Adobe: после email")
 
             # ── 4. Экран подтверждения личности (перед кодом) ──
-            try:
-                btn = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
-                if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
-                    await btn.evaluate("node => node.click()")
-                    await asyncio.sleep(4)
-            except Exception:
-                pass
+            btn_verify = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
+            if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0 and await btn_verify.count() > 0:
+                print("Adobe: экран подтверждения — нажимаем Continue...")
+                await btn_verify.evaluate("node => node.click()")
+                await asyncio.sleep(4)
 
             # ── 5. Ввод 2FA кода (УМНЫЙ ВВОД ПО ЯЧЕЙКАМ) ──
             if await page.locator('text=/Verify your identity/i').count() > 0:
@@ -206,7 +202,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             await visible_inputs[i].fill(digit)
                             await asyncio.sleep(0.1)
                     else:
-                        # Запасной план: просто печатаем с клавиатуры
+                        # Запасной план: печатаем с клавиатуры
                         await page.keyboard.type(code, delay=200)
                     
                     await asyncio.sleep(1)
@@ -230,25 +226,22 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль ──
-            try:
-                pwd = page.locator('input[type="password"],#password').first
+            # ── 6. Вводим пароль (Human Typing) ──
+            pwd_loc = page.locator('input[type="password"],#password')
+            if await pwd_loc.count() > 0:
+                print("Adobe: поле пароля найдено. Вводим через клавиатуру...")
+                pwd = pwd_loc.first
                 await pwd.wait_for(state="attached", timeout=10000)
-                await pwd.evaluate("node => node.click()")
-                await pwd.fill(ADOBE_PASSWORD.strip(), force=True)
+                await pwd.evaluate("node => node.focus()")
+                await asyncio.sleep(0.5)
+                # Человеческий ввод
+                await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
                 await asyncio.sleep(1)
                 
-                for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
-                    try:
-                        el = page.locator(sel).first
-                        if await el.count() > 0:
-                            await el.evaluate("node => node.click()")
-                            break
-                    except Exception:
-                        continue
+                btn_signin = page.locator('button:has-text("Sign in"), button:has-text("Continue"), button[type="submit"]').first
+                if await btn_signin.count() > 0:
+                    await btn_signin.evaluate("node => node.click()")
                 await asyncio.sleep(6)
-            except Exception as e:
-                pass
 
             # Закрываем промежуточные экраны
             for _ in range(10):
@@ -270,9 +263,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(4)
 
             # ── ЗАЩИТА ОТ СЛЕПОТЫ ПЕРЕД ЗАГРУЗКОЙ ──
-            if await page.locator('text=/Choose files|Drag and drop/i').count() == 0 and "enhance" not in page.url:
-                await shot("/tmp/adobe_error.png", "❌ Бот застрял на авторизации!")
-                raise RuntimeError("Не удалось открыть интерфейс загрузки. Проверь логин/пароль.")
+            if await page.locator('input[type="email"],input[name="username"]').count() > 0 or await page.locator('text=/Sign in/i').count() > 2:
+                await shot("/tmp/adobe_error.png", "❌ Бот застрял на экране авторизации!")
+                raise RuntimeError("Ошибка авторизации: не удалось войти (возможно, форма зависла).")
 
             # СОХРАНЕНИЕ СЕССИИ (КУКИ)
             await ctx.storage_state(path=STATE_FILE)
