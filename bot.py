@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.4 — Smart Wait + Full JS Injection
-- Исправлен баг пропуска email (заменен count() на wait_for())
-- JS Injection теперь используется и для email, и для пароля
-- Сохранение сессии для обхода 2FA
+Podcast Bot v3.5 — Human Typing Auth + Session Persistence
+- Имитация реальной клавиатуры (page.keyboard.type) для обхода защиты React
+- JS focus() для предотвращения зависания при скролле
+- Сохранение куки (сессии) в adobe_state.json
 """
 
 import os
@@ -159,21 +159,18 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Вводим email (С ОЖИДАНИЕМ И JS-ИНЖЕКТОМ) ──
+            # ── 3. Вводим email (Human Typing + Focus) ──
             try:
                 print("Adobe: ищем поле email...")
                 email_field = page.locator('input[type="email"],input[name="username"]').first
-                # Ждем до 10 секунд. Если мы уже залогинены по сессии, выскочит таймаут и пойдет дальше!
                 await email_field.wait_for(state="attached", timeout=10000)
-                print("Adobe: поле email найдено. Вводим через JS...")
+                print("Adobe: поле email найдено. Печатаем...")
                 
-                email_str = ADOBE_EMAIL.strip()
-                await email_field.evaluate(f"""(node) => {{
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(node, '{email_str}');
-                    node.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    node.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}""")
+                # Ставим курсор через JS, чтобы избежать ошибки скролла
+                await email_field.evaluate("node => node.focus()")
+                await asyncio.sleep(0.5)
+                # Печатаем как живой человек
+                await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
                 await asyncio.sleep(1)
 
                 for sel in ['button:has-text("Continue")', '#btn-id-forward', 'button[type="submit"]']:
@@ -209,8 +206,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=120)
                     code = adobe_2fa_state[user_id]["code"].strip()
-                    await page.locator(code_sel).first.fill(code)
+                    
+                    code_field = page.locator(code_sel).first
+                    await code_field.evaluate("node => node.focus()")
+                    await page.keyboard.type(code, delay=100)
                     await asyncio.sleep(1)
+                    
                     sub = page.locator('button:has-text("Continue"),button:has-text("Submit"),button:has-text("Verify"),button[type="submit"]').first
                     if await sub.count() > 0:
                         await sub.click(force=True)
@@ -221,20 +222,18 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (С ОЖИДАНИЕМ И JS-ИНЖЕКТОМ) ──
+            # ── 6. Вводим пароль (Human Typing + Focus) ──
             try:
                 print("Adobe: ищем поле пароля...")
                 pwd = page.locator('input[type="password"],#password').first
                 await pwd.wait_for(state="attached", timeout=10000)
-                print("Adobe: поле пароля найдено. Вводим через JS...")
+                print("Adobe: поле пароля найдено. Печатаем...")
                 
-                pwd_str = ADOBE_PASSWORD.strip()
-                await pwd.evaluate(f"""(node) => {{
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(node, '{pwd_str}');
-                    node.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    node.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }}""")
+                # Ставим курсор через JS, чтобы избежать ошибки скролла скрытых полей
+                await pwd.evaluate("node => node.focus()")
+                await asyncio.sleep(0.5)
+                # Печатаем как живой человек
+                await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
                 await asyncio.sleep(1)
                 
                 for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
