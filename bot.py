@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.15 — The Interstitial Killer
-- Принудительное нажатие "Remind me later" / "Напомнить позже"
-- Жесткая проверка наличия кнопки "Choose files" перед началом загрузки
-- Обход невидимых ловушек (Honeypot Bypass)
+Podcast Bot v3.16 — The Anti-Freeze 2FA
+- Защита от зависания на вводе 2FA (один клик + слепая печать)
+- Добавлены скриншоты-чекпоинты после получения кода от пользователя
+- Усиленная логика нажатия Continue перед 2FA
 """
 
 import os
@@ -162,7 +162,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Вводим email (ОБХОД НЕВИДИМЫХ ЛОВУШЕК) ──
+            # ── 3. Вводим email ──
             print("Adobe: ищем ВИДИМОЕ поле email...")
             email_target = None
             for _ in range(8):
@@ -186,62 +186,61 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(4)
                 await shot("/tmp/adobe_last.png", "Adobe: после email")
             else:
-                print("Adobe: Видимое поле email не найдено. Возможно, мы уже залогинены.")
+                print("Adobe: Видимое поле email не найдено. Идем дальше.")
 
             # ── 4. Экран подтверждения личности (перед кодом) ──
-            try:
-                btn_verify = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
-                if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0 and await btn_verify.count() > 0:
-                    print("Adobe: экран подтверждения — нажимаем Continue...")
-                    await btn_verify.click(force=True)
-                    await asyncio.sleep(4)
-            except Exception:
-                pass
+            print("Adobe: Проверяем наличие экрана Verify your identity...")
+            for _ in range(3):
+                if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
+                    btn_verify = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
+                    if await btn_verify.is_visible():
+                        print("Adobe: Нажимаем Continue для отправки кода...")
+                        await btn_verify.click(force=True)
+                        await asyncio.sleep(4)
+                        break
+                await asyncio.sleep(1)
 
-            # ── 5. Ввод 2FA кода ──
-            if await page.locator('text=/Verify your identity/i').count() > 0:
+            # ── 5. Ввод 2FA кода (ИСПРАВЛЕНО ОТ ЗАВИСАНИЯ) ──
+            if await page.locator('text=/Verify your identity|Confirm your number/i').count() > 0:
                 print("Adobe: нужен 2FA код...")
-                await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты!\nПришли мне его обычным текстом (2 минуты).")
+                await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты/телефона!\nПришли мне его обычным текстом (2 минуты).")
                 ev = asyncio.Event()
                 adobe_2fa_state[user_id] = {"event": ev, "code": ""}
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=120)
                     code = adobe_2fa_state[user_id]["code"].strip()
                     
-                    visible_inputs = await page.locator('input:visible').all()
-                    if len(visible_inputs) >= 6:
-                        for i, digit in enumerate(code[:6]):
-                            await visible_inputs[i].fill(digit)
-                            await asyncio.sleep(0.1)
-                        await visible_inputs[5].press("Enter")
-                    else:
-                        code_input = None
-                        inputs = await page.locator('input[type="text"]').all()
-                        for inp in inputs:
-                            if await inp.is_visible():
-                                code_input = inp
-                                break
-                        if code_input:
-                            await code_input.click()
-                            await code_input.fill(code)
-                            await code_input.press("Enter")
+                    # ЧЕКПОИНТ: Скриншот, чтобы видеть, что бот проснулся
+                    await shot("/tmp/adobe_last.png", f"⏳ Начинаю вводить полученный код ({code[:2]}***)...")
                     
+                    # Ищем самый первый инпут и кликаем в него один раз
+                    first_input = page.locator('input:not([type="hidden"])').first
+                    await first_input.click(force=True)
+                    await asyncio.sleep(0.5)
+                    
+                    # Печатаем весь код, пусть React сам раскидывает его по квадратам
+                    print("Adobe: Впечатываем код...")
+                    await page.keyboard.type(code, delay=150)
                     await asyncio.sleep(1)
                     
-                    for _ in range(10):
+                    print("Adobe: Жмем Enter для 2FA...")
+                    await page.keyboard.press("Enter")
+                    
+                    # Ждем исчезновения окна или появления ошибки
+                    for _ in range(12):
                         await asyncio.sleep(1)
-                        if await page.locator('text=/invalid code/i').count() > 0:
+                        if await page.locator('text=/invalid code|incorrect/i').count() > 0:
                             raise RuntimeError("Adobe не принял код (пишет Invalid code). Начни загрузку заново.")
-                        if await page.locator('text=/Verify your identity/i').count() == 0:
+                        if await page.locator('text=/Verify your identity|Confirm your number/i').count() == 0:
                             break
                             
-                    print(f"Adobe: 2FA код отправлен и принят")
+                    print(f"Adobe: 2FA код обработан!")
                 except asyncio.TimeoutError:
                     raise RuntimeError("2FA таймаут: код не пришёл за 2 минуты")
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (ОБХОД НЕВИДИМЫХ ЛОВУШЕК) ──
+            # ── 6. Вводим пароль ──
             print("Adobe: ищем ВИДИМОЕ поле пароля...")
             pwd_target = None
             for _ in range(8):
@@ -266,8 +265,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             else:
                 print("Adobe: Видимое поле пароля не появилось.")
 
-            # ── 6.5 ОБХОД НАВЯЗЧИВЫХ ЭКРАНОВ БЕЗОПАСНОСТИ (Remind me later) ──
-            print("Adobe: Проверка на промежуточные экраны (Remind me later)...")
+            # ── 6.5 ОБХОД НАВЯЗЧИВЫХ ЭКРАНОВ БЕЗОПАСНОСТИ ──
+            print("Adobe: Проверка на промежуточные экраны...")
             try:
                 for _ in range(8):
                     remind_btn = page.locator('button:has-text("Remind me later"), button:has-text("Напомнить позже")').first
@@ -277,7 +276,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await asyncio.sleep(4)
                         break
                         
-                    # Расширенный кликер для других всплывающих окон
                     await page.evaluate("""() => {
                         const btn = [...document.querySelectorAll('button,a')]
                             .find(e => /not now|skip|пропустить|continue|продолжить|remind me later|напомнить позже/i.test(e.innerText?.trim()));
@@ -296,10 +294,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(4)
 
             # ── ЗАЩИТА ОТ СЛЕПОТЫ ПЕРЕД ЗАГРУЗКОЙ ──
-            # Строгая проверка: если мы не видим интерфейс с кнопкой "Choose files" или инпутом, значит мы где-то застряли
             if await page.locator('text=/Choose files/i').count() == 0 and await page.locator('input[type="file"]').count() == 0:
                 await shot("/tmp/adobe_error.png", "❌ Бот не видит интерфейс загрузки!")
-                raise RuntimeError("Ошибка: Бот не дошел до экрана 'Enhance' (вероятно, завис на экране безопасности).")
+                raise RuntimeError("Ошибка: Бот не дошел до экрана 'Enhance' (вероятно, завис на этапе безопасности).")
 
             # СОХРАНЕНИЕ СЕССИИ (КУКИ)
             await ctx.storage_state(path=STATE_FILE)
