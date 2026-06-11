@@ -1,9 +1,8 @@
 """
-Podcast Bot v3.45 — The Codec Fix (До загрузки файла + Фикс конвертера)
-- Сохранена идеальная рабочая механика входа в Adobe (v3.41 - До загрузки файла)
-- Полностью переписан блок скачивания и конвертации аудио (защита от зависаний ffmpeg)
-- Исправлена утечка файловых дескрипторов (используется mkstemp вместо NamedTemporaryFile)
-- Добавлен жесткий перехватчик системных ошибок: бот больше никогда не "зависнет молча"
+Podcast Bot v3.46 — The Banner Fix
+- ИСПРАВЛЕН КРИТИЧЕСКИЙ БАГ (False Positive): удалена проверка на слова "didn't receive" в HTML, из-за которой бот убивал сам себя, видя синий баннер-подсказку от Adobe.
+- Оптимизирован ввод 2FA: бот кликает в ПЕРВУЮ ячейку и печатает код как человек (с задержкой 250мс). Скрипты Adobe сами раскидывают цифры по остальным 5 ячейкам.
+- Сохранена рабочая выгрузка файла (v3.41).
 """
 
 import os
@@ -16,7 +15,6 @@ import threading
 import time
 import base64
 import gc
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -90,7 +88,7 @@ async def run_dummy_server():
 async def post_init(app: Application):
     asyncio.create_task(run_dummy_server())
 
-# ── Утилиты (ИСПРАВЛЕНО ОТ ЗАВИСАНИЙ) ──────────
+# ── Утилиты ────────────────────────────────────
 async def download_voice(update, context) -> Path:
     voice = update.message.voice or update.message.audio
     f = await context.bot.get_file(voice.file_id)
@@ -300,7 +298,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             break
                     if step == "code_2fa": break
 
-            # ── 6. Ввод 2FA кода ──
+            # ── 6. Ввод 2FA кода (THE BANNER FIX) ──
             if step == "code_2fa":
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда обычным текстом (3 минуты).")
                 ev = asyncio.Event()
@@ -316,20 +314,14 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         if await inp.is_visible():
                             visible_inputs.append(inp)
                     
-                    if len(visible_inputs) >= 6:
-                        print("Adobe: Найдено 6 ячеек 2FA. Вводим по одной...")
-                        for i, digit in enumerate(code[:6]):
-                            if i < len(visible_inputs):
-                                await visible_inputs[i].click(force=True)
-                                await visible_inputs[i].fill(digit)
-                                await asyncio.sleep(0.3)
-                    elif len(visible_inputs) > 0:
-                        print("Adobe: Найдено одно поле 2FA. Вводим целиком...")
+                    if len(visible_inputs) > 0:
+                        print("Adobe: Найдено поле(я) 2FA. Вводим код в первую ячейку...")
+                        # Вводим ВЕСЬ код в первую ячейку с задержкой. Скрипт Adobe сам раскидает его по остальным.
                         await visible_inputs[0].click(force=True)
-                        await visible_inputs[0].fill(code)
+                        await visible_inputs[0].press_sequentially(code, delay=250)
                     else:
                         print("Adobe: Поля не найдены, печатаем вслепую...")
-                        await page.keyboard.type(code, delay=200)
+                        await page.keyboard.type(code, delay=250)
                     
                     await asyncio.sleep(1)
                     
@@ -349,7 +341,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         if password_found: break
                         
                         html = await page.content()
-                        if "didn't receive" in html.lower() or "não recebeu" in html.lower() or "invalid" in html.lower() or "wrong" in html.lower():
+                        # 🔥 УДАЛЕН ТОКСИЧНЫЙ "didn't receive" 🔥
+                        if "inválido" in html.lower() or "invalid" in html.lower() or "incorrect" in html.lower() or "wrong" in html.lower():
                             await shot("/tmp/adobe_error.png", "❌ Adobe не принял код. Запусти заново.")
                             raise RuntimeError("Adobe не принял код")
 
@@ -716,7 +709,7 @@ async def generate_metadata(transcript: str) -> tuple[str, str]:
         elif c.upper().startswith("ОПИСАНИЕ:"): desc = c[9:].strip()
     return title, desc
 
-# ── Telegram handlers (С ПЕРЕХВАТОМ ГЛОБАЛЬНЫХ ОШИБОК) ──
+# ── Telegram handlers ──────────────────────────
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
