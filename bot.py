@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.47 — The Auth Link
-- Устранен баг "молчаливого зависания" на стартовом экране.
-- Клик по Sign In переписан на поиск скрытой системной ссылки (href *auth.services*), что делает его независимым от языка и видимости кнопки.
-- Добавлен Fast-Fail: если переход на логин не удался, бот немедленно выдает ошибку, а не ждет поля ввода по 3 минуты.
-- Сохранен фикс 2FA (v3.46) и прямой инжект аудиофайлов.
+Podcast Bot v3.48 — The Redirect Fix
+- ИСПРАВЛЕНА ОШИБКА "unsupported method GET": убран спам клавишей Enter при вводе 2FA, который ломал скрытый POST-редирект Adobe (ims/fromSusi).
+- Добавлено мягкое ожидание авто-сабмита формы 2FA (3 секунды) + резервный клик по кнопке Verify/Verificar.
+- Внедрено ожидание завершения внутренних редиректов Adobe перед переходом в студию Enhance.
+- Португальский язык интерфейса полностью поддерживается в фоне, статусы в Telegram — на русском.
 """
 
 import os
@@ -196,19 +196,17 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Умный клик по Sign In (АБСОЛЮТНАЯ НАДЕЖНОСТЬ) ──
+            # ── 2. Умный клик по Sign In ──
             print("Adobe: Ищем и нажимаем ссылку Sign In...")
             auth_reached = False
             for attempts in range(3):
                 try:
                     await page.evaluate("""() => {
-                        // Ищем ссылку, которая ведет на сервер авторизации (самый надежный способ)
                         const authLink = Array.from(document.querySelectorAll('a')).find(a => a.href && (a.href.includes('auth.services') || a.href.includes('login') || a.href.includes('signin')));
                         if (authLink) {
                             authLink.click();
                             return;
                         }
-                        // Резервный поиск по тексту
                         const el = [...document.querySelectorAll('a,button')]
                             .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
                         if (el) el.click();
@@ -216,7 +214,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 except Exception:
                     pass
                 
-                # Даем время на загрузку и проверяем URL
                 for _ in range(6):
                     await asyncio.sleep(1)
                     if "auth" in page.url or "login" in page.url or "signin" in page.url:
@@ -226,7 +223,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 if auth_reached:
                     break
             
-            # ЖЕСТКИЙ СТОП, ЕСЛИ КЛИК НЕ СРАБОТАЛ
             if not auth_reached:
                 await shot("/tmp/adobe_error.png", "❌ Adobe: Кнопка 'Sign In' не сработала. Интерфейс не пускает на логин.")
                 raise RuntimeError("Сбой навигации: не удалось перейти на страницу авторизации Adobe.")
@@ -322,7 +318,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             break
                     if step == "code_2fa": break
 
-            # ── 6. Ввод 2FA кода ──
+            # ── 6. Ввод 2FA кода (THE REDIRECT FIX) ──
             if step == "code_2fa":
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда обычным текстом (3 минуты).")
                 ev = asyncio.Event()
@@ -346,15 +342,26 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         print("Adobe: Поля не найдены, печатаем вслепую...")
                         await page.keyboard.type(code, delay=250)
                     
-                    await asyncio.sleep(1)
+                    print("Adobe: Код напечатан. Ожидаем авто-отправку...")
+                    await asyncio.sleep(3)
                     
-                    for _ in range(3):
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(0.5)
+                    # Мягкое нажатие, если авто-отправка не сработала
+                    try:
+                        v_btn = page.locator('button:has-text("Verify"), button:has-text("Verificar"), button:has-text("Submit"), button:has-text("Continue"), button:has-text("Continuar")').first
+                        if await v_btn.is_visible():
+                            print("Adobe: Авто-отправка не произошла, нажимаем кнопку подтверждения...")
+                            await v_btn.click(force=True)
+                    except: pass
                     
                     password_found = False
                     for _ in range(20):
                         await asyncio.sleep(1)
+                        # Если редирект уже пошел на Enhance, значит 2FA принят и пароль не нужен
+                        if "enhance" in page.url and "auth" not in page.url:
+                            step = "done"
+                            password_found = True
+                            break
+
                         p_inps = await page.locator('input[type="password"]').all()
                         for p in p_inps:
                             if await p.is_visible():
@@ -417,10 +424,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             gc.collect()
 
-            # ── 8. Промежуточные экраны ──
-            for _ in range(10):
+            # ── 8. Промежуточные экраны и редиректы ──
+            for _ in range(15):
+                if "services.adobe.com" in page.url or "ims" in page.url:
+                    print(f"Adobe: ждем завершения редиректа ({page.url})...")
+                    await asyncio.sleep(2)
+                    continue
+
                 if "enhance" in page.url and "auth" not in page.url:
                     break
+                
                 try:
                     await page.evaluate("""() => {
                         const btn = [...document.querySelectorAll('button,a')]
