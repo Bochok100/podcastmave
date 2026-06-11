@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.13 — The Flawless Focus
-- Убраны команды clear(), которые сбрасывали фокус курсора
-- Ввод текста жестко привязан к локатору через press_sequentially
-- Метод клавиши Enter оставлен (работает идеально)
+Podcast Bot v3.14 — The Honeypot Bypass
+- Поиск только физически ВИДИМЫХ полей (обход невидимых ловушек Adobe)
+- Безопасный ввод через fill()
+- Использование Enter для 100% срабатывания React
 """
 
 import os
@@ -162,26 +162,34 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Вводим email (БЕЗ CLEAR, ЖЕСТКАЯ ПРИВЯЗКА К ПОЛЮ) ──
-            try:
-                print("Adobe: ждем появление поля email...")
-                email_field = page.locator('input[type="email"],input[name="username"]').first
-                await email_field.wait_for(state="visible", timeout=8000)
-                
-                print("Adobe: поле email найдено. Вводим...")
-                await email_field.click()
+            # ── 3. Вводим email (ОБХОД НЕВИДИМЫХ ЛОВУШЕК) ──
+            print("Adobe: ищем ВИДИМОЕ поле email...")
+            email_target = None
+            # Даем странице 8 секунд на отрисовку
+            for _ in range(8):
+                inputs = await page.locator('input[type="email"], input[name="username"]').all()
+                for inp in inputs:
+                    if await inp.is_visible():
+                        email_target = inp
+                        break
+                if email_target:
+                    break
+                await asyncio.sleep(1)
+
+            if email_target:
+                print("Adobe: видимое поле email найдено. Вводим...")
+                await email_target.click()
                 await asyncio.sleep(0.5)
-                
-                # Печатаем строго в это поле
-                await email_field.press_sequentially(ADOBE_EMAIL.strip(), delay=100)
+                # Надежный ввод для React
+                await email_target.fill(ADOBE_EMAIL.strip())
                 await asyncio.sleep(1)
 
                 print("Adobe: Жмем Enter...")
-                await email_field.press("Enter")
+                await email_target.press("Enter")
                 await asyncio.sleep(4)
                 await shot("/tmp/adobe_last.png", "Adobe: после email")
-            except Exception as e:
-                print(f"Adobe: Поле email не найдено ({e}). Идем дальше.")
+            else:
+                print("Adobe: Видимое поле email не найдено. Возможно, мы уже залогинены.")
 
             # ── 4. Экран подтверждения личности (перед кодом) ──
             try:
@@ -210,10 +218,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             await asyncio.sleep(0.1)
                         await visible_inputs[5].press("Enter")
                     else:
-                        code_input = page.locator('input[type="text"]').first
-                        await code_input.click()
-                        await code_input.press_sequentially(code, delay=150)
-                        await code_input.press("Enter")
+                        code_input = None
+                        inputs = await page.locator('input[type="text"]').all()
+                        for inp in inputs:
+                            if await inp.is_visible():
+                                code_input = inp
+                                break
+                        if code_input:
+                            await code_input.click()
+                            await code_input.fill(code)
+                            await code_input.press("Enter")
                     
                     await asyncio.sleep(1)
                     
@@ -230,25 +244,31 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (БЕЗ CLEAR, ЖЕСТКАЯ ПРИВЯЗКА К ПОЛЮ) ──
-            try:
-                print("Adobe: ждем появление поля пароля...")
-                pwd_field = page.locator('input[type="password"],#password').first
-                await pwd_field.wait_for(state="visible", timeout=8000)
-                
-                print("Adobe: поле пароля найдено. Вводим...")
-                await pwd_field.click()
+            # ── 6. Вводим пароль (ОБХОД НЕВИДИМЫХ ЛОВУШЕК) ──
+            print("Adobe: ищем ВИДИМОЕ поле пароля...")
+            pwd_target = None
+            for _ in range(8):
+                inputs = await page.locator('input[type="password"], #password').all()
+                for inp in inputs:
+                    if await inp.is_visible():
+                        pwd_target = inp
+                        break
+                if pwd_target:
+                    break
+                await asyncio.sleep(1)
+
+            if pwd_target:
+                print("Adobe: видимое поле пароля найдено. Вводим...")
+                await pwd_target.click()
                 await asyncio.sleep(0.5)
-                
-                # Печатаем строго в это поле
-                await pwd_field.press_sequentially(ADOBE_PASSWORD.strip(), delay=100)
+                await pwd_target.fill(ADOBE_PASSWORD.strip())
                 await asyncio.sleep(1)
                 
                 print("Adobe: Жмем Enter...")
-                await pwd_field.press("Enter")
+                await pwd_target.press("Enter")
                 await asyncio.sleep(6)
-            except Exception as e:
-                print(f"Adobe: Поле пароля не появилось ({e}).")
+            else:
+                print("Adobe: Видимое поле пароля не появилось.")
 
             # Закрываем промежуточные экраны
             for _ in range(10):
