@@ -1,9 +1,8 @@
 """
-Podcast Bot v3.50 — The Anti-Zombie
-- ИСПРАВЛЕН БАГ ДОЛГОГО ЗАВИСАНИЯ: переход на Sign In теперь осуществляется прямым извлечением ссылки (goto href), а не кликом.
-- Внедрен жесткий Fast-Fail (15 секунд): если страница логина не открылась, бот сразу выдает ошибку, а не ищет поля вслепую по 3-5 минут.
-- Логика 2FA работает через глобальный keyboard.type с задержкой, что идеально обходит 6-ячеечную защиту Adobe.
-- Устранена ошибка Conflict: добавлено drop_pending_updates=True для жесткого обрыва старых сессий.
+Podcast Bot v3.51 — The React Detach Fix
+- ИСПРАВЛЕН БАГ ПУСТЫХ ЯЧЕЕК 2FA: внедрен алгоритм динамического перезапроса DOM-элементов перед каждой цифрой. Это полностью обходит защиту React, которая перерисовывает ячейки после каждого нажатия.
+- Добавлен промежуточный скриншот для визуального подтверждения вбитых цифр.
+- Сохранен прямой переход (Fast-Fail) на Sign In и анти-зомби таймеры.
 """
 
 import os
@@ -232,7 +231,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             # ── 3. Email ──
             try:
-                print("Adobe: ищем поле email...")
+                print("Adobe: ищем поле email (до 30 сек)...")
                 email_target = None
                 for _ in range(15):
                     inputs = await page.locator('input[type="email"], input[name="username"], input[id*="email" i], input[name="email" i]').all()
@@ -319,7 +318,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             break
                     if step == "code_2fa": break
 
-            # ── 6. Ввод 2FA кода ──
+            # ── 6. Ввод 2FA кода (THE REACT DETACH FIX) ──
             if step == "code_2fa":
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда обычным текстом (3 минуты).")
                 ev = asyncio.Event()
@@ -327,19 +326,40 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=180)
                     code = adobe_2fa_state[user_id]["code"].strip()
-                    await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
+                    await shot("/tmp/adobe_last.png", f"⏳ Начинаю ввод кода {code[:2]}***...")
 
-                    all_inputs = await page.locator('input[type="text"], input[type="number"], input[type="tel"]').all()
-                    visible_inputs = [inp for inp in all_inputs if await inp.is_visible()]
+                    # Вводим каждую цифру с динамическим перезапросом элементов!
+                    for i, digit in enumerate(code[:6]):
+                        # ПЕРЕЗАПРАШИВАЕМ элементы на каждом шаге цикла!
+                        current_inputs = await page.locator('input[type="text"], input[type="number"], input[type="tel"]').all()
+                        visible_inps = [inp for inp in current_inputs if await inp.is_visible()]
+                        
+                        if len(visible_inps) >= 6:
+                            # 6 независимых ячеек
+                            try:
+                                if i < len(visible_inps):
+                                    await visible_inps[i].click(force=True)
+                                    await asyncio.sleep(0.1)
+                                await page.keyboard.press(digit)
+                            except Exception as e:
+                                print(f"Fallback press on digit {i}: {e}")
+                                await page.keyboard.press(digit)
+                        elif len(visible_inps) > 0:
+                            # Одно большое поле
+                            if i == 0:
+                                await visible_inps[0].click(force=True)
+                                await visible_inps[0].press_sequentially(code, delay=200)
+                            break
+                        else:
+                            # Поля не найдены, печатаем вслепую
+                            if i == 0:
+                                await page.keyboard.type(code, delay=200)
+                            break
+                        
+                        await asyncio.sleep(0.2)
                     
-                    if len(visible_inputs) > 0:
-                        print("Adobe: Найдено поле(я) 2FA. Кликаем в первое...")
-                        await visible_inputs[0].click(force=True)
-                    
-                    print("Adobe: Печатаем код как человек...")
-                    await page.keyboard.type(code, delay=250)
-                    
-                    print("Adobe: Код напечатан. Ожидаем авто-отправку (3 сек)...")
+                    # Делаем скриншот СРАЗУ после ввода, чтобы ты увидел введенные цифры
+                    await shot("/tmp/adobe_last.png", f"✅ Adobe: Код напечатан. Ждем авто-отправку...")
                     await asyncio.sleep(3)
                     
                     try:
@@ -371,7 +391,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             raise RuntimeError("Adobe не принял код")
 
                     if not password_found:
-                        await shot("/tmp/adobe_error.png", "❌ Adobe: Завис после ввода кода 2FA.")
+                        await shot("/tmp/adobe_error.png", "❌ Adobe: Завис после ввода кода 2FA. Сервер Adobe не ответил.")
                         raise RuntimeError("Adobe не перешел к паролю после ввода кода")
 
                     await shot("/tmp/adobe_last.png", f"Adobe: после кода. URL: {page.url}")
@@ -906,7 +926,6 @@ def main():
         app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
         
         print("✅ Бот запущен!")
-        # 🔥 drop_pending_updates=True жестко убивает двойников и устраняет ошибку Conflict 🔥
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
