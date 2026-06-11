@@ -127,7 +127,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-software-rasterizer",
-                "--single-process",           # один процесс — меньше памяти
                 "--renderer-process-limit=1",
                 "--js-flags=--max-old-space-size=200",
                 "--disable-blink-features=AutomationControlled",
@@ -183,19 +182,43 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             # ── 3. Email ──
             print("Adobe: вводим email...")
-            for _ in range(10):
+            # Ждём поле email (до 15 сек)
+            email_appeared = False
+            for _ in range(15):
                 inp = page.locator('input[type="email"], input[name="username"]').first
-                if await inp.count() > 0 and await inp.is_visible():
-                    await inp.click()
-                    await asyncio.sleep(0.5)
-                    await inp.fill(ADOBE_EMAIL.strip())
-                    await asyncio.sleep(0.5)
-                    await inp.press("Enter")
-                    await asyncio.sleep(4)
-                    await shot("/tmp/adobe_last.png", f"Adobe: email введён. URL: {page.url}")
-                    print("Adobe: email введён")
-                    break
+                if await inp.count() > 0:
+                    try:
+                        # Используем JS для заполнения — обходит проблемы с фокусом
+                        await page.evaluate(
+                            """(email) => {
+                                const inp = document.querySelector('input[type="email"], input[name="username"]');
+                                if (inp) {
+                                    inp.focus();
+                                    inp.value = email;
+                                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                                }
+                            }""",
+                            ADOBE_EMAIL.strip()
+                        )
+                        await asyncio.sleep(0.5)
+                        # Нажимаем Continue через JS
+                        await page.evaluate("""() => {
+                            const btn = document.querySelector('button[data-id="enterpriseButton"], .continue-btn, button[type="submit"]')
+                                || [...document.querySelectorAll('button')].find(b => /continue/i.test(b.innerText));
+                            if (btn) btn.click();
+                        }""")
+                        await asyncio.sleep(4)
+                        await shot("/tmp/adobe_last.png", f"Adobe: email введён. URL: {page.url}")
+                        print(f"Adobe: email введён через JS, URL={page.url}")
+                        email_appeared = True
+                        break
+                    except Exception as e:
+                        print(f"Adobe email JS error: {e}")
                 await asyncio.sleep(1)
+            if not email_appeared:
+                await shot("/tmp/adobe_error.png", "❌ Поле email не найдено")
+                raise RuntimeError("Adobe: поле email не появилось за 15 секунд")
 
             # ── 4. Экран подтверждения "Verify your identity" ──
             # Adobe сначала показывает кнопку Continue (отправить код),
@@ -468,7 +491,6 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--single-process",
                 "--renderer-process-limit=1",
                 "--js-flags=--max-old-space-size=200",
                 "--disable-extensions",
