@@ -1,8 +1,10 @@
 """
-Podcast Bot v3.52 — The Dynamic Locator (Финальная броня)
-- ИСПРАВЛЕН БАГ МЕРТВОГО ЗАВИСАНИЯ (Detached DOM): бот больше не использует статические ElementHandles. Все элементы ищутся динамически через `page.locator().nth()`, что делает бота неуязвимым для перерисовки ячеек React.
-- Оптимизирован ввод 2FA: бот находит свежую ячейку перед каждой цифрой, кликает в нее и нажимает клавишу (обходим любые сбросы фокуса).
-- Защита от "молчания": глобальный обработчик ошибок усилен, зависания внутри Playwright сведены к нулю.
+Podcast Bot v3.53 — Titanium Build (Финальная сборка)
+- Устранены перемудренные алгоритмы: возвращен самый стабильный метод клика по Sign In из ранних сборок.
+- Увеличены таймауты: Render получает до 45 секунд на прогрузку тяжелых страниц Adobe (защита от ложных Fast-Fail).
+- 2FA: Оставлен механизм динамического обхода React-защиты (перезапрос ячеек перед каждой цифрой).
+- Загрузка: Сохранена прямая инъекция в <input type="file"> для обхода системных окон Linux.
+- Оптимизация памяти: агрессивный сборщик мусора и безопасные файловые дескрипторы для стабильной работы сервера.
 """
 
 import os
@@ -158,7 +160,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 "--disable-gpu",
                 "--disable-software-rasterizer",
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=150 --expose-gc",
+                "--js-flags=--max-old-space-size=250 --expose-gc", # Чуть больше памяти для стабильности
                 "--disable-site-isolation-trials",                 
                 "--disk-cache-size=5242880",                       
                 "--disable-blink-features=AutomationControlled",
@@ -196,42 +198,37 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Умный клик по Sign In ──
+            # ── 2. Возврат самого надежного клика "Sign In" ──
             print("Adobe: Нажимаем Sign In...")
             try:
+                # Никаких вырезаний куки, просто ищем ссылку/кнопку и кликаем
                 await page.evaluate("""() => {
-                    document.querySelectorAll('[id*="onetrust"], [class*="cookie"], [class*="overlay"]').forEach(e => e.remove());
+                    const el = [...document.querySelectorAll('a, button, span')].find(e => /sign in|entrar|log in/i.test(e.innerText?.trim()));
+                    if (el) el.click();
                 }""")
-                sign_btn = page.locator('a, button').filter(has_text=re.compile("(?i)^sign in$|^entrar$|^log in$")).first
-                if await sign_btn.count() > 0:
-                    await sign_btn.click(force=True)
-                else:
-                    await page.evaluate("""() => {
-                        const el = [...document.querySelectorAll('a,button')].find(e => /sign in|entrar|log in/i.test(e.innerText?.trim()));
-                        if (el) el.click();
-                    }""")
             except Exception as e:
-                print(f"Ошибка клика Sign In: {e}")
+                print(f"Ошибка первоначального клика: {e}")
                 
+            # Даем Render щедрые 45 секунд на прогрузку тяжелого интерфейса IMS Adobe
             auth_reached = False
-            for _ in range(15):
+            for _ in range(45):
+                await asyncio.sleep(1)
                 if "auth" in page.url or "login" in page.url or "signin" in page.url:
                     auth_reached = True
                     break
-                await asyncio.sleep(1)
-                
+                    
             if not auth_reached:
-                await shot("/tmp/adobe_error.png", "❌ Adobe: Не удалось открыть форму входа (кнопка Sign In не сработала). Запустите заново.")
+                await shot("/tmp/adobe_error.png", "❌ Adobe: Кнопка 'Sign In' не сработала или сервер не успел загрузить страницу. Запустите заново.")
                 raise RuntimeError("Сбой навигации: не удалось перейти на логин.")
 
             print(f"Adobe: Успешно перешли на логин. URL: {page.url}")
 
-            # ── 3. Email (ДИНАМИЧЕСКИЙ ЛОКАТОР) ──
+            # ── 3. Email ──
             print("Adobe: ищем поле email...")
             email_found = False
-            email_loc = page.locator('input[type="email"], input[name="username"], input[id*="email" i], input[name="email" i]').first
-            for _ in range(15):
-                if await email_loc.count() > 0:
+            for _ in range(20):
+                email_loc = page.locator('input[type="email"], input[name="username"], input[id*="email" i], input[name="email" i]').first
+                if await email_loc.count() > 0 and await email_loc.is_visible():
                     try:
                         await email_loc.click(force=True)
                         await page.keyboard.press("Control+A")
@@ -251,7 +248,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             else:
                 print("Adobe: Поле email не найдено. Идем дальше.")
 
-            # ── 4. Умный навигатор (ДИНАМИЧЕСКИЙ ПОИСК) ──
+            # ── 4. Умный навигатор ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
             for _ in range(30):
@@ -292,7 +289,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         step = "code_2fa"
                         break
 
-            # ── 6. Ввод 2FA кода (THE DYNAMIC LOCATOR FIX) ──
+            # ── 6. Ввод 2FA кода (Идеальный механизм из 3.51) ──
             if step == "code_2fa":
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда обычным текстом (3 минуты).")
                 ev = asyncio.Event()
@@ -309,7 +306,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         print("Adobe: Найдено 6 ячеек 2FA. Динамический ввод...")
                         for i in range(6):
                             try:
-                                # Находим свежую ячейку перед каждым кликом!
+                                # Перехват на лету: обходим защиту React
                                 target = all_inps.nth(i)
                                 await target.click(force=True)
                                 await asyncio.sleep(0.1)
@@ -365,13 +362,13 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 7. Пароль (ДИНАМИЧЕСКИЙ ЛОКАТОР) ──
+            # ── 7. Пароль ──
             if step == "password":
                 print("Adobe: ждем появление поля пароля...")
                 pwd_found = False
-                pwd_loc = page.locator('input[type="password"]').first
-                for _ in range(15):
-                    if await pwd_loc.count() > 0:
+                for _ in range(20):
+                    pwd_loc = page.locator('input[type="password"]').first
+                    if await pwd_loc.count() > 0 and await pwd_loc.is_visible():
                         try:
                             await pwd_loc.click(force=True)
                             await page.keyboard.press("Control+A")
@@ -445,7 +442,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
             await ctx.storage_state(path=STATE_FILE)
 
-            # ── 11. ЗАГРУЗКА ФАЙЛА ──
+            # ── 11. ЗАГРУЗКА ФАЙЛА (Механика из 3.41) ──
             print("Adobe: начинаем загрузку файла...")
             uploaded = False
             
