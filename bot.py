@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.35 — The Anti-Freeze
-- Внедрен Глобальный Таймер (10 минут): предотвращает любые молчаливые зависания Playwright
-- Устранен баг бесконечного синего кружка Adobe: используется жесткий page.goto() вместо зависающего page.reload()
-- Улучшено определение успешной загрузки интерфейса (учет португальского Escolher arquivos)
-- Полная экономия оперативной памяти и защита от утечек
+Podcast Bot v3.36 — The Self-Healing Bot
+- Внедрен механизм авто-лечения: если клик по Sign In не сработал, бот детектирует это и повторяет клик до победного
+- Устранен баг "слепого ожидания" на главной странице
+- Безотказный поиск полей (по type и bounding_box)
+- Абсолютный таймер 10 минут (Anti-Freeze) и полная асинхронность сохранены
 """
 
 import os
@@ -178,6 +178,23 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
         page = await ctx.new_page()
 
         try:
+            # ── Вспомогательная функция клика Sign In ──
+            async def force_click_sign_in():
+                try:
+                    for text in ['Sign In', 'Sign in', 'Entrar', 'Log in']:
+                        loc = page.locator(f'a:has-text("{text}"), button:has-text("{text}")').first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            await loc.click(force=True)
+                            return True
+                    await page.evaluate("""() => {
+                        const el = [...document.querySelectorAll('a,button,span')]
+                            .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
+                        if (el) el.click();
+                    }""")
+                    return True
+                except:
+                    return False
+
             # ── 1. Открываем Adobe Podcast ──
             print("Adobe: открываем страницу...")
             await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
@@ -186,33 +203,39 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
             # ── 2. Нажимаем Sign In ──
-            try:
-                await page.evaluate("""() => {
-                    const el = [...document.querySelectorAll('a,button')]
-                        .find(e => /^sign in|entrar$/i.test(e.innerText?.trim()));
-                    if (el) el.click();
-                }""")
-                await asyncio.sleep(4)
-            except Exception:
-                pass
+            print("Adobe: Ищем кнопку Sign In...")
+            await force_click_sign_in()
+            await asyncio.sleep(4)
 
-            # ── 3. Email (УЛЬТИМАТИВНЫЙ ПОИСК ПО ФИЗИЧЕСКИМ РАЗМЕРАМ) ──
+            # ── 3. Email (УЛЬТИМАТИВНЫЙ ПОИСК + АВТО-ЛЕЧЕНИЕ) ──
             try:
-                print("Adobe: ищем физически отрисованное поле email (до 30 сек)...")
+                print("Adobe: ищем поле email (до 30 сек)...")
                 email_target = None
-                for _ in range(30):
-                    inputs = await page.locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"])').all()
-                    for inp in inputs:
-                        box = await inp.bounding_box()
-                        if box and box['width'] > 0 and box['height'] > 0:
-                            email_target = inp
-                            break
-                    if email_target:
+                for attempts in range(30):
+                    # Авто-лечение: если мы всё ещё на главной странице, долбим кнопку Sign In
+                    if "auth" not in page.url and await page.locator('text=/Enhance Speech/i').count() > 0:
+                        if attempts % 5 == 0:
+                            print("Adobe: Мы всё ещё на главной! Повторяем клик Sign In...")
+                            await force_click_sign_in()
+                    
+                    # Ищем поле email
+                    for sel in ['input[type="email"]', 'input[name="username"]', 'input[id*="email" i]']:
+                        inputs = await page.locator(sel).all()
+                        for inp in inputs:
+                            box = await inp.bounding_box()
+                            if box and box['width'] > 0 and box['height'] > 0:
+                                email_target = inp
+                                break
+                        if email_target: break
+                    
+                    if email_target: 
                         break
                     await asyncio.sleep(1)
 
                 if email_target:
-                    print("Adobe: поле 100% на экране. Вводим почту...")
+                    print("Adobe: поле email 100% на экране. Вводим почту...")
+                    await email_target.evaluate("node => node.focus()")
+                    await asyncio.sleep(0.5)
                     await email_target.click(force=True)
                     await asyncio.sleep(0.5)
                     await page.keyboard.press("Control+A")
@@ -225,13 +248,13 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(4)
                     await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
                 else:
-                    await shot("/tmp/adobe_error.png", "❌ Adobe: Физическое поле email не появилось за 30 сек.")
-                    raise RuntimeError("Adobe: Поле email не найдено")
+                    await shot("/tmp/adobe_error.png", "❌ Adobe: Не удалось перейти на экран авторизации (Sign In не сработал).")
+                    raise RuntimeError("Сбой навигации: кнопка Sign In не реагирует.")
             except Exception as e:
                 print(f"Adobe email error: {str(e)[:100]}")
                 if "RuntimeError" in str(type(e)): raise
 
-            # ── 4. Умный навигатор с рентгеном ──
+            # ── 4. Умный навигатор ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
             for _ in range(40):
@@ -307,6 +330,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     
                     if first_input:
                         print("Adobe: фокусируемся на поле кода...")
+                        await first_input.evaluate("node => node.focus()")
+                        await asyncio.sleep(0.5)
                         await first_input.click(force=True)
                         await page.keyboard.type(code, delay=150)
                         await asyncio.sleep(1)
@@ -351,6 +376,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
                     if pwd_target:
                         print("Adobe: поле пароля 100% на экране. Вводим...")
+                        await pwd_target.evaluate("node => node.focus()")
+                        await asyncio.sleep(0.5)
                         await pwd_target.click(force=True)
                         await asyncio.sleep(0.5)
                         await page.keyboard.press("Control+A")
@@ -392,12 +419,11 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-            # ── 10. Ждём интерфейс загрузки (ЖЕСТКАЯ ЗАЩИТА ОТ СИНЕГО КРУЖКА) ──
+            # ── 10. Ждём интерфейс загрузки ──
             print("Adobe: ждём интерфейс загрузки...")
             for attempts in range(25):
                 ui_ready = False
                 
-                # Ищем точные признаки готового интерфейса (кнопку загрузки или инпут)
                 if await page.locator('button:has-text("Choose files"), button:has-text("Escolher arquivos")').count() > 0:
                     ui_ready = True
                 if await page.locator('input[type="file"]').count() > 0:
@@ -406,18 +432,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 if ui_ready: 
                     break
                 
-                # Если 10 секунд видим синий кружок — стираем историю и жестко переходим заново
-                if attempts == 10:
-                    print("Adobe: баг синего кружка, принудительный жесткий переход...")
+                if attempts == 12:
+                    print("Adobe: баг синего кружка, принудительный переход...")
                     try:
                         await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
                         await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                    except Exception as e:
-                        print(f"Goto fallback error: {e}")
+                    except Exception: pass
                 
                 await asyncio.sleep(1)
             else:
-                await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился (синий кружок). Смотри /screen")
+                await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился. Смотри /screen")
                 raise RuntimeError("Adobe: экран Enhance завис на загрузке (баг Adobe)")
 
             await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
@@ -451,7 +475,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             if not uploaded:
                 with open(mp3, "rb") as f:
                     b64 = base64.b64encode(f.read()).decode()
-                # Асинхронное ожидание JavaScript (защита от зависания вкладки)
                 await asyncio.wait_for(page.evaluate(f"""async () => {{
                     const bin = atob("{b64}"), arr = new Uint8Array(bin.length);
                     for (let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
@@ -467,7 +490,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             await asyncio.sleep(3)
             
-            # Нажимаем Enhance
+            # Нажимаем Enhance 
             for frame in page.frames:
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button:has-text("Melhorar")']:
                     try:
@@ -694,7 +717,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         await update.message.reply_photo(photo=f, caption=f"ℹ️ {caption}")
             except Exception: pass
 
-        # Глобальный таймаут (10 минут) от вечных зависаний Playwright
         try:
             studio = await asyncio.wait_for(enhance_audio(mp3, uid, notify), timeout=600.0)
         except asyncio.TimeoutError:
