@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.31 — The Ultimate Auth
-- Убраны проверки is_visible(), из-за которых бот пропускал шаги. Используется wait_for(state="attached")
-- Внедрен "умный навигатор": бот сам понимает, какой экран показал Adobe (2FA, Continue, или сразу Пароль)
-- Учтены португальские версии интерфейса (Continuar, Confirme sua identidade)
-- Сохранена полная экономия памяти и асинхронность
+Podcast Bot v3.32 — The Perfect Vision
+- Возвращен строгий поиск полей только через is_visible() для обхода невидимых ловушек (honeypots) Adobe
+- Внедрено безотказное комбо ввода: JS focus -> force click -> Ctrl+A -> type
+- Умный навигатор отслеживает 2FA/Пароль/Continue (поддержка медленных серверов Render)
+- Сохранена полная асинхронность и максимальная экономия памяти
 """
 
 import os
@@ -197,22 +197,39 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email (НАДЕЖНОЕ ОЖИДАНИЕ В КОДЕ) ──
+            # ── 3. Email (ИСКЛЮЧИТЕЛЬНО ВИДИМЫЕ ПОЛЯ + КОМБО КЛИК) ──
             try:
-                print("Adobe: ждем появление поля email (до 30 сек)...")
-                email_loc = page.locator('input[type="email"], input[name="username"]').first
-                await email_loc.wait_for(state="attached", timeout=30000)
-                await asyncio.sleep(1) # Даем прогрузиться анимации
+                print("Adobe: ждем появление видимого поля email (до 30 сек)...")
+                email_target = None
+                for _ in range(30):
+                    inputs = await page.locator('input[type="email"], input[name="username"], input[id*="email" i], input[name="email" i]').all()
+                    for inp in inputs:
+                        if await inp.is_visible():
+                            email_target = inp
+                            break
+                    if email_target:
+                        break
+                    await asyncio.sleep(1)
 
-                print("Adobe: поле email найдено. Вводим...")
-                await email_loc.click(force=True)
-                await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
-                await asyncio.sleep(1)
-                
-                print("Adobe: Жмем Enter...")
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(4)
-                await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
+                if email_target:
+                    print("Adobe: видимое поле email найдено. Вводим...")
+                    await email_target.evaluate("node => node.focus()")
+                    await asyncio.sleep(0.5)
+                    await email_target.click(force=True)
+                    await asyncio.sleep(0.5)
+                    
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
+                    await asyncio.sleep(1)
+                    
+                    print("Adobe: Жмем Enter...")
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(2)
+                    await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
+                else:
+                    await shot("/tmp/adobe_last.png", "⚠️ Adobe: Видимое поле email не найдено за 30 сек. Пропускаем шаг.")
+                    print("Adobe: Видимое поле email не найдено. Идем дальше.")
             except Exception as e:
                 await shot("/tmp/adobe_error.png", f"❌ Ошибка при вводе email: {str(e)[:50]}")
                 print(f"Adobe email error: {str(e)[:100]}")
@@ -220,23 +237,32 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             # ── 4. Умный навигатор (Что Adobe покажет дальше?) ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
-            for _ in range(30):
-                # Проверяем пароль
-                if await page.locator('input[type="password"]').count() > 0:
-                    step = "password"
-                    break
+            for _ in range(40): # Даем 40 секунд на прогрузку медленных серверов
+                # 1. Проверяем пароль
+                pwd_inputs = await page.locator('input[type="password"]').all()
+                for p_inp in pwd_inputs:
+                    if await p_inp.is_visible():
+                        step = "password"
+                        break
+                if step == "password": break
                 
-                # Проверяем кнопку Continue/Continuar (для отправки кода 2FA)
-                if await page.locator('button:has-text("Continue"), button:has-text("Continuar")').count() > 0 and await page.locator('text=/Verify|Confirme|identity/i').count() > 0:
-                    step = "continue_2fa"
-                    break
+                # 2. Проверяем кнопку Continue для 2FA
+                btn_continue = await page.locator('button:has-text("Continue"), button:has-text("Continuar")').all()
+                for b_inp in btn_continue:
+                    if await b_inp.is_visible() and await page.locator('text=/Verify|Confirme|identity/i').count() > 0:
+                        step = "continue_2fa"
+                        break
+                if step == "continue_2fa": break
                 
-                # Проверяем поля ввода кода (если 2FA отправлено сразу)
-                if await page.locator('input[type="text"], input[type="number"]').count() > 0 and await page.locator('text=/Verify|Confirme|identity|code/i').count() > 0:
-                    step = "code_2fa"
-                    break
+                # 3. Проверяем поля ввода кода
+                code_inputs = await page.locator('input[type="text"], input[type="number"]').all()
+                for c_inp in code_inputs:
+                    if await c_inp.is_visible() and await page.locator('text=/Verify|Confirme|identity|code/i').count() > 0:
+                        step = "code_2fa"
+                        break
+                if step == "code_2fa": break
                 
-                # Проверяем редирект
+                # 4. Редирект
                 if "enhance" in page.url and "auth" not in page.url:
                     step = "done"
                     break
@@ -245,18 +271,24 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             
             print(f"Adobe: Следующий шаг определен как -> {step}")
 
-            # ── 5. Нажимаем Continue для 2FA (если требуется) ──
+            # ── 5. Нажимаем Continue для 2FA ──
             if step == "continue_2fa":
                 print("Adobe: нажимаем Continue для отправки 2FA...")
-                btn_verify = page.locator('button:has-text("Continue"), button:has-text("Continuar")').first
-                await btn_verify.click(force=True)
+                btns = await page.locator('button:has-text("Continue"), button:has-text("Continuar")').all()
+                for btn in btns:
+                    if await btn.is_visible():
+                        await btn.click(force=True)
+                        break
                 
                 # Ждем появления полей для кода
                 for _ in range(15):
                     await asyncio.sleep(1)
-                    if await page.locator('input[type="text"], input[type="number"]').count() > 0:
-                        step = "code_2fa"
-                        break
+                    c_inps = await page.locator('input[type="text"], input[type="number"]').all()
+                    for c in c_inps:
+                        if await c.is_visible():
+                            step = "code_2fa"
+                            break
+                    if step == "code_2fa": break
 
             # ── 6. Ввод 2FA кода ──
             if step == "code_2fa":
@@ -268,20 +300,32 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     code = adobe_2fa_state[user_id]["code"].strip()
                     await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
 
-                    first_input = page.locator('input[type="text"], input[type="number"]').first
-                    await first_input.wait_for(state="attached", timeout=10000)
-                    await asyncio.sleep(1)
-                    await first_input.click(force=True)
-                    await page.keyboard.type(code, delay=150)
-                    await asyncio.sleep(1)
-                    await page.keyboard.press("Enter")
+                    first_input = None
+                    inputs = await page.locator('input[type="text"], input[type="number"]').all()
+                    for inp in inputs:
+                        if await inp.is_visible():
+                            first_input = inp
+                            break
                     
-                    # Ждем пока появится пароль
+                    if first_input:
+                        print("Adobe: фокусируемся на поле кода...")
+                        await first_input.evaluate("node => node.focus()")
+                        await asyncio.sleep(0.5)
+                        await first_input.click(force=True)
+                        await page.keyboard.type(code, delay=150)
+                        await asyncio.sleep(1)
+                        await page.keyboard.press("Enter")
+                    
+                    # Ждем пока 2FA исчезнет и появится пароль
                     for _ in range(20):
                         await asyncio.sleep(1)
-                        if await page.locator('input[type="password"]').count() > 0:
-                            step = "password"
-                            break
+                        p_inps = await page.locator('input[type="password"]').all()
+                        for p in p_inps:
+                            if await p.is_visible():
+                                step = "password"
+                                break
+                        if step == "password": break
+                        
                         html = await page.content()
                         if "didn't receive" in html.lower() or "não recebeu" in html.lower() or "invalid" in html.lower():
                             await shot("/tmp/adobe_error.png", "❌ Adobe не принял код. Запусти заново.")
@@ -293,23 +337,40 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 7. Пароль (НАДЕЖНОЕ ОЖИДАНИЕ) ──
+            # ── 7. Пароль (ИСКЛЮЧИТЕЛЬНО ВИДИМЫЕ ПОЛЯ + КОМБО КЛИК) ──
             if step == "password":
                 try:
                     print("Adobe: ждем появление поля пароля...")
-                    pwd_loc = page.locator('input[type="password"]').first
-                    await pwd_loc.wait_for(state="attached", timeout=30000)
-                    await asyncio.sleep(1)
+                    pwd_target = None
+                    for _ in range(30):
+                        inputs = await page.locator('input[type="password"], #password, input[name="password"]').all()
+                        for inp in inputs:
+                            if await inp.is_visible():
+                                pwd_target = inp
+                                break
+                        if pwd_target:
+                            break
+                        await asyncio.sleep(1)
 
-                    print("Adobe: поле пароля найдено. Вводим...")
-                    await pwd_loc.click(force=True)
-                    await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
-                    await asyncio.sleep(1)
-                    
-                    print("Adobe: Жмем Enter...")
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(8)
-                    await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
+                    if pwd_target:
+                        print("Adobe: поле пароля найдено. Фокусируемся...")
+                        await pwd_target.evaluate("node => node.focus()")
+                        await asyncio.sleep(0.5)
+                        await pwd_target.click(force=True)
+                        await asyncio.sleep(0.5)
+                        
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Backspace")
+                        await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
+                        await asyncio.sleep(1)
+                        
+                        print("Adobe: Жмем Enter...")
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(8)
+                        await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
+                    else:
+                        await shot("/tmp/adobe_last.png", "⚠️ Adobe: Поле пароля не найдено за 30 сек. Пропускаем шаг.")
+                        print("Adobe: Видимое поле пароля не найдено. Идем дальше.")
                 except Exception as e:
                     await shot("/tmp/adobe_error.png", f"❌ Ошибка при вводе пароля: {str(e)[:50]}")
                     print(f"Adobe password error: {str(e)[:100]}")
@@ -340,13 +401,14 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             # ── 10. Ждём интерфейс загрузки ──
             print("Adobe: ждём интерфейс загрузки...")
             for _ in range(20):
-                ui_ready = (
-                    await page.locator('input[type="file"]').count() > 0 or
-                    await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0 or
-                    await page.locator('[class*="upload"],[class*="drop"]').count() > 0
-                )
-                if ui_ready:
-                    break
+                ui_ready = False
+                inps = await page.locator('input[type="file"]').all()
+                for inp in inps:
+                    if await inp.is_visible(): ui_ready = True
+                if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0: ui_ready = True
+                if await page.locator('[class*="upload"],[class*="drop"]').count() > 0: ui_ready = True
+                
+                if ui_ready: break
                 await asyncio.sleep(1)
             else:
                 await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился. Смотри /screen")
