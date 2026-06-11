@@ -1,10 +1,8 @@
 """
-Podcast Bot v3.23 — The Memory Optimizer
-- Процесс авторизации и логики оставлен без изменений (работает стабильно)
-- Внедрены жесткие лимиты кэша браузера и отключена изоляция сайтов для экономии ОЗУ
-- Мгновенное удаление "тяжелых" Base64-строк из памяти
-- Очистка File Descriptors (устранена утечка памяти при отправке скриншотов)
-- Принудительный сбор мусора (window.gc()) в циклах ожидания
+Podcast Bot v3.24 — Classic Auth + Memory Diet
+- Откачена логика авторизации к проверенной версии (без JS-костылей очистки)
+- Надежный .fill(force=True) для email и пароля, который 100% пробивает React
+- Сохранены все оптимизации ОЗУ (GC, лимиты кэша, удаление Base64, очистка File Descriptors)
 """
 
 import os
@@ -143,9 +141,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 "--disable-gpu",
                 "--disable-software-rasterizer",
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=150 --expose-gc", # Снижен лимит и включен ручной сбор мусора
-                "--disable-site-isolation-trials",                 # Радикальная экономия памяти (общий процесс)
-                "--disk-cache-size=5242880",                       # Лимит кэша 5 МБ
+                "--js-flags=--max-old-space-size=150 --expose-gc",
+                "--disable-site-isolation-trials",                 # Экономия памяти
+                "--disk-cache-size=5242880",                       # Лимит кэша
                 "--disable-blink-features=AutomationControlled",
                 "--disable-extensions",
                 "--disable-background-networking",
@@ -192,7 +190,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email (НАДЕЖНЫЙ ПОИСК + БУЛЬДОЗЕРНЫЙ КЛИК) ──
+            # ── 3. Email (НАДЕЖНЫЙ ВВОД ИЗ РАБОЧИХ ВЕРСИЙ) ──
             try:
                 print("Adobe: ждем появление поля email...")
                 email_target = None
@@ -210,12 +208,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     print("Adobe: видимое поле email найдено. Вводим...")
                     await email_target.click(force=True)
                     await asyncio.sleep(0.5)
-                    await email_target.evaluate("node => node.value = ''")
-                    await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
+                    # Используем надежный .fill(force=True) вместо JS-костылей
+                    await email_target.fill(ADOBE_EMAIL.strip(), force=True)
                     await asyncio.sleep(1)
                     
                     print("Adobe: Жмем Enter...")
-                    await page.keyboard.press("Enter")
+                    await email_target.press("Enter")
                     await asyncio.sleep(6)
                     await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
                 else:
@@ -272,7 +270,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Пароль (НАДЕЖНЫЙ ПОИСК + БУЛЬДОЗЕРНЫЙ КЛИК) ──
+            # ── 6. Пароль (НАДЕЖНЫЙ ВВОД) ──
             try:
                 print("Adobe: ждем появление поля пароля...")
                 pwd_target = None
@@ -290,12 +288,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     print("Adobe: поле пароля найдено. Вводим...")
                     await pwd_target.click(force=True)
                     await asyncio.sleep(0.5)
-                    await pwd_target.evaluate("node => node.value = ''")
-                    await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
+                    # Используем надежный .fill(force=True)
+                    await pwd_target.fill(ADOBE_PASSWORD.strip(), force=True)
                     await asyncio.sleep(1)
                     
                     print("Adobe: Жмем Enter...")
-                    await page.keyboard.press("Enter")
+                    await pwd_target.press("Enter")
                     await asyncio.sleep(8)
                     await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
                 else:
@@ -303,7 +301,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception as e:
                 print(f"Adobe password error: {str(e)[:100]}")
 
-            gc.collect() # Очистка перед переходом в студию
+            gc.collect() # Очистка памяти перед переходом в студию
 
             # ── 7. Промежуточные экраны ──
             for _ in range(10):
@@ -382,8 +380,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     );
                 }}""")
                 uploaded = True
-                # Мгновенная очистка тяжелой строки из памяти
-                del b64 
+                del b64 # Освобождаем память от тяжелой строки
                 gc.collect()
 
             await asyncio.sleep(3)
@@ -404,7 +401,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             for i in range(36):
                 await asyncio.sleep(5)
                 
-                # Внедряем очистку мусора во время простоя (OOM Fix)
+                # Сборщик мусора во время простоя (OOM Fix)
                 try:
                     await page.evaluate("try { window.gc(); } catch(e) {}")
                 except Exception:
@@ -607,7 +604,6 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async def notify(path, caption):
             try:
                 if os.path.exists(path):
-                    # Использование with open предотвращает утечку файловых дескрипторов
                     with open(path, "rb") as f:
                         await update.message.reply_photo(photo=f, caption=f"ℹ️ {caption}")
             except Exception: pass
@@ -628,7 +624,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text("✍️ GPT-4o заголовок...")
         title, desc = generate_metadata(text)
         
-        del text # Освобождение памяти от большой строки транскрипта
+        del text 
         gc.collect()
 
         pending[uid] = {"mp3": studio, "title": title, "description": desc}
