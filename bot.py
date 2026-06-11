@@ -1,8 +1,9 @@
 """
-Podcast Bot v3.27 — The Tank Login
-- Возвращены расширенные селекторы для поиска полей почты и пароля (устранена "слепота" бота)
-- Внедрено "смертельное комбо" для ввода: focus() -> click(force=True) -> Ctrl+A -> Backspace -> type()
-- Сохранена полная асинхронность и экономия памяти
+Podcast Bot v3.28 — JS Force Focus
+- Обход ошибки Timeout exceeded на Locator.focus()
+- Использование принудительного JavaScript фокуса (node.focus()), который игнорирует невидимые слои загрузки
+- Сохранено "смертельное комбо" для React: JS focus -> Click force -> Ctrl+A -> Backspace -> Type
+- Полная экономия памяти и асинхронность сохранены
 """
 
 import os
@@ -196,12 +197,11 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email (РАСШИРЕННЫЙ ПОИСК + КОМБО КЛИК) ──
+            # ── 3. Email (РАСШИРЕННЫЙ ПОИСК + JS ФОКУС) ──
             try:
                 print("Adobe: ждем появление поля email (до 30 сек)...")
                 email_target = None
                 for _ in range(30):
-                    # Вернули расширенный поиск, чтобы точно найти поле
                     inputs = await page.locator('input[type="email"], input[name="username"], input[id*="email" i], input[name="email" i]').all()
                     for inp in inputs:
                         if await inp.is_visible():
@@ -213,10 +213,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
                 if email_target:
                     print("Adobe: видимое поле email найдено. Вводим...")
-                    await email_target.focus()
+                    # Принудительный фокус через JS, обходит любые перекрывающие слои
+                    await email_target.evaluate("node => node.focus()")
                     await asyncio.sleep(0.5)
                     await email_target.click(force=True)
                     await asyncio.sleep(0.5)
+                    
                     # Выделяем и удаляем мусор, затем печатаем
                     await page.keyboard.press("Control+A")
                     await page.keyboard.press("Backspace")
@@ -263,7 +265,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     
                     if first_input:
                         print("Adobe: фокусируемся на поле кода...")
-                        await first_input.focus()
+                        await first_input.evaluate("node => node.focus()")
                         await asyncio.sleep(0.5)
                         await first_input.click(force=True)
                         await page.keyboard.type(code, delay=150)
@@ -285,7 +287,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Пароль (РАСШИРЕННЫЙ ПОИСК + КОМБО КЛИК) ──
+            # ── 6. Пароль (РАСШИРЕННЫЙ ПОИСК + JS ФОКУС) ──
             try:
                 print("Adobe: ждем появление поля пароля (до 30 сек)...")
                 pwd_target = None
@@ -301,10 +303,11 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
                 if pwd_target:
                     print("Adobe: поле пароля найдено. Фокусируемся...")
-                    await pwd_target.focus()
+                    await pwd_target.evaluate("node => node.focus()")
                     await asyncio.sleep(0.5)
                     await pwd_target.click(force=True)
                     await asyncio.sleep(0.5)
+                    
                     await page.keyboard.press("Control+A")
                     await page.keyboard.press("Backspace")
                     await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
