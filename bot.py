@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.14 — The Honeypot Bypass
-- Поиск только физически ВИДИМЫХ полей (обход невидимых ловушек Adobe)
-- Безопасный ввод через fill()
-- Использование Enter для 100% срабатывания React
+Podcast Bot v3.15 — The Interstitial Killer
+- Принудительное нажатие "Remind me later" / "Напомнить позже"
+- Жесткая проверка наличия кнопки "Choose files" перед началом загрузки
+- Обход невидимых ловушек (Honeypot Bypass)
 """
 
 import os
@@ -165,7 +165,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             # ── 3. Вводим email (ОБХОД НЕВИДИМЫХ ЛОВУШЕК) ──
             print("Adobe: ищем ВИДИМОЕ поле email...")
             email_target = None
-            # Даем странице 8 секунд на отрисовку
             for _ in range(8):
                 inputs = await page.locator('input[type="email"], input[name="username"]').all()
                 for inp in inputs:
@@ -180,10 +179,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 print("Adobe: видимое поле email найдено. Вводим...")
                 await email_target.click()
                 await asyncio.sleep(0.5)
-                # Надежный ввод для React
                 await email_target.fill(ADOBE_EMAIL.strip())
                 await asyncio.sleep(1)
-
                 print("Adobe: Жмем Enter...")
                 await email_target.press("Enter")
                 await asyncio.sleep(4)
@@ -263,26 +260,35 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(0.5)
                 await pwd_target.fill(ADOBE_PASSWORD.strip())
                 await asyncio.sleep(1)
-                
                 print("Adobe: Жмем Enter...")
                 await pwd_target.press("Enter")
                 await asyncio.sleep(6)
             else:
                 print("Adobe: Видимое поле пароля не появилось.")
 
-            # Закрываем промежуточные экраны
-            for _ in range(10):
-                try:
+            # ── 6.5 ОБХОД НАВЯЗЧИВЫХ ЭКРАНОВ БЕЗОПАСНОСТИ (Remind me later) ──
+            print("Adobe: Проверка на промежуточные экраны (Remind me later)...")
+            try:
+                for _ in range(8):
+                    remind_btn = page.locator('button:has-text("Remind me later"), button:has-text("Напомнить позже")').first
+                    if await remind_btn.count() > 0 and await remind_btn.is_visible():
+                        print("Adobe: Жмем 'Remind me later'...")
+                        await remind_btn.click(force=True)
+                        await asyncio.sleep(4)
+                        break
+                        
+                    # Расширенный кликер для других всплывающих окон
                     await page.evaluate("""() => {
                         const btn = [...document.querySelectorAll('button,a')]
-                            .find(e => /not now|skip|пропустить|continue|продолжить/i.test(e.innerText?.trim()));
+                            .find(e => /not now|skip|пропустить|continue|продолжить|remind me later|напомнить позже/i.test(e.innerText?.trim()));
                         if (btn) btn.click();
                     }""")
-                except Exception:
-                    pass
-                if "enhance" in page.url:
-                    break
-                await asyncio.sleep(1)
+                    
+                    if "enhance" in page.url and await page.locator('text=/Choose files/i').count() > 0:
+                        break
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
 
             if "enhance" not in page.url:
                 await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
@@ -290,9 +296,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(4)
 
             # ── ЗАЩИТА ОТ СЛЕПОТЫ ПЕРЕД ЗАГРУЗКОЙ ──
-            if await page.locator('input[type="email"],input[name="username"]').count() > 0 or await page.locator('text=/Sign in/i').count() > 2:
-                await shot("/tmp/adobe_error.png", "❌ Бот застрял на экране авторизации!")
-                raise RuntimeError("Ошибка авторизации: не удалось войти (возможно, форма зависла).")
+            # Строгая проверка: если мы не видим интерфейс с кнопкой "Choose files" или инпутом, значит мы где-то застряли
+            if await page.locator('text=/Choose files/i').count() == 0 and await page.locator('input[type="file"]').count() == 0:
+                await shot("/tmp/adobe_error.png", "❌ Бот не видит интерфейс загрузки!")
+                raise RuntimeError("Ошибка: Бот не дошел до экрана 'Enhance' (вероятно, завис на экране безопасности).")
 
             # СОХРАНЕНИЕ СЕССИИ (КУКИ)
             await ctx.storage_state(path=STATE_FILE)
