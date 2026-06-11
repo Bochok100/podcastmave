@@ -122,14 +122,19 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
         browser = await pw.chromium.launch(
             headless=False,
             args=[
-                "--no-sandbox", 
+                "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu", 
+                "--disable-gpu",
                 "--disable-software-rasterizer",
+                "--single-process",           # один процесс — меньше памяти
                 "--renderer-process-limit=1",
-                "--js-flags=--max-old-space-size=256",
-                "--disable-blink-features=AutomationControlled"
+                "--js-flags=--max-old-space-size=200",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--no-first-run",
             ]
         )
         
@@ -459,11 +464,16 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
         browser = await pw.chromium.launch(
             headless=True, 
             args=[
-                "--no-sandbox", 
-                "--disable-setuid-sandbox", 
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--renderer-process-limit=1"
+                "--single-process",
+                "--renderer-process-limit=1",
+                "--js-flags=--max-old-space-size=200",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--no-first-run",
             ]
         )
         ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
@@ -590,6 +600,15 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         studio = await enhance_audio(mp3, uid, notify)
 
+        # Удаляем исходные файлы — освобождаем место на диске
+        for _f in [ogg, mp3]:
+            try:
+                if _f.exists() and str(_f) != str(studio):
+                    _f.unlink()
+            except Exception:
+                pass
+
+
         await msg.edit_text("📝 Whisper транскрипция...")
         text = transcribe(studio)
 
@@ -630,6 +649,13 @@ async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ Загружаю в mave...")
     try:
         await upload_to_mave(data["mp3"], data["title"], data["description"])
+        try:
+            mp3_path = Path(data["mp3"])
+            if mp3_path.exists():
+                mp3_path.unlink()
+                print(f"Удалён MP3: {mp3_path.name}")
+        except Exception:
+            pass
         caption = f"✅ *Опубликовано!*\n\n_{data['title']}_"
         if os.path.exists("/tmp/mave_done.png"):
             await q.message.reply_photo(photo=open("/tmp/mave_done.png", "rb"), caption=caption, parse_mode=ParseMode.MARKDOWN)
