@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.19 — The Safe Click
-- Перебор всех input с проверкой is_visible() перед кликом (защита от зависания на невидимых полях)
-- Надежный тайпинг 2FA
-- Принудительная сборка мусора (OOM Fix)
+Podcast Bot v3.18 — The Diet Update (OOM Fix)
+- Mave переведен в headless=True для экономии ~150MB RAM
+- Добавлены жесткие лимиты памяти для Chromium (--renderer-process-limit=1, --js-flags)
+- Принудительная сборка мусора (gc.collect()) после каждого этапа
 """
 
 import os
@@ -221,22 +221,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     
                     await shot("/tmp/adobe_last.png", f"⏳ Начинаю вводить полученный код ({code[:2]}***)...")
                     
-                    # УМНЫЙ ПЕРЕБОР: ищем только видимое поле, чтобы не зависнуть
-                    print("Adobe: Ищем видимую ячейку для кода...")
-                    clicked = False
-                    for _ in range(5):
-                        all_inputs = await page.locator('input').all()
-                        for inp in all_inputs:
-                            try:
-                                if await inp.is_visible() and await inp.is_editable():
-                                    await inp.click(force=True, timeout=3000)
-                                    clicked = True
-                                    break
-                            except:
-                                pass
-                        if clicked:
-                            break
-                        await asyncio.sleep(1)
+                    first_input = page.locator('input:not([type="hidden"])').first
+                    await first_input.click(force=True)
+                    await asyncio.sleep(0.5)
                     
                     print("Adobe: Впечатываем код...")
                     await page.keyboard.type(code, delay=150)
@@ -246,7 +233,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         print("Adobe: Жмем Enter для 2FA...")
                         await page.keyboard.press("Enter")
                     
-                    for _ in range(15):
+                    for _ in range(12):
                         await asyncio.sleep(1)
                         if await page.locator('input[type="password"]').count() > 0:
                             break
@@ -432,16 +419,18 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception: pass
             raise RuntimeError(f"Adobe: {e}")
         finally:
+            # ОЧИСТКА ПАМЯТИ
             try:
                 if 'ctx' in locals(): await ctx.close()
                 if 'page' in locals() and not page.is_closed(): await page.close()
             except: pass
             await browser.close()
-            gc.collect()
+            gc.collect() # Собираем мусор Python
 
 # ── mave.digital ───────────────────────────────
 async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
     async with async_playwright() as pw:
+        # Для Mave графика не нужна, запускаем headless=True (экономит ~150МБ RAM)
         browser = await pw.chromium.launch(
             headless=True, 
             args=[
