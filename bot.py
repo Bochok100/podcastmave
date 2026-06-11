@@ -1,8 +1,9 @@
 """
-Podcast Bot v3.46 — The Banner Fix
-- ИСПРАВЛЕН КРИТИЧЕСКИЙ БАГ (False Positive): удалена проверка на слова "didn't receive" в HTML, из-за которой бот убивал сам себя, видя синий баннер-подсказку от Adobe.
-- Оптимизирован ввод 2FA: бот кликает в ПЕРВУЮ ячейку и печатает код как человек (с задержкой 250мс). Скрипты Adobe сами раскидывают цифры по остальным 5 ячейкам.
-- Сохранена рабочая выгрузка файла (v3.41).
+Podcast Bot v3.47 — The Auth Link
+- Устранен баг "молчаливого зависания" на стартовом экране.
+- Клик по Sign In переписан на поиск скрытой системной ссылки (href *auth.services*), что делает его независимым от языка и видимости кнопки.
+- Добавлен Fast-Fail: если переход на логин не удался, бот немедленно выдает ошибку, а не ждет поля ввода по 3 минуты.
+- Сохранен фикс 2FA (v3.46) и прямой инжект аудиофайлов.
 """
 
 import os
@@ -11,7 +12,6 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
-import threading
 import time
 import base64
 import gc
@@ -93,9 +93,8 @@ async def download_voice(update, context) -> Path:
     voice = update.message.voice or update.message.audio
     f = await context.bot.get_file(voice.file_id)
     
-    # БЕЗОПАСНОЕ СОЗДАНИЕ ВРЕМЕННОГО ФАЙЛА (без блокировки)
     fd, path = tempfile.mkstemp(suffix=".ogg")
-    os.close(fd) # Обязательно закрываем дескриптор
+    os.close(fd) 
     
     print(f"Скачиваем аудио в {path}...")
     await f.download_to_drive(path)
@@ -197,17 +196,42 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Старый добрый клик по Sign In ──
-            print("Adobe: Нажимаем Sign In...")
-            try:
-                await page.evaluate("""() => {
-                    const el = [...document.querySelectorAll('a,button')]
-                        .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
-                    if (el) el.click();
-                }""")
-                await asyncio.sleep(5)
-            except Exception:
-                pass
+            # ── 2. Умный клик по Sign In (АБСОЛЮТНАЯ НАДЕЖНОСТЬ) ──
+            print("Adobe: Ищем и нажимаем ссылку Sign In...")
+            auth_reached = False
+            for attempts in range(3):
+                try:
+                    await page.evaluate("""() => {
+                        // Ищем ссылку, которая ведет на сервер авторизации (самый надежный способ)
+                        const authLink = Array.from(document.querySelectorAll('a')).find(a => a.href && (a.href.includes('auth.services') || a.href.includes('login') || a.href.includes('signin')));
+                        if (authLink) {
+                            authLink.click();
+                            return;
+                        }
+                        // Резервный поиск по тексту
+                        const el = [...document.querySelectorAll('a,button')]
+                            .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
+                        if (el) el.click();
+                    }""")
+                except Exception:
+                    pass
+                
+                # Даем время на загрузку и проверяем URL
+                for _ in range(6):
+                    await asyncio.sleep(1)
+                    if "auth" in page.url or "login" in page.url or "signin" in page.url:
+                        auth_reached = True
+                        break
+                
+                if auth_reached:
+                    break
+            
+            # ЖЕСТКИЙ СТОП, ЕСЛИ КЛИК НЕ СРАБОТАЛ
+            if not auth_reached:
+                await shot("/tmp/adobe_error.png", "❌ Adobe: Кнопка 'Sign In' не сработала. Интерфейс не пускает на логин.")
+                raise RuntimeError("Сбой навигации: не удалось перейти на страницу авторизации Adobe.")
+
+            print(f"Adobe: Успешно перешли на логин. URL: {page.url}")
 
             # ── 3. Email ──
             try:
@@ -298,7 +322,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             break
                     if step == "code_2fa": break
 
-            # ── 6. Ввод 2FA кода (THE BANNER FIX) ──
+            # ── 6. Ввод 2FA кода ──
             if step == "code_2fa":
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда обычным текстом (3 минуты).")
                 ev = asyncio.Event()
@@ -316,7 +340,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     
                     if len(visible_inputs) > 0:
                         print("Adobe: Найдено поле(я) 2FA. Вводим код в первую ячейку...")
-                        # Вводим ВЕСЬ код в первую ячейку с задержкой. Скрипт Adobe сам раскидает его по остальным.
                         await visible_inputs[0].click(force=True)
                         await visible_inputs[0].press_sequentially(code, delay=250)
                     else:
@@ -341,7 +364,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         if password_found: break
                         
                         html = await page.content()
-                        # 🔥 УДАЛЕН ТОКСИЧНЫЙ "didn't receive" 🔥
                         if "inválido" in html.lower() or "invalid" in html.lower() or "incorrect" in html.lower() or "wrong" in html.lower():
                             await shot("/tmp/adobe_error.png", "❌ Adobe не принял код. Запусти заново.")
                             raise RuntimeError("Adobe не принял код")
