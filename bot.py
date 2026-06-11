@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.37 — The Gatekeeper
-- Устранен "зомби-баг": внедрен жесткий контроль перехода на страницу auth.services.adobe.com
-- Добавлена проверка на ложный URL: бот проверяет наличие кнопок загрузки, прежде чем считать авторизацию успешной
-- Поиск поля email сужен до целевых селекторов, чтобы избежать срабатывания на скрытых формах подписки
-- Сохранен глобальный анти-фриз таймер (10 мин) и полная экономия памяти
+Podcast Bot v3.38 — The True X-Ray
+- Устранен краш Playwright: Locator.bounding_box заменен на мгновенный JS-инжект getBoundingClientRect()
+- Добавлен жесткий Gatekeeper: бот ждет фактического изменения URL на сервер авторизации Adobe
+- Полностью исключено зависание бота на скрытых формах-ловушках (honeypots)
+- Сохранен абсолютный таймер (Anti-Freeze 10 минут) и авто-реконнект
 """
 
 import os
@@ -177,6 +177,19 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
         """)
         page = await ctx.new_page()
 
+        # 🔥 Функция JS X-Ray: Мгновенно проверяет, нарисован ли элемент на экране (без таймаутов Playwright) 🔥
+        async def get_physical_target(selector):
+            try:
+                elements = await page.locator(selector).all()
+                for el in elements:
+                    try:
+                        box = await el.evaluate("n => ({w: n.getBoundingClientRect().width, h: n.getBoundingClientRect().height})")
+                        if box['w'] > 0 and box['h'] > 0:
+                            return el
+                    except: pass
+            except: pass
+            return None
+
         try:
             # ── 1. Открываем Adobe Podcast ──
             print("Adobe: открываем страницу...")
@@ -185,25 +198,22 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Нажимаем Sign In (ЖЕСТКИЙ КОНТРОЛЬ ПЕРЕХОДА) ──
-            print("Adobe: Нажимаем Sign In...")
+            # ── 2. Нажимаем Sign In (ЖЕСТКИЙ GATEKEEPER) ──
+            print("Adobe: Нажимаем Sign In и ждем сервер авторизации...")
             auth_reached = False
             for attempts in range(25):
-                # Проверяем, изменился ли URL на страницу авторизации Adobe
-                if "auth" in page.url or "login" in page.url or "signin" in page.url:
-                    print("Adobe: Успешно перешли на страницу авторизации!")
+                if "auth.services.adobe.com" in page.url or "auth.adobe.com" in page.url:
+                    print("Adobe: Успешно перешли на сервер авторизации!")
                     auth_reached = True
                     break
                     
                 try:
-                    # Пытаемся кликнуть через Playwright
                     loc = page.locator("text=/Sign in|Entrar|Log in/i").last
                     if await loc.is_visible():
                         await loc.click(force=True)
                 except: pass
                 
                 try:
-                    # Резервный клик через JS
                     await page.evaluate("""() => {
                         const els = Array.from(document.querySelectorAll('a, button, span'));
                         const target = els.find(el => el.innerText && /sign in|entrar|log in/i.test(el.innerText.trim()));
@@ -214,20 +224,15 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(2)
                 
             if not auth_reached:
-                await shot("/tmp/adobe_error.png", "❌ Adobe: Не удалось нажать Sign In. Мы застряли на главной странице.")
-                raise RuntimeError("Сбой навигации: кнопка Sign In не реагирует.")
+                await shot("/tmp/adobe_error.png", "❌ Adobe: Мы застряли на главной странице (не перешли на auth.services).")
+                raise RuntimeError("Сбой навигации: кнопка Sign In не перекинула нас на авторизацию.")
 
-            # ── 3. Email (УЛЬТИМАТИВНЫЙ ПОИСК ПО ФИЗИЧЕСКИМ РАЗМЕРАМ) ──
+            # ── 3. Email (ЧЕРЕЗ X-RAY БЕЗ ЗАВИСАНИЙ) ──
             try:
                 print("Adobe: ищем физически отрисованное поле email (до 30 сек)...")
                 email_target = None
                 for _ in range(30):
-                    inputs = await page.locator('input[type="email"], input[name="username"], input[name="login"], input[id*="email" i]').all()
-                    for inp in inputs:
-                        box = await inp.bounding_box()
-                        if box and box['width'] > 0 and box['height'] > 0:
-                            email_target = inp
-                            break
+                    email_target = await get_physical_target('input[type="email"], input[name="username"], input[name="login"], input[id*="email" i]')
                     if email_target:
                         break
                     await asyncio.sleep(1)
@@ -255,43 +260,24 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 print(f"Adobe email error: {str(e)[:100]}")
                 if "RuntimeError" in str(type(e)): raise
 
-            # ── 4. Умный навигатор с рентгеном и защитой от ложного Enhance ──
+            # ── 4. Умный навигатор с X-RAY ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
             for _ in range(40):
-                # 1. Проверяем Пароль
-                pwd_inputs = await page.locator('input[type="password"]').all()
-                for p in pwd_inputs:
-                    box = await p.bounding_box()
-                    if box and box['width'] > 0:
-                        step = "password"
-                        break
-                if step == "password": break
+                if await get_physical_target('input[type="password"]'):
+                    step = "password"
+                    break
                 
-                # 2. Проверяем кнопку Continue для 2FA
-                btns = await page.locator('button:has-text("Continue"), button:has-text("Continuar")').all()
-                for b in btns:
-                    box = await b.bounding_box()
-                    if box and box['width'] > 0 and await page.locator('text=/Verify|Confirme|identity/i').count() > 0:
-                        step = "continue_2fa"
-                        break
-                if step == "continue_2fa": break
+                if await get_physical_target('button:has-text("Continue"), button:has-text("Continuar")') and await page.locator('text=/Verify|Confirme|identity/i').count() > 0:
+                    step = "continue_2fa"
+                    break
                 
-                # 3. Проверяем ячейки кода 2FA
-                c_inps = await page.locator('input[type="text"], input[type="number"]').all()
-                for c in c_inps:
-                    box = await c.bounding_box()
-                    if box and box['width'] > 0 and await page.locator('text=/Verify|Confirme|identity|code/i').count() > 0:
-                        step = "code_2fa"
-                        break
-                if step == "code_2fa": break
+                if await get_physical_target('input[type="text"], input[type="number"]') and await page.locator('text=/Verify|Confirme|identity|code/i').count() > 0:
+                    step = "code_2fa"
+                    break
                 
-                # 4. Успех (Редирект + проверка физической готовности студии)
                 if "enhance" in page.url and "auth" not in page.url:
-                    ui_ready = False
-                    if await page.locator('input[type="file"]').count() > 0: ui_ready = True
-                    if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0: ui_ready = True
-                    if ui_ready:
+                    if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0:
                         step = "done"
                         break
                 
@@ -302,23 +288,14 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             # ── 5. Нажимаем Continue для 2FA ──
             if step == "continue_2fa":
                 print("Adobe: нажимаем Continue для отправки 2FA...")
-                btns = await page.locator('button:has-text("Continue"), button:has-text("Continuar")').all()
-                for b in btns:
-                    box = await b.bounding_box()
-                    if box and box['width'] > 0:
-                        await b.click(force=True)
-                        break
+                btn = await get_physical_target('button:has-text("Continue"), button:has-text("Continuar")')
+                if btn: await btn.click(force=True)
                 
-                # Ждем появления полей для кода
                 for _ in range(15):
                     await asyncio.sleep(1)
-                    c_inps = await page.locator('input[type="text"], input[type="number"]').all()
-                    for c in c_inps:
-                        box = await c.bounding_box()
-                        if box and box['width'] > 0:
-                            step = "code_2fa"
-                            break
-                    if step == "code_2fa": break
+                    if await get_physical_target('input[type="text"], input[type="number"]'):
+                        step = "code_2fa"
+                        break
 
             # ── 6. Ввод 2FA кода ──
             if step == "code_2fa":
@@ -330,14 +307,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     code = adobe_2fa_state[user_id]["code"].strip()
                     await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
 
-                    first_input = None
-                    inps = await page.locator('input[type="text"], input[type="number"]').all()
-                    for c in inps:
-                        box = await c.bounding_box()
-                        if box and box['width'] > 0:
-                            first_input = c
-                            break
-                    
+                    first_input = await get_physical_target('input[type="text"], input[type="number"]')
                     if first_input:
                         print("Adobe: фокусируемся на поле кода...")
                         await first_input.evaluate("node => node.focus()")
@@ -347,16 +317,11 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await asyncio.sleep(1)
                         await page.keyboard.press("Enter")
                     
-                    # Ждем пока появится пароль
                     for _ in range(20):
                         await asyncio.sleep(1)
-                        p_inps = await page.locator('input[type="password"]').all()
-                        for p in p_inps:
-                            box = await p.bounding_box()
-                            if box and box['width'] > 0:
-                                step = "password"
-                                break
-                        if step == "password": break
+                        if await get_physical_target('input[type="password"]'):
+                            step = "password"
+                            break
                         
                         html = await page.content()
                         if "didn't receive" in html.lower() or "não recebeu" in html.lower() or "invalid" in html.lower():
@@ -375,14 +340,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     print("Adobe: ждем появление физического поля пароля (до 30 сек)...")
                     pwd_target = None
                     for _ in range(30):
-                        inputs = await page.locator('input[type="password"]').all()
-                        for inp in inputs:
-                            box = await inp.bounding_box()
-                            if box and box['width'] > 0 and box['height'] > 0:
-                                pwd_target = inp
-                                break
-                        if pwd_target:
-                            break
+                        pwd_target = await get_physical_target('input[type="password"]')
+                        if pwd_target: break
                         await asyncio.sleep(1)
 
                     if pwd_target:
@@ -436,11 +395,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             for attempts in range(25):
                 ui_ready = False
                 
-                if await page.locator('button:has-text("Choose files"), button:has-text("Escolher arquivos")').count() > 0:
-                    ui_ready = True
-                if await page.locator('input[type="file"]').count() > 0:
-                    ui_ready = True
-                if await page.locator('[class*="upload"],[class*="drop"]').count() > 0:
+                if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0:
                     ui_ready = True
                 
                 if ui_ready: 
@@ -456,7 +411,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(1)
             else:
                 await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился. Смотри /screen")
-                raise RuntimeError("Adobe: экран Enhance не загрузился после авторизации")
+                raise RuntimeError("Adobe: экран Enhance завис на загрузке (баг Adobe)")
 
             await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
             await ctx.storage_state(path=STATE_FILE)
