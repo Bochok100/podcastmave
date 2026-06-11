@@ -1,9 +1,8 @@
 """
-Podcast Bot v4.0 — The State Machine Engine
-- АРХИТЕКТУРНЫЙ РЕФАКТОРИНГ: Линейная логика авторизации заменена на "Конечный автомат" (State Machine). Бот глобально оценивает экран каждые 2 секунды и динамически реагирует на активные элементы.
-- Снижена нагрузка на CPU сервера Render на 80% (убраны агрессивные микро-циклы поиска локаторов).
-- SPA Routing: Переход на Sign In осуществляется через прямой парсинг href, игнорируя перекрывающие слои и всплывающие окна.
-- Сохранен лучший механизм загрузки аудио (прямая инъекция File Object) и обход React-защиты при вводе 2FA.
+Podcast Bot v4.1 — The Regex Fix
+- ИСПРАВЛЕНА СИНТАКСИЧЕСКАЯ ОШИБКА: флаг игнорирования регистра (?i) заменен на нативный re.IGNORECASE, чтобы предотвратить ошибки трансляции Regex в движок JavaScript (V8).
+- Сохранен State Machine Engine: бот оценивает экран и сам решает, что вводить, без линейных таймеров.
+- Сохранен прямой SPA-роутинг и обход React-защиты 2FA.
 """
 
 import os
@@ -200,7 +199,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             print("Adobe: Запуск State Machine Engine...")
             auth_success = False
 
-            # Максимум 40 циклов по ~2 секунды (хватит даже для самого медленного интернета)
             for step_attempts in range(40):
                 url = page.url
                 html = await page.content()
@@ -213,7 +211,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     break
 
                 # СТАТУС 2: Пропуск промежуточных экранов (Skip, Not Now)
-                skip_btn = page.locator('button, a').filter(has_text=re.compile("(?i)^not now$|^skip$|^remind me later$|^lembrar depois$|^pular$")).first
+                skip_btn = page.locator('button, a').filter(has_text=re.compile(r"^not now$|^skip$|^remind me later$|^lembrar depois$|^pular$", re.IGNORECASE)).first
                 if await skip_btn.is_visible():
                     print("Adobe: Пропускаем промежуточный экран...")
                     await skip_btn.click(force=True)
@@ -221,10 +219,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     continue
 
                 # СТАТУС 3: Требуется нажать Sign In (если мы на главной)
-                sign_btn = page.locator('a, button').filter(has_text=re.compile("(?i)sign in|entrar|log in")).first
+                sign_btn = page.locator('a, button').filter(has_text=re.compile(r"sign in|entrar|log in", re.IGNORECASE)).first
                 if await sign_btn.is_visible() and "auth" not in url and "login" not in url:
                     print("Adobe: Нажимаем Sign In...")
-                    # Прямой SPA-роутинг: извлекаем URL и переходим жестко
                     auth_url = await page.evaluate("""() => {
                         const link = Array.from(document.querySelectorAll('a')).find(a => a.href && (a.href.includes('auth.services') || a.href.includes('login')));
                         return link ? link.href : null;
@@ -273,7 +270,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     continue
 
                 # СТАТУС 6: Кнопка Continue (Иногда появляется перед отправкой кода 2FA)
-                continue_btn = page.locator('button').filter(has_text=re.compile("(?i)^Continue$|^Continuar$")).first
+                continue_btn = page.locator('button').filter(has_text=re.compile(r"^Continue$|^Continuar$", re.IGNORECASE)).first
                 if await continue_btn.is_visible() and ("verify" in html.lower() or "confirme" in html.lower()):
                     print("Adobe: Нажимаем Continue для отправки 2FA...")
                     await continue_btn.click(force=True)
@@ -296,7 +293,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             print("Adobe: Ввод 2FA в 6 ячеек (Обход React)...")
                             for i in range(6):
                                 try:
-                                    # Запрашиваем элементы заново перед каждой цифрой
                                     target = page.locator('input[type="text"], input[type="number"], input[type="tel"]').nth(i)
                                     await target.click(force=True)
                                     await asyncio.sleep(0.1)
@@ -314,7 +310,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await asyncio.sleep(3)
                         
                         # Нажатие кнопки подтверждения
-                        verify_btn = page.locator('button').filter(has_text=re.compile("(?i)^Verify$|^Verificar$|^Submit$")).first
+                        verify_btn = page.locator('button').filter(has_text=re.compile(r"^Verify$|^Verificar$|^Submit$", re.IGNORECASE)).first
                         if await verify_btn.is_visible():
                             await verify_btn.click(force=True)
                         else:
@@ -324,7 +320,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         
                         # Проверка на отторжение кода
                         html_after = await page.content()
-                        if re.search(r"(?i)inválido|invalid|incorrect|wrong|неверный", html_after):
+                        if re.search(r"inválido|invalid|incorrect|wrong|неверный", html_after, re.IGNORECASE):
                             await shot("/tmp/adobe_error.png", "❌ Adobe: Неверный код 2FA. Запусти заново.")
                             raise RuntimeError("Adobe не принял код 2FA.")
 
@@ -364,7 +360,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             if not uploaded:
                 try:
                     async with page.expect_file_chooser(timeout=8000) as fc_info:
-                        btn = page.locator('button').filter(has_text=re.compile("(?i)Choose files|Escolher arquivos")).first
+                        btn = page.locator('button').filter(has_text=re.compile(r"Choose files|Escolher arquivos", re.IGNORECASE)).first
                         await btn.click(force=True)
                     fc = await fc_info.value
                     await fc.set_files(str(mp3), timeout=15000)
@@ -408,7 +404,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             for frame in page.frames:
                 for txt in ["Enhance speech", "Enhance", "Melhorar"]:
                     try:
-                        btn = frame.locator('button').filter(has_text=re.compile(f"(?i){txt}")).first
+                        btn = frame.locator('button').filter(has_text=re.compile(txt, re.IGNORECASE)).first
                         if await btn.count() > 0:
                             await asyncio.wait_for(btn.click(force=True), timeout=5.0)
                             break
@@ -427,7 +423,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 gc.collect()
 
                 for frame in page.frames:
-                    b = frame.locator('button, a').filter(has_text=re.compile("(?i)^Download$|^Baixar$")).last
+                    b = frame.locator('button, a').filter(has_text=re.compile(r"^Download$|^Baixar$", re.IGNORECASE)).last
                     if await b.count() > 0 and await b.is_visible():
                         dl_btn = b
                         break
