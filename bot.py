@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.5 — Human Typing Auth + Session Persistence
-- Имитация реальной клавиатуры (page.keyboard.type) для обхода защиты React
-- JS focus() для предотвращения зависания при скролле
-- Сохранение куки (сессии) в adobe_state.json
+Podcast Bot v3.6 — Native Fill + No Scroll Clicks
+- Возвращен нативный .fill(force=True) для корректной работы React
+- Убраны все .click(force=True), вызывавшие зависания скролла (заменены на JS click)
+- Сохранение сессии для обхода 2FA
 """
 
 import os
@@ -159,25 +159,22 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Вводим email (Human Typing + Focus) ──
+            # ── 3. Вводим email ──
             try:
                 print("Adobe: ищем поле email...")
                 email_field = page.locator('input[type="email"],input[name="username"]').first
                 await email_field.wait_for(state="attached", timeout=10000)
-                print("Adobe: поле email найдено. Печатаем...")
                 
-                # Ставим курсор через JS, чтобы избежать ошибки скролла
-                await email_field.evaluate("node => node.focus()")
-                await asyncio.sleep(0.5)
-                # Печатаем как живой человек
-                await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
+                # Кликаем через JS (без скролла) и заливаем текст нативно
+                await email_field.evaluate("node => node.click()")
+                await email_field.fill(ADOBE_EMAIL.strip(), force=True)
                 await asyncio.sleep(1)
 
                 for sel in ['button:has-text("Continue")', '#btn-id-forward', 'button[type="submit"]']:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
-                            await el.click(force=True)
+                            await el.evaluate("node => node.click()")
                             break
                     except Exception:
                         continue
@@ -191,7 +188,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 btn = page.locator('button:has-text("Continue"),button:has-text("Продолжить")').first
                 if await page.locator('text=/Verify your identity|Подтверждение личности/i').count() > 0:
                     print("Adobe: экран подтверждения — нажимаем Continue...")
-                    await btn.click(force=True)
+                    await btn.evaluate("node => node.click()")
                     await asyncio.sleep(4)
             except Exception:
                 pass
@@ -208,13 +205,13 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     code = adobe_2fa_state[user_id]["code"].strip()
                     
                     code_field = page.locator(code_sel).first
-                    await code_field.evaluate("node => node.focus()")
-                    await page.keyboard.type(code, delay=100)
+                    await code_field.evaluate("node => node.click()")
+                    await code_field.fill(code, force=True)
                     await asyncio.sleep(1)
                     
                     sub = page.locator('button:has-text("Continue"),button:has-text("Submit"),button:has-text("Verify"),button[type="submit"]').first
                     if await sub.count() > 0:
-                        await sub.click(force=True)
+                        await sub.evaluate("node => node.click()")
                     await asyncio.sleep(5)
                     print(f"Adobe: 2FA код отправлен")
                 except asyncio.TimeoutError:
@@ -222,25 +219,22 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (Human Typing + Focus) ──
+            # ── 6. Вводим пароль ──
             try:
                 print("Adobe: ищем поле пароля...")
                 pwd = page.locator('input[type="password"],#password').first
                 await pwd.wait_for(state="attached", timeout=10000)
-                print("Adobe: поле пароля найдено. Печатаем...")
                 
-                # Ставим курсор через JS, чтобы избежать ошибки скролла скрытых полей
-                await pwd.evaluate("node => node.focus()")
-                await asyncio.sleep(0.5)
-                # Печатаем как живой человек
-                await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
+                # Кликаем через JS (без скролла) и заливаем нативно, игнорируя невидимость!
+                await pwd.evaluate("node => node.click()")
+                await pwd.fill(ADOBE_PASSWORD.strip(), force=True)
                 await asyncio.sleep(1)
                 
                 for sel in ['button:has-text("Sign in")', 'button:has-text("Continue")', 'button[type="submit"]']:
                     try:
                         el = page.locator(sel).first
                         if await el.count() > 0:
-                            await el.click(force=True)
+                            await el.evaluate("node => node.click()")
                             break
                     except Exception:
                         continue
