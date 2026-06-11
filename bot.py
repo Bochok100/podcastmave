@@ -1,9 +1,8 @@
 """
-Podcast Bot v3.41 — До загрузки файла (The Perfect Upload)
-- ПОЛНОСТЬЮ СОХРАНЕНА рабочая механика логина (v3.39)
-- Полностью переписан блок загрузки аудио: вместо клика по кнопке (который вешал браузер системным окном) используется прямая инъекция в <input type="file">
-- Добавлены 3 уровня резервной загрузки (Input -> Chooser -> Drag&Drop)
-- Бот обрабатывает португальские элементы (Escolher arquivos), но отчитывается на русском
+Podcast Bot v3.42 — The Tel Fix
+- ИСПРАВЛЕН КРИТИЧЕСКИЙ БАГ: добавлена поддержка полей type="tel", которые Adobe использует для 2FA-кодов.
+- Добавлен жесткий стоп: если после ввода кода 2FA бот не перешел к паролю, он выдаст ошибку, а не пойдет дальше по сценарию.
+- Сохранена безотказная логика загрузки файла (v3.41) и таймеры анти-фриза.
 """
 
 import os
@@ -197,7 +196,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email (Старая механика: is_visible -> click -> type) ──
+            # ── 3. Email ──
             try:
                 print("Adobe: ищем поле email (до 30 сек)...")
                 email_target = None
@@ -231,7 +230,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception as e:
                 print(f"Adobe email error: {str(e)[:100]}")
 
-            # ── 4. Умный навигатор (Что Adobe покажет дальше?) ──
+            # ── 4. Умный навигатор ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
             for _ in range(30):
@@ -249,7 +248,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         break
                 if step == "continue_2fa": break
                 
-                c_inps = await page.locator('input[type="text"], input[type="number"]').all()
+                # 🔥 ИСПРАВЛЕНИЕ: Добавлен input[type="tel"] для 2FA кодов 🔥
+                c_inps = await page.locator('input[type="text"], input[type="number"], input[type="tel"]').all()
                 for c in c_inps:
                     if await c.is_visible() and await page.locator('text=/Verify|Confirme|identity|code/i').count() > 0:
                         step = "code_2fa"
@@ -279,7 +279,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 
                 for _ in range(15):
                     await asyncio.sleep(1)
-                    c_inps = await page.locator('input[type="text"], input[type="number"]').all()
+                    # 🔥 ИСПРАВЛЕНИЕ 🔥
+                    c_inps = await page.locator('input[type="text"], input[type="number"], input[type="tel"]').all()
                     for c in c_inps:
                         if await c.is_visible():
                             step = "code_2fa"
@@ -297,7 +298,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
 
                     first_input = None
-                    inputs = await page.locator('input[type="text"], input[type="number"]').all()
+                    # 🔥 ИСПРАВЛЕНИЕ: Берем любой видимый input (кроме скрытых), чтобы точно найти ячейки type="tel" 🔥
+                    inputs = await page.locator('input:not([type="hidden"])').all()
                     for inp in inputs:
                         if await inp.is_visible():
                             first_input = inp
@@ -311,20 +313,32 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await page.keyboard.type(code, delay=150)
                         await asyncio.sleep(1)
                         await page.keyboard.press("Enter")
+                    else:
+                        print("Adobe: Поле не найдено, печатаем вслепую...")
+                        await page.keyboard.type(code, delay=150)
+                        await asyncio.sleep(1)
+                        await page.keyboard.press("Enter")
                     
+                    # 🔥 ИСПРАВЛЕНИЕ: Жесткий контроль перехода к паролю 🔥
+                    password_found = False
                     for _ in range(20):
                         await asyncio.sleep(1)
                         p_inps = await page.locator('input[type="password"]').all()
                         for p in p_inps:
                             if await p.is_visible():
                                 step = "password"
+                                password_found = True
                                 break
-                        if step == "password": break
+                        if password_found: break
                         
                         html = await page.content()
-                        if "didn't receive" in html.lower() or "não recebeu" in html.lower() or "invalid" in html.lower():
-                            await shot("/tmp/adobe_error.png", "❌ Adobe не принял код. Запусти заново.")
-                            raise RuntimeError("Adobe не принял код")
+                        if "incorrect" in html.lower() or "inválido" in html.lower() or "invalid" in html.lower() or "wrong" in html.lower():
+                            await shot("/tmp/adobe_error.png", "❌ Adobe: Неверный код 2FA. Запусти заново.")
+                            raise RuntimeError("Adobe: Неверный код 2FA")
+                            
+                    if not password_found:
+                        await shot("/tmp/adobe_error.png", "❌ Adobe: Завис после ввода кода 2FA.")
+                        raise RuntimeError("Adobe не перешел к паролю после ввода кода")
 
                     await shot("/tmp/adobe_last.png", f"Adobe: после кода. URL: {page.url}")
                 except asyncio.TimeoutError:
@@ -332,7 +346,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 7. Пароль (Старая механика) ──
+            # ── 7. Пароль ──
             if step == "password":
                 try:
                     print("Adobe: ждем появление поля пароля...")
@@ -424,7 +438,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             print("Adobe: начинаем загрузку файла...")
             uploaded = False
             
-            # Попытка 1: Прямая вставка в невидимый input (Самый надежный способ, не вызывает системных окон)
+            # Попытка 1: Прямая вставка в невидимый input 
             try:
                 file_input = page.locator('input[type="file"]').first
                 await file_input.wait_for(state="attached", timeout=10000)
@@ -448,7 +462,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 except Exception as e:
                     print(f"Adobe: Перехватчик не сработал: {e}")
 
-            # Попытка 3: Экстремальный Drag & Drop (если ничего не помогло)
+            # Попытка 3: Экстремальный Drag & Drop
             if not uploaded:
                 try:
                     with open(mp3, "rb") as f:
