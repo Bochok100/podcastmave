@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.16 — The Anti-Freeze 2FA
-- Защита от зависания на вводе 2FA (один клик + слепая печать)
-- Добавлены скриншоты-чекпоинты после получения кода от пользователя
-- Усиленная логика нажатия Continue перед 2FA
+Podcast Bot v3.17 — Password Screen Transition Fix
+- Умный переход: если после 2FA мгновенно появляется пароль, бот не жмет лишний раз Enter
+- Очистка поля пароля (.fill("")) перед вводом для защиты от случайных нажатий
+- Улучшен детектор ошибок 2FA
 """
 
 import os
@@ -200,7 +200,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         break
                 await asyncio.sleep(1)
 
-            # ── 5. Ввод 2FA кода (ИСПРАВЛЕНО ОТ ЗАВИСАНИЯ) ──
+            # ── 5. Ввод 2FA кода ──
             if await page.locator('text=/Verify your identity|Confirm your number/i').count() > 0:
                 print("Adobe: нужен 2FA код...")
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты/телефона!\nПришли мне его обычным текстом (2 минуты).")
@@ -210,31 +210,33 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.wait_for(ev.wait(), timeout=120)
                     code = adobe_2fa_state[user_id]["code"].strip()
                     
-                    # ЧЕКПОИНТ: Скриншот, чтобы видеть, что бот проснулся
                     await shot("/tmp/adobe_last.png", f"⏳ Начинаю вводить полученный код ({code[:2]}***)...")
                     
-                    # Ищем самый первый инпут и кликаем в него один раз
                     first_input = page.locator('input:not([type="hidden"])').first
                     await first_input.click(force=True)
                     await asyncio.sleep(0.5)
                     
-                    # Печатаем весь код, пусть React сам раскидывает его по квадратам
                     print("Adobe: Впечатываем код...")
                     await page.keyboard.type(code, delay=150)
                     await asyncio.sleep(1)
                     
-                    print("Adobe: Жмем Enter для 2FA...")
-                    await page.keyboard.press("Enter")
+                    # Если мы все еще на экране 2FA, жмем Enter
+                    if await page.locator('text=/Verify your identity|Confirm your number/i').count() > 0:
+                        print("Adobe: Жмем Enter для 2FA...")
+                        await page.keyboard.press("Enter")
                     
-                    # Ждем исчезновения окна или появления ошибки
+                    # Проверяем успешность
                     for _ in range(12):
                         await asyncio.sleep(1)
-                        if await page.locator('text=/invalid code|incorrect/i').count() > 0:
+                        # Если появилось поле пароля - код принят, выходим из цикла!
+                        if await page.locator('input[type="password"]').count() > 0:
+                            break
+                        if await page.locator('text=/invalid code|incorrect code/i').count() > 0 and await page.locator('text=/Verify your identity/i').count() > 0:
                             raise RuntimeError("Adobe не принял код (пишет Invalid code). Начни загрузку заново.")
                         if await page.locator('text=/Verify your identity|Confirm your number/i').count() == 0:
                             break
                             
-                    print(f"Adobe: 2FA код обработан!")
+                    print(f"Adobe: 2FA пройден!")
                 except asyncio.TimeoutError:
                     raise RuntimeError("2FA таймаут: код не пришёл за 2 минуты")
                 finally:
@@ -254,10 +256,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await asyncio.sleep(1)
 
             if pwd_target:
-                print("Adobe: видимое поле пароля найдено. Вводим...")
+                print("Adobe: видимое поле пароля найдено. Очищаем и вводим...")
                 await pwd_target.click()
                 await asyncio.sleep(0.5)
-                await pwd_target.fill(ADOBE_PASSWORD.strip())
+                # ОЧИЩАЕМ ПОЛЕ перед вводом, чтобы стереть случайные нажатия
+                await pwd_target.fill("")
+                await pwd_target.press_sequentially(ADOBE_PASSWORD.strip(), delay=100)
                 await asyncio.sleep(1)
                 print("Adobe: Жмем Enter...")
                 await pwd_target.press("Enter")
