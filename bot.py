@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.39 — The Rollback
-- ПОЛНЫЙ ОТКАТ механики логина к старой, стабильной версии (без X-Ray и Gatekeeper)
-- Поиск полей вернулся к простой проверке is_visible()
-- Оставлен только глобальный анти-фриз (10 минут) и фикс синего кружка (F5) внутри студии
-- Полная асинхронность для защиты сервера Render
+Podcast Bot v3.40 — The Dropdown Fix
+- Исправлен критический баг "ложной авторизации": удален поиск по CSS классу "drop", который ложно срабатывал на "dropdown" меню главной страницы.
+- Теперь готовность интерфейса подтверждается строго наличием поля "Choose files".
+- Нажатие на стартовую кнопку "Sign In" переписано на жесткий нативный клик (force=True) для пробития перекрывающих баннеров.
+- Сохранен глобальный таймер (10 мин) и умный F5 для защиты от багов.
 """
 
 import os
@@ -185,19 +185,25 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # ── 2. Старый добрый клик по Sign In ──
+            # ── 2. Жесткий клик по Sign In ──
             print("Adobe: Нажимаем Sign In...")
             try:
-                await page.evaluate("""() => {
-                    const el = [...document.querySelectorAll('a,button')]
-                        .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
-                    if (el) el.click();
-                }""")
+                for txt in ["Sign In", "Sign in", "Entrar", "Log in"]:
+                    btn = page.locator(f'a:has-text("{txt}"), button:has-text("{txt}")').first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(force=True)
+                        break
+                else:
+                    await page.evaluate("""() => {
+                        const el = [...document.querySelectorAll('a,button')]
+                            .find(e => /^sign in|entrar|log in$/i.test(e.innerText?.trim()));
+                        if (el) el.click();
+                    }""")
                 await asyncio.sleep(5)
             except Exception:
                 pass
 
-            # ── 3. Email (Старая механика: is_visible -> click -> type) ──
+            # ── 3. Email (Простая старая механика) ──
             try:
                 print("Adobe: ищем поле email (до 30 сек)...")
                 email_target = None
@@ -231,11 +237,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception as e:
                 print(f"Adobe email error: {str(e)[:100]}")
 
-            # ── 4. Умный навигатор (Что Adobe покажет дальше?) ──
+            # ── 4. Умный навигатор ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
             for _ in range(30):
-                # Проверяем Пароль
                 pwd_inputs = await page.locator('input[type="password"]').all()
                 for p in pwd_inputs:
                     if await p.is_visible():
@@ -243,7 +248,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         break
                 if step == "password": break
                 
-                # Проверяем кнопку Continue для 2FA
                 btns = await page.locator('button:has-text("Continue"), button:has-text("Continuar")').all()
                 for b in btns:
                     if await b.is_visible() and await page.locator('text=/Verify|Confirme|identity/i').count() > 0:
@@ -251,7 +255,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         break
                 if step == "continue_2fa": break
                 
-                # Проверяем поля ввода кода
                 c_inps = await page.locator('input[type="text"], input[type="number"]').all()
                 for c in c_inps:
                     if await c.is_visible() and await page.locator('text=/Verify|Confirme|identity|code/i').count() > 0:
@@ -259,11 +262,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         break
                 if step == "code_2fa": break
                 
-                # Редирект
                 if "enhance" in page.url and "auth" not in page.url:
                     ui_ready = False
                     if await page.locator('input[type="file"]').count() > 0: ui_ready = True
-                    if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0: ui_ready = True
+                    # ИСПРАВЛЕНИЕ: Удален поиск по слову "drop", ищем только точные слова
+                    if await page.locator('text=/Choose files|Escolher arquivos/i').count() > 0: ui_ready = True
+                    
                     if ui_ready:
                         step = "done"
                         break
@@ -281,7 +285,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await btn.click(force=True)
                         break
                 
-                # Ждем появления полей для кода
                 for _ in range(15):
                     await asyncio.sleep(1)
                     c_inps = await page.locator('input[type="text"], input[type="number"]').all()
@@ -337,7 +340,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 7. Пароль (Старая механика) ──
+            # ── 7. Пароль ──
             if step == "password":
                 try:
                     print("Adobe: ждем появление поля пароля...")
@@ -402,17 +405,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             for attempts in range(25):
                 ui_ready = False
                 
-                if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0:
+                # ИСПРАВЛЕНИЕ: Никаких "drop". Только строгие совпадения кнопок.
+                if await page.locator('text=/Choose files|Escolher arquivos/i').count() > 0:
                     ui_ready = True
                 if await page.locator('input[type="file"]').count() > 0:
-                    ui_ready = True
-                if await page.locator('[class*="upload"],[class*="drop"]').count() > 0:
                     ui_ready = True
                 
                 if ui_ready: 
                     break
                 
-                # Фикс бага "синего кружка"
+                # Умный F5 от багов Adobe
                 if attempts == 12:
                     print("Adobe: долгая загрузка студии, принудительно обновляем (F5)...")
                     try:
@@ -847,3 +849,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
