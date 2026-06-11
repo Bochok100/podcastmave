@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.43 — The 6-Box Fix
-- Исправлен баг пустых ячеек 2FA: теперь бот кликает и вводит каждую из 6 цифр в отдельный квадратик (обходит React-защиту Adobe).
-- Тройной Enter после ввода кода для гарантии срабатывания формы.
-- Жесткий выброс ошибки, если пароль не появился после кода.
-- Сохранена полная загрузка файла без системных окон и анти-фриз таймер.
+Podcast Bot v3.44 — The Clean Slate
+- Очищен от старого мусора (удалены неиспользуемые импорты http.server и threading)
+- Добавлены жесткие предохранители на случай отсутствия токенов в Render
+- Сохранена механика 6-Box Fix (ввод 2FA по ячейкам) и прямой загрузки аудио
+- Сохранен встроенный асинхронный сервер для защиты от падений
 """
 
 import os
@@ -12,11 +12,9 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
-import threading
 import time
 import base64
 import gc
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -74,8 +72,11 @@ async def handle_client(reader, writer):
     except Exception:
         pass
     finally:
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 async def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -286,8 +287,592 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             break
                     if step == "code_2fa": break
 
-            # ── 6. Ввод 2FA кода (THE 6-BOX FIX) ──
+            # ── 6. Ввод 2FA кода ──
             if step == "code_2fa":
                 await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда обычным текстом (3 минуты).")
                 ev = asyncio.Event()
-                adobe_2fa_state[user_id] = {"
+                adobe_2fa_state[user_id] = {"event": ev, "code": ""}
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=180)
+                    code = adobe_2fa_state[user_id]["code"].strip()
+                    await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
+
+                    all_inputs = await page.locator('input[type="text"], input[type="number"], input[type="tel"]').all()
+                    visible_inputs = []
+                    for inp in all_inputs:
+                        if await inp.is_visible():
+                            visible_inputs.append(inp)
+                    
+                    if len(visible_inputs) >= 6:
+                        print("Adobe: Найдено 6 ячеек 2FA. Вводим по одной...")
+                        for i, digit in enumerate(code[:6]):
+                            if i < len(visible_inputs):
+                                await visible_inputs[i].click(force=True)
+                                await visible_inputs[i].fill(digit)
+                                await asyncio.sleep(0.3)
+                    elif len(visible_inputs) > 0:
+                        print("Adobe: Найдено одно поле 2FA. Вводим целиком...")
+                        await visible_inputs[0].click(force=True)
+                        await visible_inputs[0].fill(code)
+                    else:
+                        print("Adobe: Поля не найдены, печатаем вслепую...")
+                        await page.keyboard.type(code, delay=200)
+                    
+                    await asyncio.sleep(1)
+                    
+                    for _ in range(3):
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(0.5)
+                    
+                    password_found = False
+                    for _ in range(20):
+                        await asyncio.sleep(1)
+                        p_inps = await page.locator('input[type="password"]').all()
+                        for p in p_inps:
+                            if await p.is_visible():
+                                step = "password"
+                                password_found = True
+                                break
+                        if password_found: break
+                        
+                        html = await page.content()
+                        if "didn't receive" in html.lower() or "não recebeu" in html.lower() or "invalid" in html.lower() or "wrong" in html.lower():
+                            await shot("/tmp/adobe_error.png", "❌ Adobe не принял код. Запусти заново.")
+                            raise RuntimeError("Adobe не принял код")
+
+                    if not password_found:
+                        await shot("/tmp/adobe_error.png", "❌ Adobe: Завис после ввода кода 2FA.")
+                        raise RuntimeError("Adobe не перешел к паролю после ввода кода")
+
+                    await shot("/tmp/adobe_last.png", f"Adobe: после кода. URL: {page.url}")
+                except asyncio.TimeoutError:
+                    raise RuntimeError("2FA таймаут: код не пришёл за 3 минуты")
+                finally:
+                    adobe_2fa_state.pop(user_id, None)
+
+            # ── 7. Пароль ──
+            if step == "password":
+                try:
+                    print("Adobe: ждем появление поля пароля...")
+                    pwd_target = None
+                    for _ in range(30):
+                        inputs = await page.locator('input[type="password"]').all()
+                        for inp in inputs:
+                            if await inp.is_visible():
+                                pwd_target = inp
+                                break
+                        if pwd_target:
+                            break
+                        await asyncio.sleep(1)
+
+                    if pwd_target:
+                        print("Adobe: поле пароля найдено. Вводим...")
+                        await pwd_target.evaluate("node => node.focus()")
+                        await asyncio.sleep(0.5)
+                        await pwd_target.click(force=True)
+                        await asyncio.sleep(0.5)
+                        await page.keyboard.press("Control+A")
+                        await page.keyboard.press("Backspace")
+                        await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
+                        await asyncio.sleep(1)
+                        
+                        print("Adobe: Жмем Enter...")
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(8)
+                        await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
+                    else:
+                        await shot("/tmp/adobe_last.png", "⚠️ Adobe: Поле пароля не найдено за 30 сек.")
+                        print("Adobe: Видимое поле пароля не найдено. Идем дальше.")
+                except Exception as e:
+                    await shot("/tmp/adobe_error.png", f"❌ Ошибка при вводе пароля: {str(e)[:50]}")
+                    print(f"Adobe password error: {str(e)[:100]}")
+
+            gc.collect()
+
+            # ── 8. Промежуточные экраны ──
+            for _ in range(10):
+                if "enhance" in page.url and "auth" not in page.url:
+                    break
+                try:
+                    await page.evaluate("""() => {
+                        const btn = [...document.querySelectorAll('button,a')]
+                            .find(e => /not now|skip|remind me later|напомнить|lembrar depois|pular|continue|continuar/i
+                                .test(e.innerText?.trim()));
+                        if (btn && btn.type !== 'submit') btn.click();
+                    }""")
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+            # ── 9. Переходим на enhance ──
+            if "enhance" not in page.url:
+                await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(5)
+
+            # ── 10. Ждём интерфейс загрузки ──
+            print("Adobe: ждём интерфейс загрузки...")
+            for attempts in range(25):
+                ui_ready = False
+                
+                if await page.locator('text=/Choose files|Escolher arquivos/i').count() > 0:
+                    ui_ready = True
+                if await page.locator('input[type="file"]').count() > 0:
+                    ui_ready = True
+                
+                if ui_ready: 
+                    break
+                
+                if attempts == 12:
+                    print("Adobe: долгая загрузка студии, принудительно обновляем (F5)...")
+                    try:
+                        await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception: pass
+                
+                await asyncio.sleep(1)
+            else:
+                await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился. Смотри /screen")
+                raise RuntimeError("Adobe: экран Enhance завис на загрузке (баг Adobe)")
+
+            await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
+            await ctx.storage_state(path=STATE_FILE)
+
+            # ── 11. ЗАГРУЗКА ФАЙЛА ──
+            print("Adobe: начинаем загрузку файла...")
+            uploaded = False
+            
+            try:
+                file_input = page.locator('input[type="file"]').first
+                await file_input.wait_for(state="attached", timeout=10000)
+                await file_input.evaluate("node => node.style.display = 'block'")
+                await file_input.set_input_files(str(mp3), timeout=15000)
+                uploaded = True
+                print("Adobe: Файл загружен через прямой input!")
+            except Exception as e:
+                print(f"Adobe: Прямой input не сработал: {e}")
+
+            if not uploaded:
+                try:
+                    async with page.expect_file_chooser(timeout=8000) as fc_info:
+                        btn = page.locator('button:has-text("Choose files"), button:has-text("Escolher arquivos")').first
+                        await btn.click(force=True)
+                    fc = await fc_info.value
+                    await fc.set_files(str(mp3), timeout=15000)
+                    uploaded = True
+                    print("Adobe: Файл загружен через file_chooser!")
+                except Exception as e:
+                    print(f"Adobe: Перехватчик не сработал: {e}")
+
+            if not uploaded:
+                try:
+                    with open(mp3, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    await page.evaluate(f"""async () => {{
+                        const bin = atob("{b64}");
+                        const arr = new Uint8Array(bin.length);
+                        for (let i=0; i<bin.length; i++) arr[i] = bin.charCodeAt(i);
+                        const file = new File([arr], "{mp3.name}", {{type: "audio/mpeg"}});
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+                        
+                        const dropZone = document.querySelector('[class*="upload"], [class*="drop"]') || document.body;
+                        ['dragenter', 'dragover', 'drop'].forEach(evName => {{
+                            dropZone.dispatchEvent(new DragEvent(evName, {{bubbles: true, cancelable: true, dataTransfer: dt}}));
+                        }});
+                    }}""")
+                    uploaded = True
+                    del b64
+                    gc.collect()
+                    print("Adobe: Файл загружен через Drag & Drop!")
+                except Exception as e:
+                    print(f"Adobe: Drag & Drop не сработал: {e}")
+
+            if not uploaded:
+                await shot("/tmp/adobe_error.png", "❌ Ошибка: не удалось передать файл в Adobe.")
+                raise RuntimeError("Adobe: все 3 метода загрузки файла провалились.")
+            
+            await shot("/tmp/adobe_last.png", "✅ Adobe: Файл передан! Ждем обработки...")
+            await asyncio.sleep(3)
+            
+            # Нажимаем Enhance
+            for frame in page.frames:
+                for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button:has-text("Melhorar")']:
+                    try:
+                        btn = frame.locator(sel).first
+                        if await btn.count() > 0:
+                            await asyncio.wait_for(btn.evaluate("n=>n.click()"), timeout=5.0)
+                            break
+                    except Exception: continue
+
+            # ── 12. Ждём Download ──
+            dl_btn = None
+            print("Adobe: ждём обработку (макс 3 минуты)...")
+            for i in range(36):
+                await asyncio.sleep(5)
+                
+                try:
+                    await page.evaluate("try { window.gc(); } catch(e) {}")
+                except Exception:
+                    pass
+                gc.collect()
+
+                for frame in page.frames:
+                    b = frame.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Baixar"), a:has-text("Baixar"), [aria-label*="Download"]').last
+                    if await b.count() > 0 and await b.is_visible():
+                        dl_btn = b
+                        break
+                if dl_btn: 
+                    break
+                if i % 6 == 5: 
+                    await shot("/tmp/adobe_last.png", f"Adobe: обрабатываем... {(i+1)*5} сек")
+
+            if not dl_btn:
+                await shot("/tmp/adobe_error.png", "❌ Кнопка Download не появилась!")
+                raise RuntimeError("Adobe: кнопка Download не найдена. Вероятно, обработка зависла.")
+
+            await shot("/tmp/adobe_last.png", "✅ Adobe обработал! Скачиваем...")
+
+            # ── 13. Скачиваем ──
+            async with page.expect_download(timeout=120000) as dl_info:
+                await dl_btn.evaluate("n=>n.click()")
+            dl = await dl_info.value
+            await dl.save_as(str(adobe))
+            size = adobe.stat().st_size
+
+            if size < 10000:
+                raise RuntimeError(f"Adobe вернул пустой файл ({size} байт)")
+
+            r = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", str(adobe),
+                "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+                "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await asyncio.wait_for(r.communicate(), timeout=120)
+
+            return out if out.exists() else adobe
+
+        except Exception as e:
+            try:
+                await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
+                await notify("/tmp/adobe_error.png", f"❌ Adobe ошибка: {str(e)[:120]}")
+            except Exception: pass
+            raise RuntimeError(f"Adobe: {e}")
+        finally:
+            try:
+                if 'ctx' in locals(): await ctx.close()
+                if 'page' in locals() and not page.is_closed(): await page.close()
+            except: pass
+            try:
+                await asyncio.wait_for(browser.close(), timeout=10.0)
+            except Exception: pass
+            gc.collect()
+
+# ── mave.digital ───────────────────────────────
+async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True, 
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--renderer-process-limit=1",
+                "--js-flags=--max-old-space-size=150",
+                "--disable-site-isolation-trials",
+                "--disk-cache-size=5242880",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--no-first-run",
+            ]
+        )
+        ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
+        page = await ctx.new_page()
+        try:
+            await page.goto("https://app.mave.digital/login")
+            await page.fill('input[type="email"]', MAVE_EMAIL)
+            await page.fill('input[type="password"]', MAVE_PASSWORD)
+            await page.click('button[type="submit"]')
+            await page.wait_for_load_state("domcontentloaded")
+            await asyncio.sleep(4)
+
+            await page.evaluate("""() => {
+                document.querySelectorAll('[id^="q-portal--dialog"]').forEach(e=>e.remove());
+                document.querySelectorAll('.q-overlay,.q-dialog__backdrop').forEach(e=>e.remove());
+                document.body.classList.remove('q-body--prevent-scroll','q-body--force-scrollbar-x');
+            }""")
+            await asyncio.sleep(1)
+            await page.locator('text=Добавить выпуск').first.click()
+            await asyncio.sleep(3)
+
+            await page.wait_for_selector('input[type="file"]', state='attached', timeout=15000)
+            await page.set_input_files('input[type="file"]', str(mp3))
+            await asyncio.sleep(2)
+
+            for sel in ['button:has-text("Загрузить файл")', 'button:has-text("Загрузить")']:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        await btn.evaluate("n=>n.click()")
+                        break
+                except Exception: continue
+
+            for _ in range(36):
+                await asyncio.sleep(5)
+                html = await page.content()
+                if any(x in html for x in ["Название выпуска", "episode-title", "upload-progress-done"]): break
+
+            for sel in ['input[placeholder*="Название выпуска"]', 'input[placeholder*="Название"]', 'input[name="title"]']:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.clear()
+                        await el.fill(title)
+                        break
+                except Exception: continue
+
+            for sel in ['.ProseMirror', 'div[contenteditable="true"]', 'textarea[name="description"]']:
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.click()
+                        await el.fill(desc)
+                        break
+                except Exception: continue
+
+            published = False
+            for txt in ["Опубликовать", "Сохранить выпуск", "Сохранить"]:
+                try:
+                    btn = page.locator(f'button:has-text("{txt}")').first
+                    if await btn.count() > 0:
+                        await btn.evaluate("n=>n.click()")
+                        published = True
+                        break
+                except Exception: continue
+
+            if not published:
+                raise RuntimeError("Кнопка публикации mave не найдена")
+            await asyncio.sleep(5)
+            await page.screenshot(path="/tmp/mave_done.png")
+            return True
+        except Exception as e:
+            await page.screenshot(path="/tmp/mave_error.png")
+            raise RuntimeError(str(e))
+        finally:
+            try:
+                if 'ctx' in locals(): await ctx.close()
+                if 'page' in locals() and not page.is_closed(): await page.close()
+            except: pass
+            await browser.close()
+            gc.collect()
+
+# ── Транскрипция ───────────────────────────────
+async def transcribe(mp3: Path) -> str:
+    client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
+    safe = mp3.parent / (mp3.stem + "_w.mp3")
+    shutil.copy2(mp3, safe)
+    
+    with open(safe, "rb") as f:
+        res = await client.audio.transcriptions.create(model="whisper-1", file=f, language="ru")
+        text_result = res.text
+        
+    try:
+        safe.unlink()
+    except Exception:
+        pass
+    
+    gc.collect()
+    return text_result
+
+# ── Метаданные ─────────────────────────────────
+async def generate_metadata(transcript: str) -> tuple[str, str]:
+    client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
+    resp = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": STYLE_PROMPT + transcript}],
+        max_tokens=512, temperature=0.7
+    )
+    text = resp.choices[0].message.content
+    title = desc = ""
+    for line in text.splitlines():
+        c = line.strip().replace("**", "")
+        if c.upper().startswith("ЗАГОЛОВОК:"): title = c[10:].strip()
+        elif c.upper().startswith("ОПИСАНИЕ:"): desc = c[9:].strip()
+    return title, desc
+
+# ── Telegram handlers ──────────────────────────
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
+    msg = await update.message.reply_text("⏳ Начинаю...")
+    try:
+        ogg = await download_voice(update, ctx)
+        await msg.edit_text("🔄 MP3...")
+        mp3 = await to_mp3(ogg)
+
+        await msg.edit_text("🎙️ Adobe Podcast Enhance (3-5 мин)...")
+
+        async def notify(path, caption):
+            try:
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        await update.message.reply_photo(photo=f, caption=f"ℹ️ {caption}")
+            except Exception: pass
+
+        try:
+            studio = await asyncio.wait_for(enhance_audio(mp3, uid, notify), timeout=600.0)
+        except asyncio.TimeoutError:
+            raise RuntimeError("Критическое зависание: процесс занял более 10 минут (баг браузера).")
+
+        for _f in [ogg, mp3]:
+            try:
+                if _f.exists() and str(_f) != str(studio):
+                    _f.unlink()
+            except Exception:
+                pass
+        gc.collect()
+
+        await msg.edit_text("📝 Whisper транскрипция...")
+        text = await transcribe(studio)
+
+        await msg.edit_text("✍️ GPT-4o заголовок...")
+        title, desc = await generate_metadata(text)
+        
+        del text 
+        gc.collect()
+
+        pending[uid] = {"mp3": studio, "title": title, "description": desc}
+        await msg.delete()
+
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Опубликовать в mave", callback_data="publish"),
+            InlineKeyboardButton("✏️ Изменить", callback_data="edit"),
+        ], [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]])
+
+        with open(studio, "rb") as audio_file:
+            await update.message.reply_document(document=audio_file, filename=f"{title[:40]}.mp3")
+            
+        await update.message.reply_text(
+            f"🎙 *Готов*\n\n*Заголовок:*\n{title}\n\n*Описание:*\n{desc}\n\nОдобряешь?",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in adobe_2fa_state:
+        adobe_2fa_state[uid]["code"] = update.message.text.strip()
+        adobe_2fa_state[uid]["event"].set()
+        await update.message.reply_text("✅ Код принят! Возвращаюсь в Adobe...")
+
+async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    data = pending.get(uid)
+    if not data:
+        await q.edit_message_text("❌ Сессия устарела.")
+        return
+    await q.edit_message_text("⏳ Загружаю в mave...")
+    try:
+        await upload_to_mave(data["mp3"], data["title"], data["description"])
+        try:
+            mp3_path = Path(data["mp3"])
+            if mp3_path.exists():
+                mp3_path.unlink()
+                print(f"Удалён MP3: {mp3_path.name}")
+        except Exception:
+            pass
+        caption = f"✅ *Опубликовано!*\n\n_{data['title']}_"
+        
+        if os.path.exists("/tmp/mave_done.png"):
+            with open("/tmp/mave_done.png", "rb") as img:
+                await q.message.reply_photo(photo=img, caption=caption, parse_mode=ParseMode.MARKDOWN)
+            await q.message.delete()
+        else:
+            await q.edit_message_text(caption, parse_mode=ParseMode.MARKDOWN)
+        pending.pop(uid, None)
+        gc.collect()
+        
+    except Exception as e:
+        if os.path.exists("/tmp/mave_error.png"):
+            with open("/tmp/mave_error.png", "rb") as img:
+                await q.message.reply_photo(photo=img, caption=f"❌ mave ошибка: {e}")
+            await q.message.delete()
+        else:
+            await q.edit_message_text(f"❌ Ошибка: {e}")
+
+async def btn_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = pending.get(q.from_user.id)
+    await q.edit_message_text(f"✏️ Заголовок:\n*{data['title']}*\n\nНовый (или /skip):", parse_mode=ParseMode.MARKDOWN)
+    return EDIT_TITLE
+
+async def edit_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if update.message.text != "/skip":
+        pending[uid]["title"] = update.message.text
+    await update.message.reply_text(f"📝 Описание:\n_{pending[uid]['description']}_\n\nНовое (или /skip):", parse_mode=ParseMode.MARKDOWN)
+    return EDIT_DESC
+
+async def edit_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if update.message.text != "/skip":
+        pending[uid]["description"] = update.message.text
+    d = pending[uid]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Опубликовать", callback_data="publish"),
+        InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
+    ]])
+    await update.message.reply_text(f"*Заголовок:* {d['title']}\n*Описание:* {d['description']}\n\nПубликуем?", parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    return ConversationHandler.END
+
+async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pending.pop(q.from_user.id, None)
+    await q.edit_message_text("❌ Отменено.")
+    gc.collect()
+    return ConversationHandler.END
+
+# ── Запуск ─────────────────────────────────────
+def main():
+    print("🚀 Бот запускается...")
+    if not TELEGRAM_TOKEN:
+        print("❌ КРИТИЧЕСКАЯ ОШИБКА: TELEGRAM_TOKEN не найден в переменных окружения Render!")
+        time.sleep(600)
+        return
+
+    try:
+        app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+        
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text, block=False), group=1)
+        
+        conv = ConversationHandler(
+            entry_points=[CallbackQueryHandler(btn_edit, pattern="^edit$")],
+            states={
+                EDIT_TITLE: [MH(filters.TEXT & ~filters.COMMAND, edit_title)],
+                EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
+            },
+            fallbacks=[CallbackQueryHandler(btn_cancel, pattern="^cancel$")],
+            per_chat=True,
+        )
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice, block=False))
+        app.add_handler(conv)
+        app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
+        app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
+        
+        print("✅ Бот запущен!")
+        app.run_polling()
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        while True:
+            time.sleep(60)
+
+if __name__ == "__main__":
+    main()
