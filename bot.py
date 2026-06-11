@@ -1,9 +1,8 @@
 """
-Podcast Bot v3.28 — JS Force Focus
-- Обход ошибки Timeout exceeded на Locator.focus()
-- Использование принудительного JavaScript фокуса (node.focus()), который игнорирует невидимые слои загрузки
-- Сохранено "смертельное комбо" для React: JS focus -> Click force -> Ctrl+A -> Backspace -> Type
-- Полная экономия памяти и асинхронность сохранены
+Podcast Bot v3.29 — The Final Fill
+- Использование надежной команды .fill(force=True) для 100% ввода текста сквозь невидимые слои
+- Сохранены расширенные селекторы для безошибочного нахождения полей
+- Полная асинхронность и экономия памяти на месте
 """
 
 import os
@@ -197,7 +196,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Email (РАСШИРЕННЫЙ ПОИСК + JS ФОКУС) ──
+            # ── 3. Email (РАСШИРЕННЫЙ ПОИСК + НАДЕЖНЫЙ ВВОД FILL) ──
             try:
                 print("Adobe: ждем появление поля email (до 30 сек)...")
                 email_target = None
@@ -213,20 +212,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
                 if email_target:
                     print("Adobe: видимое поле email найдено. Вводим...")
-                    # Принудительный фокус через JS, обходит любые перекрывающие слои
-                    await email_target.evaluate("node => node.focus()")
-                    await asyncio.sleep(0.5)
-                    await email_target.click(force=True)
-                    await asyncio.sleep(0.5)
-                    
-                    # Выделяем и удаляем мусор, затем печатаем
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
+                    # Команда fill(force=True) игнорирует невидимые слои и жестко вводит текст
+                    await email_target.fill(ADOBE_EMAIL.strip(), force=True)
                     await asyncio.sleep(1)
                     
                     print("Adobe: Жмем Enter...")
-                    await page.keyboard.press("Enter")
+                    await email_target.press("Enter")
                     await asyncio.sleep(6)
                     await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
                 else:
@@ -265,12 +256,11 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     
                     if first_input:
                         print("Adobe: фокусируемся на поле кода...")
-                        await first_input.evaluate("node => node.focus()")
-                        await asyncio.sleep(0.5)
+                        # Для 2FA последовательный ввод работает лучше
                         await first_input.click(force=True)
-                        await page.keyboard.type(code, delay=150)
+                        await first_input.press_sequentially(code, delay=150)
                         await asyncio.sleep(1)
-                        await page.keyboard.press("Enter")
+                        await first_input.press("Enter")
                     
                     for _ in range(15):
                         await asyncio.sleep(1)
@@ -287,7 +277,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Пароль (РАСШИРЕННЫЙ ПОИСК + JS ФОКУС) ──
+            # ── 6. Пароль (РАСШИРЕННЫЙ ПОИСК + НАДЕЖНЫЙ ВВОД FILL) ──
             try:
                 print("Adobe: ждем появление поля пароля (до 30 сек)...")
                 pwd_target = None
@@ -302,19 +292,12 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(1)
 
                 if pwd_target:
-                    print("Adobe: поле пароля найдено. Фокусируемся...")
-                    await pwd_target.evaluate("node => node.focus()")
-                    await asyncio.sleep(0.5)
-                    await pwd_target.click(force=True)
-                    await asyncio.sleep(0.5)
-                    
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
+                    print("Adobe: поле пароля найдено. Вводим...")
+                    await pwd_target.fill(ADOBE_PASSWORD.strip(), force=True)
                     await asyncio.sleep(1)
                     
                     print("Adobe: Жмем Enter...")
-                    await page.keyboard.press("Enter")
+                    await pwd_target.press("Enter")
                     await asyncio.sleep(8)
                     await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
                 else:
