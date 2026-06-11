@@ -1,8 +1,8 @@
 """
-Podcast Bot v3.11 — Sniper Typing & Force Clicks
-- Заменен page.keyboard.type на целевой locator.press_sequentially()
-- Жесткая очистка полей перед вводом
-- Гарантированный клик по кнопкам Continue
+Podcast Bot v3.12 — The "Enter Key" Method
+- Нажатие клавиши Enter вместо поиска и клика по кнопкам Continue (100% обход React)
+- Защита от пустых переменных среды (ADOBE_EMAIL / ADOBE_PASSWORD)
+- Умный ввод 2FA по ячейкам
 """
 
 import os
@@ -103,6 +103,10 @@ def to_mp3(src: Path) -> Path:
 
 # ── Adobe Podcast ──────────────────────────────
 async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
+    # ЖЕСТКАЯ ПРОВЕРКА ПЕРЕМЕННЫХ
+    if not ADOBE_EMAIL or not ADOBE_PASSWORD:
+        raise RuntimeError("ОШИБКА: ADOBE_EMAIL или ADOBE_PASSWORD не заполнены в настройках Render!")
+
     adobe = mp3.parent / (mp3.stem + "_adobe.mp3")
     out   = mp3.parent / (mp3.stem + "_studio.mp3")
 
@@ -159,7 +163,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             except Exception:
                 pass
 
-            # ── 3. Вводим email (СНАЙПЕРСКИЙ ВВОД) ──
+            # ── 3. Вводим email (МЕТОД КЛАВИШИ ENTER) ──
             try:
                 print("Adobe: ждем появление поля email...")
                 email_field = page.locator('input[type="email"],input[name="username"]').first
@@ -168,17 +172,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 print("Adobe: поле email найдено. Вводим...")
                 await email_field.click()
                 await email_field.clear()
-                # Печатаем строго в ЭТО поле
-                await email_field.press_sequentially(ADOBE_EMAIL.strip(), delay=50)
+                
+                await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
                 await asyncio.sleep(1)
 
-                btn = page.locator('button:has-text("Continue"), button:has-text("Продолжить"), #btn-id-forward, button[type="submit"]').first
-                if await btn.count() > 0:
-                    await btn.click(force=True)
+                print("Adobe: Жмем Enter...")
+                await page.keyboard.press("Enter")
                 await asyncio.sleep(4)
                 await shot("/tmp/adobe_last.png", "Adobe: после email")
-            except Exception:
-                print("Adobe: Поле email не найдено. Идем дальше.")
+            except Exception as e:
+                print(f"Adobe: Поле email не найдено ({e}). Идем дальше.")
 
             # ── 4. Экран подтверждения личности (перед кодом) ──
             try:
@@ -207,13 +210,14 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             await asyncio.sleep(0.1)
                     else:
                         code_input = page.locator('input[type="text"]').first
-                        await code_input.press_sequentially(code, delay=100)
+                        await code_input.click()
+                        await page.keyboard.type(code, delay=150)
                     
                     await asyncio.sleep(1)
                     
-                    sub = page.locator('button:has-text("Continue"),button:has-text("Submit"),button:has-text("Verify"),button[type="submit"]').first
-                    if await sub.count() > 0:
-                        await sub.click(force=True)
+                    # Здесь тоже жмем Enter вместо клика
+                    print("Adobe: Ввели код, жмем Enter...")
+                    await page.keyboard.press("Enter")
                     
                     for _ in range(10):
                         await asyncio.sleep(1)
@@ -228,26 +232,24 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Вводим пароль (СНАЙПЕРСКИЙ ВВОД) ──
+            # ── 6. Вводим пароль (МЕТОД КЛАВИШИ ENTER) ──
             try:
                 print("Adobe: ждем появление поля пароля...")
                 pwd_field = page.locator('input[type="password"],#password').first
-                # Ждем именно видимости (visible)
                 await pwd_field.wait_for(state="visible", timeout=8000)
                 
                 print("Adobe: поле пароля найдено. Вводим...")
                 await pwd_field.click(force=True)
                 await pwd_field.clear()
-                # Печатаем строго в ЭТО поле
-                await pwd_field.press_sequentially(ADOBE_PASSWORD.strip(), delay=50)
+                
+                await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
                 await asyncio.sleep(1)
                 
-                btn_signin = page.locator('button:has-text("Sign in"), button:has-text("Continue"), button:has-text("Продолжить"), button[type="submit"]').first
-                if await btn_signin.count() > 0:
-                    await btn_signin.click(force=True)
+                print("Adobe: Жмем Enter...")
+                await page.keyboard.press("Enter")
                 await asyncio.sleep(6)
-            except Exception:
-                print("Adobe: Поле пароля не появилось.")
+            except Exception as e:
+                print(f"Adobe: Поле пароля не появилось ({e}).")
 
             # Закрываем промежуточные экраны
             for _ in range(10):
