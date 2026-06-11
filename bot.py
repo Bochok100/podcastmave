@@ -1,9 +1,9 @@
 """
-Podcast Bot v3.32 — The Perfect Vision
-- Возвращен строгий поиск полей только через is_visible() для обхода невидимых ловушек (honeypots) Adobe
-- Внедрено безотказное комбо ввода: JS focus -> force click -> Ctrl+A -> type
-- Умный навигатор отслеживает 2FA/Пароль/Continue (поддержка медленных серверов Render)
-- Сохранена полная асинхронность и максимальная экономия памяти
+Podcast Bot v3.34 — The Unkillable Bot
+- Устранена ошибка Render (Connection refused): HTTP-сервер переведен на встроенный asyncio.start_server
+- Добавлен "Умный F5": принудительная перезагрузка страницы (page.reload()), если Adobe виснет на синем кружке
+- Распознавание португальского интерфейса Adobe с отправкой русскоязычных статусов в Telegram
+- Полная асинхронность и экономия оперативной памяти
 """
 
 import os
@@ -12,11 +12,9 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
-import threading
 import time
 import base64
 import gc
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -65,28 +63,28 @@ STYLE_PROMPT = """
 ТРАНСКРИПЦИЯ:
 """
 
-# ── HTTP сервер ──────────
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/screen':
-            for f in ['/tmp/adobe_last.png', '/tmp/adobe_error.png']:
-                if os.path.exists(f):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.end_headers()
-                    with open(f, 'rb') as img:
-                        self.wfile.write(img.read())
-                    return
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write("Bot alive. Screen: /screen".encode())
+# ── Асинхронный HTTP сервер для Render ──────────
+async def handle_client(reader, writer):
+    try:
+        response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBot alive!\r\n"
+        writer.write(response.encode('utf8'))
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
-    def log_message(self, *a):
-        return
+async def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = await asyncio.start_server(handle_client, '0.0.0.0', port)
+    print(f"✅ Асинхронный сервер Health Check запущен на порту {port}")
+    async with server:
+        await server.serve_forever()
 
-def run_server():
-    HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 10000))), Handler).serve_forever()
+async def post_init(app: Application):
+    # Запускаем сервер Render в том же цикле, что и Telegram-бот (никогда не зависнет)
+    asyncio.create_task(run_dummy_server())
 
 # ── Утилиты ────────────────────────────────────
 async def download_voice(update, context) -> Path:
@@ -225,7 +223,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     
                     print("Adobe: Жмем Enter...")
                     await page.keyboard.press("Enter")
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(4)
                     await shot("/tmp/adobe_last.png", f"Adobe: после email. URL: {page.url}")
                 else:
                     await shot("/tmp/adobe_last.png", "⚠️ Adobe: Видимое поле email не найдено за 30 сек. Пропускаем шаг.")
@@ -237,7 +235,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             # ── 4. Умный навигатор (Что Adobe покажет дальше?) ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
-            for _ in range(40): # Даем 40 секунд на прогрузку медленных серверов
+            for _ in range(40):
                 # 1. Проверяем пароль
                 pwd_inputs = await page.locator('input[type="password"]').all()
                 for p_inp in pwd_inputs:
@@ -246,7 +244,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         break
                 if step == "password": break
                 
-                # 2. Проверяем кнопку Continue для 2FA
+                # 2. Проверяем кнопку Continue для 2FA (перевод с португальского учтен)
                 btn_continue = await page.locator('button:has-text("Continue"), button:has-text("Continuar")').all()
                 for b_inp in btn_continue:
                     if await b_inp.is_visible() and await page.locator('text=/Verify|Confirme|identity/i').count() > 0:
@@ -280,7 +278,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await btn.click(force=True)
                         break
                 
-                # Ждем появления полей для кода
                 for _ in range(15):
                     await asyncio.sleep(1)
                     c_inps = await page.locator('input[type="text"], input[type="number"]').all()
@@ -316,7 +313,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await asyncio.sleep(1)
                         await page.keyboard.press("Enter")
                     
-                    # Ждем пока 2FA исчезнет и появится пароль
                     for _ in range(20):
                         await asyncio.sleep(1)
                         p_inps = await page.locator('input[type="password"]').all()
@@ -337,7 +333,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 7. Пароль (ИСКЛЮЧИТЕЛЬНО ВИДИМЫЕ ПОЛЯ + КОМБО КЛИК) ──
+            # ── 7. Пароль ──
             if step == "password":
                 try:
                     print("Adobe: ждем появление поля пароля...")
@@ -398,20 +394,31 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(5)
 
-            # ── 10. Ждём интерфейс загрузки ──
+            # ── 10. Ждём интерфейс загрузки (с УМНЫМ F5 от бесконечного кружка) ──
             print("Adobe: ждём интерфейс загрузки...")
-            for _ in range(20):
+            for attempts in range(30):
                 ui_ready = False
                 inps = await page.locator('input[type="file"]').all()
                 for inp in inps:
                     if await inp.is_visible(): ui_ready = True
+                
+                # Португальский перевод учтен (Escolher arquivos)
                 if await page.locator('text=/Choose files|Escolher arquivos|Upload/i').count() > 0: ui_ready = True
                 if await page.locator('[class*="upload"],[class*="drop"]').count() > 0: ui_ready = True
                 
-                if ui_ready: break
+                if ui_ready: 
+                    break
+                
+                # Если 12 секунд подряд крутится синий кружок — обновляем страницу (F5)
+                if attempts == 12:
+                    print("Adobe: долгая загрузка студии, принудительно обновляем страницу (F5)...")
+                    await page.reload()
+                    await page.wait_for_load_state("domcontentloaded")
+                    await asyncio.sleep(4)
+                    
                 await asyncio.sleep(1)
             else:
-                await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился. Смотри /screen")
+                await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился после обновления. Смотри /screen")
                 raise RuntimeError("Adobe: экран Enhance не загрузился после авторизации")
 
             await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
@@ -460,7 +467,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             await asyncio.sleep(3)
             
-            # Нажимаем Enhance
+            # Нажимаем Enhance (Melhorar на португальском)
             for frame in page.frames:
                 for sel in ['button:has-text("Enhance speech")', 'button:has-text("Enhance")', 'button:has-text("Melhorar")']:
                     try:
@@ -483,6 +490,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 gc.collect()
 
                 for frame in page.frames:
+                    # Скачать (Baixar на португальском)
                     b = frame.locator('button:has-text("Download"), a:has-text("Download"), button:has-text("Baixar"), a:has-text("Baixar"), [aria-label*="Download"]').last
                     if await b.count() > 0 and await b.is_visible():
                         dl_btn = b
@@ -802,10 +810,9 @@ async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Запуск ─────────────────────────────────────
 def main():
-    threading.Thread(target=run_server, daemon=True).start()
     print("🚀 Бот запускается...")
     try:
-        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
         
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text, block=False), group=1)
         
