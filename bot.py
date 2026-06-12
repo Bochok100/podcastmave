@@ -1,8 +1,9 @@
 """
-Podcast Bot v4.2 — The Handshake Fix
-- ИСПРАВЛЕН БАГ ЛОЖНОГО ОТТОРЖЕНИЯ 2FA: Бот больше не нажимает Enter вслепую после ввода кода. Добавлена проверка появления поля password перед сабмитом и парсингом ошибок.
-- Улучшен ввод пароля: перед вводом поле принудительно очищается (на случай мусорных символов).
-- Сохранен State Machine Engine: нулевая нагрузка на сервер, полная адаптивность к лагам сайта.
+Podcast Bot v5.0 — Back to Basics (The Classic)
+- ВОЗВРАТ К ИДЕАЛЬНОЙ ЛИНЕЙНОЙ ЛОГИКЕ (v3.41). Убрана избыточная архитектура State Machine, перегружавшая бесплатный сервер.
+- УСТРАНЕНЫ ТАЙМАУТЫ: Все клики по кнопкам (Sign In, Verify, Continue) переписаны на сырой JavaScript (page.evaluate), который мгновенно бьет по DOM-дереву и никогда не зависает (в отличие от locator.click()).
+- БРОНЕБОЙНЫЙ 2FA: Использован метод мягкого фокуса (focus) вместо жесткого клика для обхода перерисовки React.
+- Оптимизация памяти, анти-двойник (drop_pending_updates=True) и прямая загрузка аудио сохранены.
 """
 
 import os
@@ -132,7 +133,7 @@ async def to_mp3(src: Path) -> Path:
     gc.collect() 
     return dst
 
-# ── Adobe Podcast (STATE MACHINE ENGINE) ──────────
+# ── Adobe Podcast (КЛАССИЧЕСКАЯ ЛИНЕЙНАЯ АВТОРИЗАЦИЯ) ──────────
 async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
     if not ADOBE_EMAIL or not ADOBE_PASSWORD:
         raise RuntimeError("ОШИБКА: ADOBE_EMAIL или ADOBE_PASSWORD не заполнены в настройках Render!")
@@ -189,168 +190,239 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
         page = await ctx.new_page()
 
         try:
-            print("Adobe: Открываем страницу...")
+            # ── 1. Открываем главную страницу ──
+            print("Adobe: открываем страницу...")
             await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(4)
             await shot("/tmp/adobe_last.png", f"Adobe: открыли. URL: {page.url}")
 
-            # === MASTER STATE MACHINE ===
-            print("Adobe: Запуск State Machine Engine...")
-            auth_success = False
-
-            for step_attempts in range(40):
-                url = page.url
-                html = await page.content()
-
-                # СТАТУС 1: Мы успешно авторизованы и в студии
-                if await page.locator('input[type="file"]').count() > 0 or \
-                   await page.locator('text=/Choose files|Escolher arquivos/i').count() > 0:
-                    print("Adobe: Интерфейс загрузки готов!")
-                    auth_success = True
+            # ── 2. Мгновенный JS-клик Sign In (Без таймаутов) ──
+            print("Adobe: Нажимаем Sign In...")
+            try:
+                await page.evaluate("""() => {
+                    const el = [...document.querySelectorAll('a, button, span')].find(e => /^sign in$|^entrar$|^log in$/i.test(e.innerText?.trim()));
+                    if (el) el.click();
+                }""")
+            except Exception as e:
+                print(f"Ошибка JS клика: {e}")
+                
+            # Даем щедрое время на редирект (Render медленный)
+            auth_reached = False
+            for _ in range(25):
+                await asyncio.sleep(1)
+                if "auth" in page.url or "login" in page.url or "signin" in page.url:
+                    auth_reached = True
                     break
+                    
+            if not auth_reached:
+                await shot("/tmp/adobe_error.png", "❌ Adobe: Не удалось перейти на форму логина. Сервер тормозит.")
+                raise RuntimeError("Сбой навигации: не удалось перейти на логин.")
 
-                # СТАТУС 2: Пропуск промежуточных экранов (Skip, Not Now)
-                skip_btn = page.locator('button, a').filter(has_text=re.compile(r"^not now$|^skip$|^remind me later$|^lembrar depois$|^pular$", re.IGNORECASE)).first
-                if await skip_btn.is_visible():
-                    print("Adobe: Пропускаем промежуточный экран...")
-                    await skip_btn.click(force=True)
-                    await asyncio.sleep(3)
-                    continue
+            print(f"Adobe: Успешно перешли на логин. URL: {page.url}")
 
-                # СТАТУС 3: Требуется нажать Sign In (если мы на главной)
-                sign_btn = page.locator('a, button').filter(has_text=re.compile(r"sign in|entrar|log in", re.IGNORECASE)).first
-                if await sign_btn.is_visible() and "auth" not in url and "login" not in url:
-                    print("Adobe: Нажимаем Sign In...")
-                    auth_url = await page.evaluate("""() => {
-                        const link = Array.from(document.querySelectorAll('a')).find(a => a.href && (a.href.includes('auth.services') || a.href.includes('login')));
-                        return link ? link.href : null;
-                    }""")
-                    if auth_url:
-                        await page.goto(auth_url)
-                    else:
-                        await page.evaluate("""() => { document.querySelectorAll('[id*="onetrust"], [class*="cookie"], [class*="overlay"]').forEach(e => e.remove()); }""")
-                        await sign_btn.click(force=True)
-                    await asyncio.sleep(4)
-                    continue
-
-                # СТАТУС 4: Поле Email
-                email_inp = page.locator('input[type="email"], input[name="username"]').first
-                if await email_inp.is_visible():
-                    val = await email_inp.input_value()
-                    if not val:
-                        print("Adobe: Вводим Email...")
-                        await email_inp.click(force=True)
+            # ── 3. Ввод Email ──
+            print("Adobe: ищем поле email...")
+            email_found = False
+            for _ in range(20):
+                email_loc = page.locator('input[type="email"], input[name="username"]').first
+                if await email_loc.count() > 0 and await email_loc.is_visible():
+                    try:
+                        # JS-фокус + обычный ввод
+                        await email_loc.evaluate("node => node.focus()")
                         await page.keyboard.press("Control+A")
                         await page.keyboard.press("Backspace")
-                        await email_inp.fill(ADOBE_EMAIL.strip())
+                        await email_loc.fill(ADOBE_EMAIL.strip())
                         await asyncio.sleep(0.5)
                         await page.keyboard.press("Enter")
-                    else:
-                        print("Adobe: Email уже введен, жмем Enter...")
-                        await page.keyboard.press("Enter")
-                    await asyncio.sleep(4)
-                    continue
+                        email_found = True
+                        break
+                    except Exception: pass
+                await asyncio.sleep(1)
 
-                # СТАТУС 5: Поле Пароля
-                pwd_inp = page.locator('input[type="password"]').first
-                if await pwd_inp.is_visible():
-                    print("Adobe: Вводим Пароль...")
-                    await pwd_inp.click(force=True)
-                    # Жестко очищаем поле перед вводом (от мусорных Enter-ов)
-                    await page.keyboard.press("Control+A")
-                    await page.keyboard.press("Backspace")
-                    await pwd_inp.fill(ADOBE_PASSWORD.strip())
-                    await asyncio.sleep(0.5)
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(2)
-                    await shot("/tmp/adobe_last.png", f"Adobe: пароль введен.")
-                    await asyncio.sleep(5)
-                    continue
+            if email_found:
+                print("Adobe: Email отправлен.")
+                await asyncio.sleep(5)
+                await shot("/tmp/adobe_last.png", f"Adobe: после email.")
+            else:
+                print("Adobe: Поле email не найдено. Идем дальше.")
 
-                # СТАТУС 6: Кнопка Continue (Иногда появляется перед отправкой кода 2FA)
-                continue_btn = page.locator('button').filter(has_text=re.compile(r"^Continue$|^Continuar$", re.IGNORECASE)).first
-                if await continue_btn.is_visible() and ("verify" in html.lower() or "confirme" in html.lower()):
-                    print("Adobe: Нажимаем Continue для отправки 2FA...")
-                    await continue_btn.click(force=True)
-                    await asyncio.sleep(4)
-                    continue
-
-                # СТАТУС 7: Поля 2FA
-                tel_inps = page.locator('input[type="text"], input[type="number"], input[type="tel"]')
-                if await tel_inps.count() > 0 and ("verify" in html.lower() or "confirme" in html.lower() or "code" in html.lower()):
+            # ── 4. Сканируем текущий шаг (Пароль или 2FA) ──
+            print("Adobe: сканируем следующий шаг...")
+            step = "unknown"
+            for _ in range(30):
+                if await page.locator('input[type="password"]').count() > 0:
+                    step = "password"
+                    break
                     
-                    # Проверяем, не висим ли мы тут уже после ввода кода
-                    if user_id not in adobe_2fa_state:
-                        await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда (3 минуты).")
-                        ev = asyncio.Event()
-                        adobe_2fa_state[user_id] = {"event": ev, "code": ""}
+                if await page.locator('input[type="text"], input[type="number"], input[type="tel"]').count() > 0:
+                    step = "code_2fa"
+                    break
+                
+                # Кнопка Continue перед 2FA
+                html = await page.content()
+                if re.search(r"Verify|Confirme|identity", html, re.IGNORECASE):
+                    try:
+                        await page.evaluate("""() => {
+                            const el = [...document.querySelectorAll('button')].find(e => /^continue$|^continuar$/i.test(e.innerText?.trim()));
+                            if (el) el.click();
+                        }""")
+                    except: pass
+                    
+                if "enhance" in page.url and "auth" not in page.url:
+                    if await page.locator('input[type="file"]').count() > 0:
+                        step = "done"
+                        break
+                        
+                await asyncio.sleep(1)
+            
+            print(f"Adobe: Следующий шаг определен как -> {step}")
+
+            # ── 5. Ввод 2FA кода (Идеальная механика) ──
+            if step == "code_2fa":
+                await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда (3 минуты).")
+                ev = asyncio.Event()
+                adobe_2fa_state[user_id] = {"event": ev, "code": ""}
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=180)
+                    code = adobe_2fa_state[user_id]["code"].strip()
+                    await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
+
+                    # Обход React через мягкий фокус
+                    inps = page.locator('input[type="text"], input[type="number"], input[type="tel"]')
+                    if await inps.count() >= 6:
+                        print("Adobe: Найдено 6 ячеек 2FA. Печатаем...")
+                        for i in range(6):
+                            try:
+                                await inps.nth(i).focus(timeout=2000)
+                            except: pass
+                            await page.keyboard.press(code[i])
+                            await asyncio.sleep(0.2)
+                    elif await inps.count() > 0:
+                        print("Adobe: Найдено 1 поле 2FA. Заполняем...")
+                        await inps.first.fill(code)
+                    else:
+                        print("Adobe: Поля не найдены, печатаем вслепую...")
+                        await page.keyboard.type(code, delay=200)
+
+                    await asyncio.sleep(3)
+                    
+                    # Мгновенный JS-клик подтверждения (без таймаутов)
+                    await page.evaluate("""() => {
+                        const el = [...document.querySelectorAll('button')].find(e => /verify|verificar|submit/i.test(e.innerText?.trim()));
+                        if (el) el.click();
+                    }""")
+                    await asyncio.sleep(1)
+                    await page.keyboard.press("Enter")
+                    
+                    # Проверяем что случилось дальше
+                    password_found = False
+                    for _ in range(20):
+                        await asyncio.sleep(1)
+                        if "enhance" in page.url and "auth" not in page.url:
+                            step = "done"
+                            password_found = True
+                            break
+
+                        if await page.locator('input[type="password"]').count() > 0:
+                            step = "password"
+                            password_found = True
+                            break
+                        
+                        html_after = await page.content()
+                        if re.search(r"inválido|invalid|incorrect|wrong|неверный", html_after, re.IGNORECASE):
+                            await shot("/tmp/adobe_error.png", "❌ Adobe не принял код. Запусти заново.")
+                            raise RuntimeError("Adobe не принял код 2FA.")
+
+                    if not password_found:
+                        await shot("/tmp/adobe_error.png", "❌ Adobe: Завис после ввода кода 2FA. Сервер Adobe не ответил.")
+                        raise RuntimeError("Adobe не перешел к паролю после ввода кода.")
+
+                    await shot("/tmp/adobe_last.png", f"Adobe: после кода. URL: {page.url}")
+                except asyncio.TimeoutError:
+                    raise RuntimeError("2FA таймаут: код не пришёл за 3 минуты.")
+                finally:
+                    adobe_2fa_state.pop(user_id, None)
+
+            # ── 6. Пароль ──
+            if step == "password":
+                print("Adobe: ждем появление поля пароля...")
+                pwd_found = False
+                for _ in range(15):
+                    pwd_loc = page.locator('input[type="password"]').first
+                    if await pwd_loc.count() > 0 and await pwd_loc.is_visible():
                         try:
-                            await asyncio.wait_for(ev.wait(), timeout=180)
-                            code = adobe_2fa_state[user_id]["code"].strip()
-                            await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
+                            await pwd_loc.evaluate("node => node.focus()")
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                            await pwd_loc.fill(ADOBE_PASSWORD.strip())
+                            await asyncio.sleep(1)
+                            await page.keyboard.press("Enter")
+                            pwd_found = True
+                            break
+                        except Exception: pass
+                    await asyncio.sleep(1)
 
-                            count = await tel_inps.count()
-                            if count >= 6:
-                                print("Adobe: Ввод 2FA в 6 ячеек (Обход React)...")
-                                for i in range(6):
-                                    try:
-                                        target = page.locator('input[type="text"], input[type="number"], input[type="tel"]').nth(i)
-                                        await target.click(force=True)
-                                        await asyncio.sleep(0.1)
-                                        await page.keyboard.press(code[i])
-                                    except Exception:
-                                        await page.keyboard.press(code[i])
-                                    await asyncio.sleep(0.1)
-                            elif count > 0:
-                                print("Adobe: Ввод 2FA в единое поле...")
-                                await tel_inps.first.click(force=True)
-                                await tel_inps.first.fill(code)
-                            else:
-                                await page.keyboard.type(code, delay=200)
+                if pwd_found:
+                    print("Adobe: Жмем Enter...")
+                    await asyncio.sleep(8)
+                    await shot("/tmp/adobe_last.png", f"Adobe: после пароля. URL: {page.url}")
+                else:
+                    print("Adobe: Видимое поле пароля не найдено. Идем дальше.")
 
-                            print("Adobe: Код введен. Ожидаем авто-отправку от Adobe (3 сек)...")
-                            await asyncio.sleep(3)
-                            
-                            # 🔥 ИСПРАВЛЕНИЕ: Проверяем, не перекинуло ли нас уже на пароль 🔥
-                            if await page.locator('input[type="password"]').count() == 0:
-                                # Мы всё еще на странице 2FA
-                                verify_btn = page.locator('button').filter(has_text=re.compile(r"^Verify$|^Verificar$|^Submit$", re.IGNORECASE)).first
-                                if await verify_btn.is_visible():
-                                    await verify_btn.click(force=True)
-                                else:
-                                    await page.keyboard.press("Enter")
-                                await asyncio.sleep(4)
-                            
-                            # 🔥 ИСПРАВЛЕНИЕ: Проверяем ошибки ТОЛЬКО если пароля нет на экране 🔥
-                            if await page.locator('input[type="password"]').count() == 0:
-                                html_after = await page.content()
-                                if re.search(r"inválido|invalid|incorrect|wrong|неверный", html_after, re.IGNORECASE):
-                                    await shot("/tmp/adobe_error.png", "❌ Adobe: Неверный код 2FA. Запусти заново.")
-                                    raise RuntimeError("Adobe не принял код 2FA.")
-                            else:
-                                print("Adobe: 2FA успешно пройден, обнаружено поле пароля!")
+            gc.collect()
 
-                        except asyncio.TimeoutError:
-                            raise RuntimeError("2FA таймаут: код не пришёл за 3 минуты.")
-                        finally:
-                            adobe_2fa_state.pop(user_id, None)
+            # ── 7. Пропуск рекламных экранов и ожидание редиректа ──
+            for _ in range(20):
+                if "services.adobe.com" in page.url or "ims" in page.url:
+                    print(f"Adobe: ждем завершения редиректа ({page.url})...")
+                    await asyncio.sleep(2)
                     continue
 
-                # СТАТУС 8: Пассивная загрузка / Редиректы Adobe IMS
-                print(f"Adobe: Сканирование... (URL: {page.url})")
-                await asyncio.sleep(2)
+                if "enhance" in page.url and "auth" not in page.url:
+                    break
+                
+                # Мгновенный JS-клик по кнопкам "Пропустить"
+                try:
+                    await page.evaluate("""() => {
+                        const el = [...document.querySelectorAll('button, a')].find(e => /not now|skip|remind me later|напомнить|lembrar depois|pular|continue|continuar/i.test(e.innerText?.trim()));
+                        if (el && el.type !== 'submit') el.click();
+                    }""")
+                except Exception: pass
+                await asyncio.sleep(1)
 
-            # === ОКОНЧАНИЕ ЦИКЛА АВТОРИЗАЦИИ ===
+            # ── 8. Переходим на enhance ──
+            if "enhance" not in page.url:
+                await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(5)
 
-            if not auth_success:
-                await shot("/tmp/adobe_error.png", "❌ Adobe: Истекло время авторизации. Бот заблудился в интерфейсе.")
-                raise RuntimeError("Сбой навигации: State Machine не достигла студии Enhance.")
-            
-            print("✅ Adobe: авторизация завершена!")
+            # ── 9. Ждём интерфейс загрузки ──
+            print("Adobe: ждём интерфейс загрузки...")
+            for attempts in range(25):
+                ui_ready = False
+                
+                html = await page.content()
+                if await page.locator('input[type="file"]').count() > 0 or re.search(r"Choose files|Escolher arquivos", html, re.IGNORECASE):
+                    ui_ready = True
+                    break
+                
+                if attempts == 12:
+                    print("Adobe: долгая загрузка студии, принудительно обновляем (F5)...")
+                    try:
+                        await page.goto("https://podcast.adobe.com/enhance", timeout=30000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception: pass
+                
+                await asyncio.sleep(1)
+            else:
+                await shot("/tmp/adobe_error.png", "❌ Интерфейс Adobe не загрузился. Смотри /screen")
+                raise RuntimeError("Adobe: экран Enhance завис на загрузке (баг Adobe).")
+
+            await shot("/tmp/adobe_last.png", "✅ Adobe: авторизация завершена, загружаем файл...")
             await ctx.storage_state(path=STATE_FILE)
 
-            # ── ЗАГРУЗКА ФАЙЛА ──
+            # ── 10. ЗАГРУЗКА ФАЙЛА ──
             print("Adobe: начинаем загрузку файла...")
             uploaded = False
             
@@ -367,8 +439,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             if not uploaded:
                 try:
                     async with page.expect_file_chooser(timeout=8000) as fc_info:
-                        btn = page.locator('button').filter(has_text=re.compile(r"Choose files|Escolher arquivos", re.IGNORECASE)).first
-                        await btn.click(force=True)
+                        await page.evaluate("""() => {
+                            const el = [...document.querySelectorAll('button')].find(e => /Choose files|Escolher arquivos/i.test(e.innerText?.trim()));
+                            if (el) el.click();
+                        }""")
                     fc = await fc_info.value
                     await fc.set_files(str(mp3), timeout=15000)
                     uploaded = True
@@ -407,17 +481,15 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await shot("/tmp/adobe_last.png", "✅ Adobe: Файл передан! Ждем обработки...")
             await asyncio.sleep(3)
             
-            # Нажимаем Enhance (если авто-обработка не началась)
-            for frame in page.frames:
-                for txt in ["Enhance speech", "Enhance", "Melhorar"]:
-                    try:
-                        btn = frame.locator('button').filter(has_text=re.compile(txt, re.IGNORECASE)).first
-                        if await btn.count() > 0:
-                            await asyncio.wait_for(btn.click(force=True), timeout=5.0)
-                            break
-                    except Exception: continue
+            # Нажимаем Enhance (Мгновенный JS-клик)
+            try:
+                await page.evaluate("""() => {
+                    const el = [...document.querySelectorAll('button')].find(e => /Enhance speech|Enhance|Melhorar/i.test(e.innerText?.trim()));
+                    if (el) el.click();
+                }""")
+            except: pass
 
-            # ── ОЖИДАНИЕ И СКАЧИВАНИЕ ──
+            # ── 11. Ждём Download ──
             dl_btn = None
             print("Adobe: ждём обработку (макс 3 минуты)...")
             for i in range(36):
@@ -429,13 +501,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     pass
                 gc.collect()
 
-                for frame in page.frames:
-                    b = frame.locator('button, a').filter(has_text=re.compile(r"^Download$|^Baixar$", re.IGNORECASE)).last
-                    if await b.count() > 0 and await b.is_visible():
-                        dl_btn = b
+                try:
+                    has_dl = await page.evaluate("""() => {
+                        const el = [...document.querySelectorAll('button, a')].find(e => /^Download$|^Baixar$/i.test(e.innerText?.trim()));
+                        return el && el.offsetParent !== null;
+                    }""")
+                    if has_dl:
+                        dl_btn = True
                         break
-                if dl_btn: 
-                    break
+                except: pass
+
                 if i % 6 == 5: 
                     await shot("/tmp/adobe_last.png", f"Adobe: обрабатываем... {(i+1)*5} сек")
 
@@ -446,7 +521,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await shot("/tmp/adobe_last.png", "✅ Adobe обработал! Скачиваем...")
 
             async with page.expect_download(timeout=120000) as dl_info:
-                await dl_btn.click(force=True)
+                await page.evaluate("""() => {
+                    const el = [...document.querySelectorAll('button, a')].find(e => /^Download$|^Baixar$/i.test(e.innerText?.trim()));
+                    if (el) el.click();
+                }""")
             dl = await dl_info.value
             await dl.save_as(str(adobe))
             size = adobe.stat().st_size
@@ -785,6 +863,7 @@ def main():
         app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
         
         print("✅ Бот запущен!")
+        # 🔥 Жесткое убийство двойников 🔥
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
