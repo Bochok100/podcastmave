@@ -1,9 +1,8 @@
 """
-Podcast Bot v5.0 — Back to Basics (The Classic)
-- ВОЗВРАТ К ИДЕАЛЬНОЙ ЛИНЕЙНОЙ ЛОГИКЕ (v3.41). Убрана избыточная архитектура State Machine, перегружавшая бесплатный сервер.
-- УСТРАНЕНЫ ТАЙМАУТЫ: Все клики по кнопкам (Sign In, Verify, Continue) переписаны на сырой JavaScript (page.evaluate), который мгновенно бьет по DOM-дереву и никогда не зависает (в отличие от locator.click()).
-- БРОНЕБОЙНЫЙ 2FA: Использован метод мягкого фокуса (focus) вместо жесткого клика для обхода перерисовки React.
-- Оптимизация памяти, анти-двойник (drop_pending_updates=True) и прямая загрузка аудио сохранены.
+Podcast Bot v5.1 — The Patience Fix
+- УВЕЛИЧЕНО ТЕРПЕНИЕ: Таймер сканирования следующего шага (после email) увеличен с 30 до 90 секунд для обхода долгих невидимых проверок Cloudflare/Adobe на серверах Render.
+- КОНТРОЛЬНЫЙ КЛИК: Добавлено принудительное нажатие на кнопку Continue через JS сразу после Enter, чтобы предотвратить эффект "вечного спиннера".
+- Сохранена вся стабильная классическая линейная логика из v5.0.
 """
 
 import os
@@ -234,14 +233,26 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await page.keyboard.press("Backspace")
                         await email_loc.fill(ADOBE_EMAIL.strip())
                         await asyncio.sleep(0.5)
+                        
+                        print("Adobe: Жмем Enter...")
                         await page.keyboard.press("Enter")
+                        await asyncio.sleep(1)
+                        
+                        # 🔥 КОНТРОЛЬНЫЙ ВЫСТРЕЛ: Добиваем кнопку Continue через JS, чтобы снять "вечный спиннер" 🔥
+                        try:
+                            await page.evaluate("""() => {
+                                const btn = [...document.querySelectorAll('button')].find(b => /continue|continuar/i.test(b.innerText));
+                                if (btn && !btn.disabled) btn.click();
+                            }""")
+                        except: pass
+                        
                         email_found = True
                         break
                     except Exception: pass
                 await asyncio.sleep(1)
 
             if email_found:
-                print("Adobe: Email отправлен.")
+                print("Adobe: Email отправлен. Ждем реакции сервера...")
                 await asyncio.sleep(5)
                 await shot("/tmp/adobe_last.png", f"Adobe: после email.")
             else:
@@ -250,7 +261,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             # ── 4. Сканируем текущий шаг (Пароль или 2FA) ──
             print("Adobe: сканируем следующий шаг...")
             step = "unknown"
-            for _ in range(30):
+            
+            # 🔥 РЕЖИМ ХАТИКО: Даем Adobe 90 секунд на проверку безопасности (Render IPs очень медленные) 🔥
+            for _ in range(90):
                 if await page.locator('input[type="password"]').count() > 0:
                     step = "password"
                     break
@@ -863,7 +876,6 @@ def main():
         app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
         
         print("✅ Бот запущен!")
-        # 🔥 Жесткое убийство двойников 🔥
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
