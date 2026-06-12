@@ -797,8 +797,8 @@ def main():
         conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(btn_edit, pattern="^edit$")],
             states={
-                EDIT_TITLE: [MH(filters.TEXT & ~filters.COMMAND, edit_title)],
-                EDIT_DESC:  [MH(filters.TEXT & ~filters.COMMAND, edit_desc)],
+                EDIT_TITLE: [MH(filters.TEXT | filters.COMMAND, edit_title)],
+                EDIT_DESC:  [MH(filters.TEXT | filters.COMMAND, edit_desc)],
             },
             fallbacks=[CallbackQueryHandler(btn_cancel, pattern="^cancel$")],
             per_chat=True,
