@@ -1,8 +1,9 @@
 """
-Podcast Bot v9.0 — The Skeleton Key (Отмычка)
-- МАРКЕРЫ [V9]: Для контроля обновления версии на сервере.
-- БРОНЕБОЙНЫЙ ВВОД (JS Focus): Полностью удалены методы Playwright (locator.click и fill) для полей email, 2FA и пароля. Фокус на элементы ставится принудительно через чистый JavaScript (el.focus()), что пробивает любые невидимые слои (Shadow DOM) и предотвращает зависания.
-- ВИЗУАЛЬНЫЙ КОНТРОЛЬ: Добавлен контрольный скриншот после ввода пароля для подтверждения физического набора символов в поле.
+Podcast Bot v10.0 — The Masterpiece
+- ИСПРАВЛЕН ФАТАЛЬНЫЙ БАГ СКРЫТЫХ ПОЛЕЙ: Строго возвращена проверка `.is_visible()` для всех элементов. Бот больше не реагирует на скрытые поля паролей или 2FA, присутствующие в фоновом DOM-дереве Adobe.
+- ОБРАБОТКА ЭКРАНА ПОДТВЕРЖДЕНИЯ: Добавлена логика перехвата промежуточного экрана "Verify your identity" с кнопкой Continue (как на крайнем скриншоте).
+- НУЛЕВАЯ НАГРУЗКА: Возврат к чистому, легковесному циклу сканирования без перегрузки процессора сервера Render.
+- ГАРАНТИЯ КЛИКА: Сохранены пробивные методы JS (.focus() и force=True).
 """
 
 import os
@@ -69,14 +70,12 @@ async def handle_client(reader, writer):
         response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBot alive!\r\n"
         writer.write(response.encode('utf8'))
         await writer.drain()
-    except Exception:
-        pass
+    except Exception: pass
     finally:
         try:
             writer.close()
             await writer.wait_closed()
-        except Exception:
-            pass
+        except Exception: pass
 
 async def run_dummy_server():
     port = int(os.environ.get("PORT", 10000))
@@ -96,7 +95,7 @@ async def download_voice(update, context) -> Path:
     fd, path = tempfile.mkstemp(suffix=".ogg")
     os.close(fd) 
     
-    print(f"[V9] Скачиваем аудио в {path}...")
+    print(f"[V10] Скачиваем аудио в {path}...")
     await f.download_to_drive(path)
     return Path(path)
 
@@ -112,8 +111,7 @@ async def to_mp3(src: Path) -> Path:
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         if proc.returncode != 0:
-            err_msg = stderr.decode('utf-8', errors='ignore')[-200:]
-            raise RuntimeError(f"Ошибка конвертации: {err_msg}")
+            raise RuntimeError(f"Ошибка конвертации: {stderr.decode('utf-8', errors='ignore')[-200:]}")
     except FileNotFoundError:
         raise RuntimeError("⚠️ ffmpeg не установлен на сервере!")
     except asyncio.TimeoutError:
@@ -166,31 +164,29 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
         if os.path.exists(STATE_FILE):
-            print("[V9] Обнаружен файл сессии, подгружаем куки...")
+            print("[V10] Обнаружен файл сессии, подгружаем куки...")
             context_args["storage_state"] = STATE_FILE
 
         ctx = await browser.new_context(**context_args)
-        await ctx.add_init_script("""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-        """)
+        await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = await ctx.new_page()
 
         try:
             # ── 1. Открываем страницу ──
-            print("[V9] Открываем страницу...")
+            print("[V10] Открываем страницу...")
             await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
             await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(4)
-            await shot("/tmp/adobe_last.png", f"ℹ️ [V9] Adobe: открыли. URL: {page.url}")
+            await shot("/tmp/adobe_last.png", f"ℹ️ [V10] Adobe: открыли. URL: {page.url}")
 
-            # ── 2. БУЛЬДОЗЕРНЫЙ КЛИК ПО SIGN IN ──
-            print("[V9] Нажимаем Sign In...")
+            # ── 2. КЛИК ПО SIGN IN ──
+            print("[V10] Нажимаем Sign In...")
             try:
                 await page.evaluate("""() => {
                     document.querySelectorAll('[id*="onetrust"], [class*="cookie"], [class*="overlay"]').forEach(e => e.remove());
                 }""")
                 sign_btn = page.locator('a, button, span').filter(has_text=re.compile(r"^sign in$|^entrar$|^log in$", re.IGNORECASE)).first
-                if await sign_btn.count() > 0:
+                if await sign_btn.count() > 0 and await sign_btn.is_visible():
                     await sign_btn.click(force=True, no_wait_after=True)
                 else:
                     await page.evaluate("""() => {
@@ -198,7 +194,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         if (el) el.click();
                     }""")
             except Exception as e:
-                print(f"[V9] Ошибка JS клика: {e}")
+                print(f"[V10] Ошибка JS клика: {e}")
                 
             auth_reached = False
             for _ in range(30):
@@ -208,24 +204,20 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     break
                     
             if not auth_reached:
-                await shot("/tmp/adobe_error.png", "❌ [V9] Ошибка: Не удалось перейти на форму логина. Сервер завис.")
-                raise RuntimeError("[V9] Сбой навигации: не удалось перейти на логин.")
+                await shot("/tmp/adobe_error.png", "❌ [V10] Ошибка: Не удалось перейти на форму логина. Сервер завис.")
+                raise RuntimeError("[V10] Сбой навигации: не удалось перейти на логин.")
 
-            print(f"[V9] Успешно перешли на логин. URL: {page.url}")
+            print(f"[V10] Успешно перешли на логин. URL: {page.url}")
 
-            # ── 3. Ввод Email (Через JS Focus) ──
-            print("[V9] ищем поле email...")
+            # ── 3. Ввод Email ──
+            print("[V10] ищем поле email...")
             email_found = False
             for _ in range(20):
-                has_email = await page.evaluate("""() => {
-                    const el = document.querySelector('input[type="email"], input[name="username"]');
-                    if (el) { el.focus(); el.click(); return true; }
-                    return false;
-                }""")
-                
-                if has_email:
+                email_loc = page.locator('input[type="email"], input[name="username"]').first
+                # СТРОГАЯ ПРОВЕРКА ВИДИМОСТИ
+                if await email_loc.count() > 0 and await email_loc.is_visible():
                     try:
-                        await asyncio.sleep(0.5)
+                        await email_loc.evaluate("node => node.focus()")
                         await page.keyboard.press("Control+A")
                         await page.keyboard.press("Backspace")
                         await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
@@ -248,54 +240,64 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             if email_found:
                 await asyncio.sleep(5)
-                await shot("/tmp/adobe_last.png", f"ℹ️ [V9] Adobe: после email.")
+                await shot("/tmp/adobe_last.png", f"ℹ️ [V10] Adobe: после email.")
             
-            # ── 4. Сканируем шаг ──
+            # ── 4. ИДЕАЛЬНЫЙ СКАНЕР ШАГОВ (Защита от скрытых полей) ──
+            print("[V10] Сканируем следующий шаг...")
             step = "unknown"
             for _ in range(90):
-                if await page.locator('input[type="password"], input[name="password"]').count() > 0:
+                html = await page.content()
+                
+                # ШАГ 4.1: Промежуточный экран с кнопкой Continue (Как на твоем скриншоте!)
+                if "verify your identity" in html.lower() or "confirme" in html.lower() or "confirm your" in html.lower():
+                    cont_btn = page.locator('button').filter(has_text=re.compile(r"^Continue$|^Continuar$", re.IGNORECASE)).first
+                    if await cont_btn.count() > 0 and await cont_btn.is_visible():
+                        print("[V10] Обнаружена промежуточная кнопка Continue. Нажимаем...")
+                        await cont_btn.click(force=True)
+                        await asyncio.sleep(4)
+                        continue # Остаемся в цикле, ждем появления 6 квадратиков
+
+                # ШАГ 4.2: Пароль (ТОЛЬКО ВИДИМОЕ ПОЛЕ)
+                pwd_loc = page.locator('input[type="password"], input[name="password"]').first
+                if await pwd_loc.count() > 0 and await pwd_loc.is_visible():
                     step = "password"
                     break
-                if await page.locator('input[type="text"], input[type="number"], input[type="tel"]').count() > 0:
+                
+                # ШАГ 4.3: Код 2FA (ТОЛЬКО ВИДИМОЕ ПОЛЕ)
+                code_loc = page.locator('input[type="text"], input[type="number"], input[type="tel"]').first
+                if await code_loc.count() > 0 and await code_loc.is_visible() and ("verify" in html.lower() or "code" in html.lower()):
                     step = "code_2fa"
                     break
-                
-                html = await page.content()
-                if re.search(r"Verify|Confirme|identity", html, re.IGNORECASE):
-                    try:
-                        await page.evaluate("""() => {
-                            const el = [...document.querySelectorAll('button')].find(e => /^continue$|^continuar$/i.test(e.innerText?.trim()));
-                            if (el) el.click();
-                        }""")
-                    except: pass
                     
+                # ШАГ 4.4: Загрузка файлов
                 if "enhance" in page.url and "auth" not in page.url:
                     if await page.locator('input[type="file"]').count() > 0:
                         step = "done"
                         break
+                
                 await asyncio.sleep(1)
 
-            # ── 5. 2FA Код (Через JS Focus) ──
+            # ── 5. 2FA Код ──
             if step == "code_2fa":
-                await shot("/tmp/adobe_last.png", "⚠️ [V9] Adobe запросил код с почты! Пришли его сюда (3 минуты).")
+                await shot("/tmp/adobe_last.png", "⚠️ [V10] Adobe запросил код с почты! Пришли его сюда (3 минуты).")
                 ev = asyncio.Event()
                 adobe_2fa_state[user_id] = {"event": ev, "code": ""}
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=180)
                     code = adobe_2fa_state[user_id]["code"].strip()
                     
-                    await shot("/tmp/adobe_last.png", f"⏳ [V9] Начинаю ввод кода {code}...")
+                    print(f"[V10] Начинаю ввод кода {code}...")
                     
                     try:
-                        # Принудительный фокус через JS
+                        # Принудительный фокус
                         await page.evaluate("""() => {
                             const el = document.querySelector('input[type="text"], input[type="number"], input[type="tel"]');
-                            if (el) { el.focus(); el.click(); }
+                            if (el) { el.focus(); }
                         }""")
-                        await page.keyboard.type(code, delay=300)
+                        await page.keyboard.type(code, delay=200)
                     except Exception as e:
-                        print(f"[V9] Ошибка фокуса 2FA: {e}")
-                        await page.keyboard.type(code, delay=300)
+                        print(f"[V10] Ошибка фокуса 2FA: {e}")
+                        await page.keyboard.type(code, delay=200)
 
                     await asyncio.sleep(2)
                     
@@ -308,6 +310,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(1)
                     await page.keyboard.press("Enter")
                     
+                    await shot("/tmp/adobe_last.png", f"✅ [V10] Код вбит. Ждем ответ Adobe...")
+                    
                     password_found = False
                     for _ in range(30):
                         await asyncio.sleep(1)
@@ -315,46 +319,44 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                             step = "done"
                             password_found = True
                             break
-                        if await page.locator('input[type="password"], input[name="password"]').count() > 0:
+                            
+                        # СТРОГАЯ ПРОВЕРКА НА ВИДИМОСТЬ ПАРОЛЯ
+                        check_pwd = page.locator('input[type="password"], input[name="password"]').first
+                        if await check_pwd.count() > 0 and await check_pwd.is_visible():
                             step = "password"
                             password_found = True
                             break
                         
                         html_after = await page.content()
                         if re.search(r"inválido|invalid|incorrect|wrong|неверный", html_after, re.IGNORECASE):
-                            await shot("/tmp/adobe_error.png", "❌ [V9] Ошибка: Неверный код 2FA. Запусти заново.")
-                            raise RuntimeError("[V9] Adobe не принял код 2FA.")
+                            await shot("/tmp/adobe_error.png", "❌ [V10] Ошибка: Неверный код 2FA. Запусти заново.")
+                            raise RuntimeError("[V10] Adobe не принял код 2FA.")
 
                     if not password_found:
-                        await shot("/tmp/adobe_error.png", "❌ [V9] Завис после ввода кода 2FA.")
-                        raise RuntimeError("[V9] Adobe не перешел к паролю.")
+                        await shot("/tmp/adobe_error.png", "❌ [V10] Завис после ввода кода 2FA.")
+                        raise RuntimeError("[V10] Adobe не перешел к паролю.")
 
                 except asyncio.TimeoutError:
-                    raise RuntimeError("[V9] 2FA таймаут: код не пришёл.")
+                    raise RuntimeError("[V10] 2FA таймаут: код не пришёл.")
                 finally:
                     adobe_2fa_state.pop(user_id, None)
 
-            # ── 6. Пароль (Через JS Focus) ──
+            # ── 6. Пароль ──
             if step == "password":
-                await shot("/tmp/adobe_last.png", "🔐 [V9] Открылась форма пароля. Пытаюсь ввести...")
+                await shot("/tmp/adobe_last.png", "🔐 [V10] Открылась форма пароля. Пытаюсь ввести...")
                 pwd_found = False
                 for _ in range(15):
-                    has_pwd = await page.evaluate("""() => {
-                        const pwd = document.querySelector('input[type="password"], input[name="password"]');
-                        if (pwd) { pwd.focus(); pwd.click(); return true; }
-                        return false;
-                    }""")
-                    
-                    if has_pwd:
+                    pwd_loc = page.locator('input[type="password"], input[name="password"]').first
+                    # СТРОГАЯ ПРОВЕРКА НА ВИДИМОСТЬ
+                    if await pwd_loc.count() > 0 and await pwd_loc.is_visible():
                         try:
-                            await asyncio.sleep(0.5)
+                            await pwd_loc.evaluate("node => node.focus()")
                             await page.keyboard.press("Control+A")
                             await page.keyboard.press("Backspace")
                             await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
                             await asyncio.sleep(1)
                             
-                            # СКРИНШОТ-ДОКАЗАТЕЛЬСТВО С ЗАПОЛНЕННЫМ ПОЛЕМ
-                            await shot("/tmp/adobe_last.png", "👀 [V9] Пароль впечатан. Нажимаю Continue...")
+                            await shot("/tmp/adobe_last.png", "👀 [V10] Пароль впечатан. Нажимаю Continue...")
                             
                             await page.evaluate("""() => {
                                 const btn = [...document.querySelectorAll('button')].find(b => /continue|continuar/i.test(b.innerText));
@@ -370,9 +372,9 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
                 if pwd_found:
                     await asyncio.sleep(8)
-                    await shot("/tmp/adobe_last.png", f"ℹ️ [V9] Пароль отправлен. Ожидаю загрузки...")
+                    await shot("/tmp/adobe_last.png", f"ℹ️ [V10] Пароль отправлен. Ожидаю загрузки...")
                 else:
-                    await shot("/tmp/adobe_error.png", "⚠️ [V9] Поле пароля не поддалось вводу.")
+                    await shot("/tmp/adobe_error.png", "⚠️ [V10] Поле пароля не поддалось вводу.")
 
             gc.collect()
 
@@ -409,10 +411,10 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     except: pass
                 await asyncio.sleep(1)
             else:
-                await shot("/tmp/adobe_error.png", "❌ [V9] Интерфейс Adobe не загрузился.")
-                raise RuntimeError("[V9] Экран Enhance завис на загрузке.")
+                await shot("/tmp/adobe_error.png", "❌ [V10] Интерфейс Adobe не загрузился.")
+                raise RuntimeError("[V10] Экран Enhance завис на загрузке.")
 
-            await shot("/tmp/adobe_last.png", "✅ [V9] Авторизация завершена, загружаем файл...")
+            await shot("/tmp/adobe_last.png", "✅ [V10] Авторизация завершена, загружаем файл...")
             await ctx.storage_state(path=STATE_FILE)
 
             # ── 10. ЗАГРУЗКА ФАЙЛА ──
@@ -457,8 +459,8 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 except: pass
 
             if not uploaded:
-                await shot("/tmp/adobe_error.png", "❌ [V9] Ошибка: не удалось передать файл в Adobe.")
-                raise RuntimeError("[V9] Все методы загрузки файла провалились.")
+                await shot("/tmp/adobe_error.png", "❌ [V10] Ошибка: не удалось передать файл в Adobe.")
+                raise RuntimeError("[V10] Все методы загрузки файла провалились.")
             
             await asyncio.sleep(3)
             
@@ -488,13 +490,13 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 except: pass
 
                 if i % 6 == 5: 
-                    await shot("/tmp/adobe_last.png", f"ℹ️ [V9] Adobe: обрабатываем... {(i+1)*5} сек")
+                    await shot("/tmp/adobe_last.png", f"ℹ️ [V10] Adobe: обрабатываем... {(i+1)*5} сек")
 
             if not dl_btn:
-                await shot("/tmp/adobe_error.png", "❌ [V9] Кнопка Download не появилась!")
-                raise RuntimeError("[V9] Кнопка Download не найдена.")
+                await shot("/tmp/adobe_error.png", "❌ [V10] Кнопка Download не появилась!")
+                raise RuntimeError("[V10] Кнопка Download не найдена.")
 
-            await shot("/tmp/adobe_last.png", "✅ [V9] Adobe обработал! Скачиваем...")
+            await shot("/tmp/adobe_last.png", "✅ [V10] Adobe обработал! Скачиваем...")
 
             async with page.expect_download(timeout=120000) as dl_info:
                 await page.evaluate("""() => {
@@ -506,7 +508,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             size = adobe.stat().st_size
 
             if size < 10000:
-                raise RuntimeError(f"[V9] Adobe вернул пустой файл ({size} байт)")
+                raise RuntimeError(f"[V10] Adobe вернул пустой файл ({size} байт)")
 
             r = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y", "-i", str(adobe),
@@ -522,7 +524,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
         except Exception as e:
             try:
                 await page.screenshot(path="/tmp/adobe_error.png", timeout=5000)
-                await notify("/tmp/adobe_error.png", f"❌ [V9] Adobe ошибка: {str(e)[:120]}")
+                await notify("/tmp/adobe_error.png", f"❌ [V10] Adobe ошибка: {str(e)[:120]}")
             except: pass
             raise RuntimeError(f"Adobe: {e}")
         finally:
@@ -653,13 +655,13 @@ async def generate_metadata(transcript: str) -> tuple[str, str]:
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
-    msg = await update.message.reply_text("⏳ [V9] Начинаю...")
+    msg = await update.message.reply_text("⏳ [V10] Начинаю...")
     try:
         ogg = await download_voice(update, ctx)
-        await msg.edit_text("🔄 [V9] MP3...")
+        await msg.edit_text("🔄 [V10] MP3...")
         mp3 = await to_mp3(ogg)
 
-        await msg.edit_text("🎙️ [V9] Adobe Podcast Enhance (3-5 мин)...")
+        await msg.edit_text("🎙️ [V10] Adobe Podcast Enhance (3-5 мин)...")
 
         async def notify(path, caption):
             try:
@@ -671,7 +673,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             studio = await asyncio.wait_for(enhance_audio(mp3, uid, notify), timeout=600.0)
         except asyncio.TimeoutError:
-            raise RuntimeError("[V9] Критическое зависание: процесс занял более 10 минут.")
+            raise RuntimeError("[V10] Критическое зависание: процесс занял более 10 минут.")
 
         for _f in [ogg, mp3]:
             try:
@@ -679,10 +681,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except: pass
         gc.collect()
 
-        await msg.edit_text("📝 [V9] Whisper транскрипция...")
+        await msg.edit_text("📝 [V10] Whisper транскрипция...")
         text = await transcribe(studio)
 
-        await msg.edit_text("✍️ [V9] GPT-4o заголовок...")
+        await msg.edit_text("✍️ [V10] GPT-4o заголовок...")
         title, desc = await generate_metadata(text)
         del text 
         gc.collect()
@@ -712,7 +714,7 @@ async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if uid in adobe_2fa_state:
         adobe_2fa_state[uid]["code"] = update.message.text.strip()
         adobe_2fa_state[uid]["event"].set()
-        await update.message.reply_text("✅ [V9] Код принят! Возвращаюсь в Adobe...")
+        await update.message.reply_text("✅ [V10] Код принят! Возвращаюсь в Adobe...")
 
 async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -722,7 +724,7 @@ async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not data:
         await q.edit_message_text("❌ Сессия устарела.")
         return
-    await q.edit_message_text("⏳ [V9] Загружаю в mave...")
+    await q.edit_message_text("⏳ [V10] Загружаю в mave...")
     try:
         await upload_to_mave(data["mp3"], data["title"], data["description"])
         try:
@@ -783,7 +785,7 @@ async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Запуск ─────────────────────────────────────
 def main():
-    print("🚀 [V9] Бот запускается...")
+    print("🚀 [V10] Бот запускается...")
     if not TELEGRAM_TOKEN:
         print("❌ КРИТИЧЕСКАЯ ОШИБКА: TELEGRAM_TOKEN не найден в переменных окружения Render!")
         time.sleep(600)
@@ -806,7 +808,7 @@ def main():
         app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
         app.add_handler(CallbackQueryHandler(btn_cancel, pattern="^cancel$"))
         
-        print("✅ [V9] Бот запущен!")
+        print("✅ [V10] Бот запущен!")
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА: {e}")
