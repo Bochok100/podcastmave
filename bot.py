@@ -1,8 +1,8 @@
 """
-Podcast Bot v4.1 — The Regex Fix
-- ИСПРАВЛЕНА СИНТАКСИЧЕСКАЯ ОШИБКА: флаг игнорирования регистра (?i) заменен на нативный re.IGNORECASE, чтобы предотвратить ошибки трансляции Regex в движок JavaScript (V8).
-- Сохранен State Machine Engine: бот оценивает экран и сам решает, что вводить, без линейных таймеров.
-- Сохранен прямой SPA-роутинг и обход React-защиты 2FA.
+Podcast Bot v4.2 — The Handshake Fix
+- ИСПРАВЛЕН БАГ ЛОЖНОГО ОТТОРЖЕНИЯ 2FA: Бот больше не нажимает Enter вслепую после ввода кода. Добавлена проверка появления поля password перед сабмитом и парсингом ошибок.
+- Улучшен ввод пароля: перед вводом поле принудительно очищается (на случай мусорных символов).
+- Сохранен State Machine Engine: нулевая нагрузка на сервер, полная адаптивность к лагам сайта.
 """
 
 import os
@@ -255,17 +255,16 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 # СТАТУС 5: Поле Пароля
                 pwd_inp = page.locator('input[type="password"]').first
                 if await pwd_inp.is_visible():
-                    val = await pwd_inp.input_value()
-                    if not val:
-                        print("Adobe: Вводим Пароль...")
-                        await pwd_inp.click(force=True)
-                        await pwd_inp.fill(ADOBE_PASSWORD.strip())
-                        await asyncio.sleep(0.5)
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(2)
-                        await shot("/tmp/adobe_last.png", f"Adobe: пароль введен.")
-                    else:
-                        await page.keyboard.press("Enter")
+                    print("Adobe: Вводим Пароль...")
+                    await pwd_inp.click(force=True)
+                    # Жестко очищаем поле перед вводом (от мусорных Enter-ов)
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.press("Backspace")
+                    await pwd_inp.fill(ADOBE_PASSWORD.strip())
+                    await asyncio.sleep(0.5)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(2)
+                    await shot("/tmp/adobe_last.png", f"Adobe: пароль введен.")
                     await asyncio.sleep(5)
                     continue
 
@@ -280,54 +279,62 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 # СТАТУС 7: Поля 2FA
                 tel_inps = page.locator('input[type="text"], input[type="number"], input[type="tel"]')
                 if await tel_inps.count() > 0 and ("verify" in html.lower() or "confirme" in html.lower() or "code" in html.lower()):
-                    await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда (3 минуты).")
-                    ev = asyncio.Event()
-                    adobe_2fa_state[user_id] = {"event": ev, "code": ""}
-                    try:
-                        await asyncio.wait_for(ev.wait(), timeout=180)
-                        code = adobe_2fa_state[user_id]["code"].strip()
-                        await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
+                    
+                    # Проверяем, не висим ли мы тут уже после ввода кода
+                    if user_id not in adobe_2fa_state:
+                        await shot("/tmp/adobe_last.png", "⚠️ Adobe запросил код с почты! Пришли его сюда (3 минуты).")
+                        ev = asyncio.Event()
+                        adobe_2fa_state[user_id] = {"event": ev, "code": ""}
+                        try:
+                            await asyncio.wait_for(ev.wait(), timeout=180)
+                            code = adobe_2fa_state[user_id]["code"].strip()
+                            await shot("/tmp/adobe_last.png", f"⏳ Ввожу код {code[:2]}***...")
 
-                        count = await tel_inps.count()
-                        if count >= 6:
-                            print("Adobe: Ввод 2FA в 6 ячеек (Обход React)...")
-                            for i in range(6):
-                                try:
-                                    target = page.locator('input[type="text"], input[type="number"], input[type="tel"]').nth(i)
-                                    await target.click(force=True)
+                            count = await tel_inps.count()
+                            if count >= 6:
+                                print("Adobe: Ввод 2FA в 6 ячеек (Обход React)...")
+                                for i in range(6):
+                                    try:
+                                        target = page.locator('input[type="text"], input[type="number"], input[type="tel"]').nth(i)
+                                        await target.click(force=True)
+                                        await asyncio.sleep(0.1)
+                                        await page.keyboard.press(code[i])
+                                    except Exception:
+                                        await page.keyboard.press(code[i])
                                     await asyncio.sleep(0.1)
-                                    await page.keyboard.press(code[i])
-                                except Exception:
-                                    await page.keyboard.press(code[i])
-                                await asyncio.sleep(0.1)
-                        elif count > 0:
-                            print("Adobe: Ввод 2FA в единое поле...")
-                            await tel_inps.first.click(force=True)
-                            await tel_inps.first.fill(code)
-                        else:
-                            await page.keyboard.type(code, delay=200)
+                            elif count > 0:
+                                print("Adobe: Ввод 2FA в единое поле...")
+                                await tel_inps.first.click(force=True)
+                                await tel_inps.first.fill(code)
+                            else:
+                                await page.keyboard.type(code, delay=200)
 
-                        await asyncio.sleep(3)
-                        
-                        # Нажатие кнопки подтверждения
-                        verify_btn = page.locator('button').filter(has_text=re.compile(r"^Verify$|^Verificar$|^Submit$", re.IGNORECASE)).first
-                        if await verify_btn.is_visible():
-                            await verify_btn.click(force=True)
-                        else:
-                            await page.keyboard.press("Enter")
+                            print("Adobe: Код введен. Ожидаем авто-отправку от Adobe (3 сек)...")
+                            await asyncio.sleep(3)
+                            
+                            # 🔥 ИСПРАВЛЕНИЕ: Проверяем, не перекинуло ли нас уже на пароль 🔥
+                            if await page.locator('input[type="password"]').count() == 0:
+                                # Мы всё еще на странице 2FA
+                                verify_btn = page.locator('button').filter(has_text=re.compile(r"^Verify$|^Verificar$|^Submit$", re.IGNORECASE)).first
+                                if await verify_btn.is_visible():
+                                    await verify_btn.click(force=True)
+                                else:
+                                    await page.keyboard.press("Enter")
+                                await asyncio.sleep(4)
+                            
+                            # 🔥 ИСПРАВЛЕНИЕ: Проверяем ошибки ТОЛЬКО если пароля нет на экране 🔥
+                            if await page.locator('input[type="password"]').count() == 0:
+                                html_after = await page.content()
+                                if re.search(r"inválido|invalid|incorrect|wrong|неверный", html_after, re.IGNORECASE):
+                                    await shot("/tmp/adobe_error.png", "❌ Adobe: Неверный код 2FA. Запусти заново.")
+                                    raise RuntimeError("Adobe не принял код 2FA.")
+                            else:
+                                print("Adobe: 2FA успешно пройден, обнаружено поле пароля!")
 
-                        await asyncio.sleep(5)
-                        
-                        # Проверка на отторжение кода
-                        html_after = await page.content()
-                        if re.search(r"inválido|invalid|incorrect|wrong|неверный", html_after, re.IGNORECASE):
-                            await shot("/tmp/adobe_error.png", "❌ Adobe: Неверный код 2FA. Запусти заново.")
-                            raise RuntimeError("Adobe не принял код 2FA.")
-
-                    except asyncio.TimeoutError:
-                        raise RuntimeError("2FA таймаут: код не пришёл за 3 минуты.")
-                    finally:
-                        adobe_2fa_state.pop(user_id, None)
+                        except asyncio.TimeoutError:
+                            raise RuntimeError("2FA таймаут: код не пришёл за 3 минуты.")
+                        finally:
+                            adobe_2fa_state.pop(user_id, None)
                     continue
 
                 # СТАТУС 8: Пассивная загрузка / Редиректы Adobe IMS
