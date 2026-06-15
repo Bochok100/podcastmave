@@ -1,8 +1,6 @@
 """
-Podcast Bot v13.1 — The Perfect Post
-- ИСПРАВЛЕН БАГ ФОРМАТИРОВАНИЯ: Убран лишний html.escape, который ломал жирный шрифт.
-- КЛИКАБЕЛЬНЫЕ ССЫЛКИ: Длинные URL спрятаны внутрь текста (гиперссылки).
-- ОТЛОЖЕННЫЙ ПОСТИНГ: Бразилия (UTC-3).
+Podcast Bot v13.2
+- ИСПРАВЛЕН IMAP: адрес message@adobe.com, убран UNSEEN, fallback на HTML-тело.
 """
 
 import os
@@ -61,7 +59,6 @@ STYLE_PROMPT = """
 ТРАНСКРИПЦИЯ:
 """
 
-# ИДЕАЛЬНЫЙ ШАБЛОН: Весь текст жирный (<b>...</b>), ссылки спрятаны в текст (<a href="...">...</a>)
 POST_TEMPLATE = """<b>НОВЫЙ ВЫПУСК УЖЕ НА ПЛОЩАДКАХ:
 
 {title}
@@ -104,29 +101,59 @@ async def delayed_publish(delay: int, chat_id: str, photo_path: str, text: str, 
 
 # ── IMAP Почта ─────────────────────────────────
 async def fetch_adobe_code_from_email() -> str:
-    if not EMAIL_USER or not EMAIL_PASS: return None
+    if not EMAIL_USER or not EMAIL_PASS:
+        return None
+
     def _fetch():
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
             mail.login(EMAIL_USER, EMAIL_PASS)
             mail.select("inbox")
-            status, messages = mail.search(None, '(UNSEEN FROM "account-recovery@adobe.com")')
+
+            # Ищем по реальному адресу Adobe, без фильтра UNSEEN
+            status, messages = mail.search(None, '(FROM "message@adobe.com")')
             mail_ids = messages[0].split()
-            if not mail_ids: return None
+            if not mail_ids:
+                print("IMAP: писем от message@adobe.com не найдено")
+                return None
+
+            # Берём последнее письмо
             status, msg_data = mail.fetch(mail_ids[-1], '(RFC822)')
             for response_part in msg_data:
-                if isinstance(response_part, tuple):
-                    msg = email.message_from_bytes(response_part[1])
-                    body = msg.get_payload(decode=True).decode(errors="ignore") if not msg.is_multipart() else next(p.get_payload(decode=True).decode(errors="ignore") for p in msg.walk() if p.get_content_type() == "text/plain")
-                    match = re.search(r'\b\d{6}\b', body)
-                    if match: return match.group(0)
-        except Exception as e: print(f"Ошибка IMAP: {e}")
+                if not isinstance(response_part, tuple):
+                    continue
+                msg = email.message_from_bytes(response_part[1])
+
+                body = ""
+                if msg.is_multipart():
+                    # Сначала ищем text/plain, потом fallback на text/html
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct == "text/plain":
+                            body = part.get_payload(decode=True).decode(errors="ignore")
+                            break
+                        elif ct == "text/html" and not body:
+                            body = part.get_payload(decode=True).decode(errors="ignore")
+                else:
+                    body = msg.get_payload(decode=True).decode(errors="ignore")
+
+                print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
+                match = re.search(r'\b\d{6}\b', body)
+                if match:
+                    return match.group(0)
+
+        except Exception as e:
+            print(f"Ошибка IMAP: {e}")
         return None
 
-    for _ in range(12):
+    # 18 попыток × 10 секунд = 3 минуты ожидания
+    for attempt in range(18):
+        print(f"IMAP: попытка {attempt + 1}/18...")
         code = await asyncio.to_thread(_fetch)
-        if code: return code
+        if code:
+            return code
         await asyncio.sleep(10)
+
     return None
 
 # ── Утилиты ────────────────────────────────────
@@ -149,7 +176,7 @@ async def download_voice(update, context) -> Path:
     voice = update.message.voice or update.message.audio
     f = await context.bot.get_file(voice.file_id)
     fd, path = tempfile.mkstemp(suffix=".ogg")
-    os.close(fd) 
+    os.close(fd)
     await f.download_to_drive(path)
     return Path(path)
 
@@ -188,7 +215,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             if not is_logged_in:
                 try: await sign_btn.click(force=True)
                 except: pass
-                
+
                 for _ in range(30):
                     await asyncio.sleep(1)
                     if "auth" in page.url or "login" in page.url: break
@@ -206,14 +233,14 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     html_page = await page.content()
                     if "verify your identity" in html_page.lower():
                         cb = page.locator('button').filter(has_text=re.compile(r"^Continue$", re.IGNORECASE)).first
-                        if await cb.count() > 0: await cb.click(force=True); await asyncio.sleep(4); continue 
+                        if await cb.count() > 0: await cb.click(force=True); await asyncio.sleep(4); continue
                     if await page.locator('input[type="password"]').count() > 0: step = "password"; break
                     if await page.locator('input[type="text"]').count() > 0 and "code" in html_page.lower(): step = "code_2fa"; break
                     if "enhance" in page.url and "auth" not in page.url: step = "done"; break
                     await asyncio.sleep(1)
 
                 if step == "code_2fa":
-                    await shot("/tmp/adobe_last.png", "📧 [V13.1] Проверяю Gmail на наличие кода...")
+                    await shot("/tmp/adobe_last.png", "📧 [V13.2] Проверяю Gmail на наличие кода...")
                     auto_code = await fetch_adobe_code_from_email()
                     if auto_code:
                         await notify(None, f"✅ Нашел код: {auto_code}")
@@ -230,7 +257,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await page.keyboard.type(final_code, delay=200)
                     await asyncio.sleep(2)
                     await page.keyboard.press("Enter")
-                    
+
                     for _ in range(30):
                         await asyncio.sleep(1)
                         if "enhance" in page.url: step = "done"; break
@@ -264,7 +291,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
             await file_input.evaluate("node => node.style.display = 'block'")
             await file_input.set_input_files(str(mp3), timeout=15000)
             await asyncio.sleep(3)
-            
+
             try: await page.evaluate("const el = [...document.querySelectorAll('button')].find(e => /Enhance speech/i.test(e.innerText)); if (el) el.click();")
             except: pass
 
@@ -300,10 +327,10 @@ async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
             await page.evaluate("document.querySelectorAll('[id^=\"q-portal\"], .q-overlay').forEach(e=>e.remove());")
             await page.locator('text=Добавить выпуск').first.click()
             await asyncio.sleep(3)
-            
+
             await page.set_input_files('input[type="file"]', str(mp3))
             await asyncio.sleep(2)
-            
+
             for sel in ['button:has-text("Загрузить файл")', 'button:has-text("Загрузить")']:
                 try:
                     if await page.locator(sel).count() > 0: await page.locator(sel).first.click(); break
@@ -361,13 +388,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
-    msg = await update.message.reply_text("⏳ [V13.1] Начинаю...")
+    msg = await update.message.reply_text("⏳ [V13.2] Начинаю...")
     try:
         ogg = await download_voice(update, ctx)
-        await msg.edit_text("🔄 [V13.1] MP3...")
+        await msg.edit_text("🔄 [V13.2] MP3...")
         mp3 = await to_mp3(ogg)
 
-        await msg.edit_text("🎙️ [V13.1] Adobe Podcast Enhance...")
+        await msg.edit_text("🎙️ [V13.2] Adobe Podcast Enhance...")
         async def notify(path, caption):
             try:
                 if path and os.path.exists(path):
@@ -378,10 +405,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         studio = await enhance_audio(mp3, uid, notify)
 
-        await msg.edit_text("📝 [V13.1] Whisper транскрипция...")
+        await msg.edit_text("📝 [V13.2] Whisper транскрипция...")
         text = await transcribe(studio)
 
-        await msg.edit_text("✍️ [V13.1] GPT-4o заголовок...")
+        await msg.edit_text("✍️ [V13.2] GPT-4o заголовок...")
         title, desc = await generate_metadata(text)
 
         pending[uid] = {"mp3": studio, "title": title, "description": desc}
@@ -397,7 +424,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = update.message.text.strip()
-    
+
     if uid in adobe_2fa_state and adobe_2fa_state[uid]["event"] and not adobe_2fa_state[uid]["event"].is_set():
         adobe_2fa_state[uid]["code"] = text
         adobe_2fa_state[uid]["event"].set()
@@ -409,12 +436,12 @@ async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if delay < 0:
             await update.message.reply_text("❌ Неверный формат. Напиши время в формате ЧЧ:ММ (например, 14:30):")
             return
-            
+
         pending[uid]["wait_time"] = False
         data = pending[uid]
-        
+
         asyncio.create_task(delayed_publish(delay, CHANNEL_ID, COVER_FILE, data["post_text"], ctx.bot))
-        
+
         target_time = (datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))) + datetime.timedelta(seconds=delay)).strftime("%H:%M")
         await update.message.reply_text(f"✅ Супер! Пост запланирован на {target_time} (время Бразилии).\nЯ отправлю его автоматически.")
         pending.pop(uid, None)
@@ -425,24 +452,23 @@ async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     data = pending.get(uid)
     if not data: return await q.edit_message_text("❌ Сессия устарела.")
-    await q.edit_message_text("⏳ [V13.1] Загружаю в mave...")
+    await q.edit_message_text("⏳ [V13.2] Загружаю в mave...")
     try:
         await upload_to_mave(data["mp3"], data["title"], data["description"])
         try: Path(data["mp3"]).unlink()
         except: pass
-        
-        # Экранируем только сгенерированный заголовок, чтобы не сломать наши HTML теги <b> и <a>
+
         safe_title = html.escape(data["title"])
         post_text = POST_TEMPLATE.format(title=safe_title)
         pending[uid]["post_text"] = post_text
-        
+
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="publish_now")],
             [InlineKeyboardButton("🕒 Запланировать (Бразилия)", callback_data="schedule")],
             [InlineKeyboardButton("✏️ Изменить текст", callback_data="edit_post")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_post")]
         ])
-        
+
         await q.message.delete()
         if os.path.exists(COVER_FILE):
             with open(COVER_FILE, "rb") as img:
@@ -458,7 +484,7 @@ async def btn_publish_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     uid = q.from_user.id
     data = pending.get(uid)
-    
+
     if not CHANNEL_ID:
         return await q.message.reply_text("❌ Ошибка: Не настроен CHANNEL_ID в сервере!")
 
@@ -468,7 +494,7 @@ async def btn_publish_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_photo(chat_id=CHANNEL_ID, photo=img, caption=data['post_text'], parse_mode=ParseMode.HTML)
         else:
             await ctx.bot.send_message(chat_id=CHANNEL_ID, text=data['post_text'], parse_mode=ParseMode.HTML)
-        
+
         await q.edit_message_reply_markup(reply_markup=None)
         await q.message.reply_text("🚀 Пост успешно улетел в канал!")
         pending.pop(uid, None)
@@ -499,7 +525,7 @@ async def save_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✏️ Изменить текст", callback_data="edit_post")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel_post")]
     ])
-    
+
     if os.path.exists(COVER_FILE):
         with open(COVER_FILE, "rb") as img:
             await update.message.reply_photo(photo=img, caption=f"Обновленный черновик:\n\n{pending[uid]['post_text']}", parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -543,25 +569,25 @@ async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Запуск ─────────────────────────────────────
 def main():
-    print("🚀 [V13.1] Бот запускается...")
+    print("🚀 [V13.2] Бот запускается...")
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    
+
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo, block=False))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text, block=False), group=1)
-    
+
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(btn_edit, pattern="^edit$"),
             CallbackQueryHandler(btn_edit_post, pattern="^edit_post$")
         ],
         states={
-            EDIT_TITLE: [MH(filters.TEXT | filters.COMMAND, edit_title)], 
+            EDIT_TITLE: [MH(filters.TEXT | filters.COMMAND, edit_title)],
             EDIT_DESC: [MH(filters.TEXT | filters.COMMAND, edit_desc)],
             EDIT_POST: [MH(filters.TEXT | filters.COMMAND, save_post)],
         },
         fallbacks=[CallbackQueryHandler(btn_cancel, pattern="^cancel$")], per_chat=True
     )
-    
+
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice, block=False))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
