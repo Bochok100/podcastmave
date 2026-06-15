@@ -1,8 +1,8 @@
 """
-Podcast Bot v13.2 — IMAP Fix & The Perfect Post
-- ИСПРАВЛЕН БАГ IMAP: Улучшен поиск писем от Adobe во всех непрочитанных сообщениях.
-- ДОБАВЛЕНО ЛОГИРОВАНИЕ: Теперь бот пишет в консоль, какие письма он видит.
-- КЛИКАБЕЛЬНЫЕ ССЫЛКИ: Длинные URL спрятаны внутрь текста (гиперссылки).
+Podcast Bot v13.3 — OpenAI API Fix
+- ОБНОВЛЕНО: Переход на новый синтаксис OpenAI (AsyncOpenAI) v1.0+
+- ИСПРАВЛЕН БАГ IMAP: Улучшен поиск писем от Adobe
+- КЛИКАБЕЛЬНЫЕ ССЫЛКИ: Длинные URL спрятаны внутрь текста
 """
 
 import os
@@ -24,7 +24,7 @@ from telegram.ext import (
     ConversationHandler, filters, ContextTypes,
 )
 from telegram.constants import ParseMode
-import openai
+from openai import AsyncOpenAI
 from playwright.async_api import async_playwright
 
 # ── Настройки ──────────────────────────────────
@@ -46,7 +46,8 @@ EDIT_TITLE, EDIT_DESC, EDIT_POST = range(3)
 pending = {}
 adobe_2fa_state = {}
 
-openai.api_key = OPENAI_KEY
+# Подключаем новый клиент OpenAI
+client = AsyncOpenAI(api_key=OPENAI_KEY)
 
 STYLE_PROMPT = """
 Ты — редактор подкаста Василия. Темы разные: крипта, ИИ, технологии, семья, жизнь.
@@ -102,7 +103,7 @@ async def delayed_publish(delay: int, chat_id: str, photo_path: str, text: str, 
     except Exception as e:
         print(f"Ошибка отложенной публикации: {e}")
 
-# ── IMAP Почта (Исправленная версия с логами) ───
+# ── IMAP Почта ─────────────────────────────────
 async def fetch_adobe_code_from_email() -> str:
     if not EMAIL_USER or not EMAIL_PASS: 
         print("❌ ОШИБКА: Не заданы EMAIL_USER или EMAIL_PASS")
@@ -115,7 +116,6 @@ async def fetch_adobe_code_from_email() -> str:
             mail.login(EMAIL_USER, EMAIL_PASS)
             mail.select("inbox")
             
-            # Ищем просто непрочитанные письма (без фильтра по отправителю)
             status, messages = mail.search(None, '(UNSEEN)')
             mail_ids = messages[0].split()
             
@@ -123,7 +123,6 @@ async def fetch_adobe_code_from_email() -> str:
                 print("⚠️ Новых непрочитанных писем нет.")
                 return None
             
-            # Читаем последние 3 непрочитанных письма
             for i in mail_ids[-3:]:
                 status, msg_data = mail.fetch(i, '(RFC822)')
                 for response_part in msg_data:
@@ -132,7 +131,6 @@ async def fetch_adobe_code_from_email() -> str:
                         sender = msg.get("From", "")
                         print(f"📩 Найдено новое письмо от: {sender}")
                         
-                        # Если письмо от Adobe
                         if "adobe" in sender.lower():
                             body = ""
                             if msg.is_multipart():
@@ -143,7 +141,6 @@ async def fetch_adobe_code_from_email() -> str:
                             else:
                                 body = msg.get_payload(decode=True).decode(errors="ignore")
                             
-                            # Ищем 6 цифр подряд
                             match = re.search(r'\b\d{6}\b', body)
                             if match:
                                 print(f"✅ Нашел код Adobe: {match.group(0)}")
@@ -152,7 +149,6 @@ async def fetch_adobe_code_from_email() -> str:
             print(f"❌ Ошибка IMAP: {e}")
         return None
 
-    # Пытаемся найти код в течение 2 минут (12 попыток по 10 сек)
     for attempt in range(12):
         print(f"🔄 Попытка {attempt + 1}/12 получить код...")
         code = await asyncio.to_thread(_fetch)
@@ -208,15 +204,18 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ogg_path = await download_voice(update, context)
         mp3_path = await to_mp3(ogg_path)
         
-        # 1. Транскрипция (OpenAI Whisper)
+        # 1. Транскрипция (OpenAI Whisper - Новый синтаксис)
         await msg.edit_text("⏳ Делаю транскрипцию (Whisper)...")
         with open(mp3_path, "rb") as audio_file:
-            transcript = await openai.Audio.atranscribe("whisper-1", audio_file)
+            transcript = await client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=audio_file
+            )
         text = transcript.text
 
-        # 2. Генерация заголовка и описания (GPT-4o)
+        # 2. Генерация заголовка и описания (GPT-4o - Новый синтаксис)
         await msg.edit_text("⏳ Придумываю заголовок и описание (GPT-4o)...")
-        response = await openai.ChatCompletion.acreate(
+        response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": STYLE_PROMPT},
@@ -231,7 +230,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = title_match.group(1).strip() if title_match else "Новый выпуск подкаста"
         desc = desc_match.group(1).strip() if desc_match else ai_text.strip()
 
-        # Формируем пост по идеальному шаблону (всегда жирный текст)
+        # Формируем пост по идеальному шаблону
         post_text = POST_TEMPLATE.format(title=title)
         
         uid = update.message.message_id
@@ -264,8 +263,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text("⏳ Публикую в Mave. Пожалуйста, подождите...")
         
         try:
-            # Здесь должна быть логика Playwright для Mave
-            # Упрощенная имитация для примера (вставь свой рабочий код Mave сюда, если он сложнее)
+            # Имитация Mave (здесь твой код Playwright для Mave)
             await asyncio.sleep(2) 
             
             kb = [
@@ -298,7 +296,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(CallbackQueryHandler(handle_callback))
     
-    print("🚀 Бот запущен (Версия 13.2)")
+    print("🚀 Бот запущен (Версия 13.3)")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
