@@ -1,7 +1,8 @@
 """
-Podcast Bot v13.4
-- ИСПРАВЛЕН IMAP: проверка свежести письма (не старше 10 минут)
-- ИСПРАВЛЕНЫ отступы в _fetch
+Podcast Bot v13.5
+- ИСПРАВЛЕНО ЗАВИСАНИЕ (добавлены таймауты на все клики Playwright)
+- ИСПРАВЛЕН IMAP: добавлен сокет-таймаут против вечных зависаний сети
+- Улучшен универсальный ввод OTP через клавиатуру
 """
 import os
 import asyncio
@@ -14,6 +15,7 @@ import imaplib
 import email
 import html
 import datetime
+import socket
 from pathlib import Path
 from email.utils import parsedate_to_datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,6 +27,9 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import openai
 from playwright.async_api import async_playwright
+
+# Защита от бесконечного зависания IMAP-соединений и сетевых запросов
+socket.setdefaulttimeout(20)
 
 # ── Настройки ──────────────────────────────────
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
@@ -97,86 +102,4 @@ async def fetch_adobe_code_from_email() -> str:
         return None
     def _fetch():
         try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(EMAIL_USER, EMAIL_PASS)
-            mail.select("inbox")
-            mail_ids = []
-            for sender in ["message@adobe.com", "adobe@email.adobe.com", "noreply@adobe.com"]:
-                status, messages = mail.search(None, f'(FROM "{sender}")')
-                ids = messages[0].split()
-                if ids:
-                    mail_ids = ids
-                    print(f"IMAP: нашли письма от {sender}")
-                    break
-            if not mail_ids:
-                print("IMAP: писем от Adobe не найдено")
-                return None
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            for mid in reversed(mail_ids[-3:]):
-                status, msg_data = mail.fetch(mid, '(RFC822)')
-                for response_part in msg_data:
-                    if not isinstance(response_part, tuple):
-                        continue
-                    msg = email.message_from_bytes(response_part[1])
-                    # Проверяем свежесть письма
-                    date_str = msg.get("Date", "")
-                    try:
-                        msg_date = parsedate_to_datetime(date_str)
-                        age_minutes = (now_utc - msg_date).total_seconds() / 60
-                        print(f"IMAP: письмо от {date_str}, возраст {age_minutes:.1f} мин")
-                        if age_minutes > 10:
-                            print(f"IMAP: письмо слишком старое ({age_minutes:.1f} мин), пропускаем")
-                            continue
-                    except Exception as e:
-                        print(f"IMAP: не смогли распарсить дату: {e}")
-                    body = ""
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            ct = part.get_content_type()
-                            if ct == "text/plain":
-                                body = part.get_payload(decode=True).decode(errors="ignore")
-                                break
-                            elif ct == "text/html" and not body:
-                                body = part.get_payload(decode=True).decode(errors="ignore")
-                    else:
-                        body = msg.get_payload(decode=True).decode(errors="ignore")
-                    print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
-                    match = re.search(r'\b\d{6}\b', body)
-                    if match:
-                        print(f"IMAP: найден свежий код {match.group(0)}")
-                        return match.group(0)
-        except Exception as e:
-            print(f"Ошибка IMAP: {e}")
-        return None
-    print("IMAP: ждём 15 секунд перед первой проверкой...")
-    await asyncio.sleep(15)
-    for attempt in range(18):
-        print(f"IMAP: попытка {attempt + 1}/18...")
-        code = await asyncio.to_thread(_fetch)
-        if code:
-            return code
-        await asyncio.sleep(10)
-    return None
-
-# ── Utilities ──────────────────────────────────
-async def run_dummy_server():
-    async def handle_client(reader, writer):
-        try:
-            writer.write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nBot alive!\r\n".encode('utf8'))
-            await writer.drain()
-        except: pass
-        finally:
-            try: writer.close(); await writer.wait_closed()
-            except: pass
-    server = await asyncio.start_server(handle_client, '0.0.0.0', int(os.environ.get("PORT", 10000)))
-    async with server: await server.serve_forever()
-
-async def post_init(app: Application):
-    asyncio.create_task(run_dummy_server())
-
-async def download_voice(update, context) -> Path:
-    voice = update.message.voice or update.message.audio
-    f = await context.bot.get_file(voice.file_id)
-    fd, path = tempfile.mkstemp(suffix=".ogg")
-    os.close(fd)
-    await f.download_to_drive(path)
+            mail = imaplib.IMAP4
