@@ -388,14 +388,37 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
                     await enter_adobe_code(page, final_code)
 
-                    for _ in range(30):
+                    for i in range(60):
                         await asyncio.sleep(1)
-                        if "enhance" in page.url:
+                        current_url = page.url
+                        html_page = await page.content()
+                        print(f"2FA после: шаг {i}, url={current_url[:80]}")
+
+                        if "enhance" in current_url and "auth" not in current_url:
                             step = "done"
                             break
                         if await page.locator('input[type="password"]').count() > 0:
                             step = "password"
                             break
+
+                        # Промежуточные окна Adobe после 2FA
+                        for btn_text in ["Continue", "Done", "Skip", "OK", "Got it",
+                                         "Don't ask again", "Stay signed in", "Yes", "No thanks"]:
+                            try:
+                                btn = page.locator('button').filter(
+                                    has_text=re.compile(btn_text, re.IGNORECASE)
+                                ).first
+                                if await btn.count() > 0 and await btn.is_visible():
+                                    print(f"2FA после: нашли кнопку '{btn_text}', кликаем")
+                                    await btn.click()
+                                    await asyncio.sleep(2)
+                                    break
+                            except: pass
+
+                        # Скрин каждые 10 секунд для диагностики
+                        if i % 10 == 0:
+                            await shot(f"/tmp/adobe_step_{i}.png",
+                                       f"📸 После 2FA, шаг {i}, url: {current_url[:60]}")
 
                 if step == "password":
                     for _ in range(15):
