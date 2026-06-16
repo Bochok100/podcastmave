@@ -107,55 +107,67 @@ async def fetch_adobe_code_from_email() -> str:
         return None
 
     def _fetch():
-        try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(EMAIL_USER, EMAIL_PASS)
-            mail.select("inbox")
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(EMAIL_USER, EMAIL_PASS)
+        mail.select("inbox")
 
-            # Ищем от нескольких возможных адресов Adobe
-            mail_ids = []
-            for sender in ["message@adobe.com", "adobe@email.adobe.com", "noreply@adobe.com"]:
-                status, messages = mail.search(None, f'(FROM "{sender}")')
-                ids = messages[0].split()
-                if ids:
-                    mail_ids = ids
-                    print(f"IMAP: нашли письма от {sender}")
-                    break
+        mail_ids = []
+        for sender in ["message@adobe.com", "adobe@email.adobe.com", "noreply@adobe.com"]:
+            status, messages = mail.search(None, f'(FROM "{sender}")')
+            ids = messages[0].split()
+            if ids:
+                mail_ids = ids
+                print(f"IMAP: нашли письма от {sender}")
+                break
 
-            if not mail_ids:
-                print("IMAP: писем от Adobe не найдено")
-                return None
+        if not mail_ids:
+            print("IMAP: писем от Adobe не найдено")
+            return None
 
-            # Проверяем последние 3 письма (на случай если свежее не последнее)
-            for mid in reversed(mail_ids[-3:]):
-                status, msg_data = mail.fetch(mid, '(RFC822)')
-                for response_part in msg_data:
-                    if not isinstance(response_part, tuple):
+        # Проверяем последние 3 письма, только свежие (не старше 10 минут)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        for mid in reversed(mail_ids[-3:]):
+            status, msg_data = mail.fetch(mid, '(RFC822)')
+            for response_part in msg_data:
+                if not isinstance(response_part, tuple):
+                    continue
+                msg = email.message_from_bytes(response_part[1])
+
+                # Проверяем дату письма
+                date_str = msg.get("Date", "")
+                try:
+                    from email.utils import parsedate_to_datetime
+                    msg_date = parsedate_to_datetime(date_str)
+                    age_minutes = (now_utc - msg_date).total_seconds() / 60
+                    print(f"IMAP: письмо от {date_str}, возраст {age_minutes:.1f} мин")
+                    if age_minutes > 10:
+                        print(f"IMAP: письмо слишком старое ({age_minutes:.1f} мин), пропускаем")
                         continue
-                    msg = email.message_from_bytes(response_part[1])
+                except Exception as e:
+                    print(f"IMAP: не смогли распарсить дату: {e}")
 
-                    body = ""
-                    if msg.is_multipart():
-                        # Сначала text/plain, fallback на text/html
-                        for part in msg.walk():
-                            ct = part.get_content_type()
-                            if ct == "text/plain":
-                                body = part.get_payload(decode=True).decode(errors="ignore")
-                                break
-                            elif ct == "text/html" and not body:
-                                body = part.get_payload(decode=True).decode(errors="ignore")
-                    else:
-                        body = msg.get_payload(decode=True).decode(errors="ignore")
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        ct = part.get_content_type()
+                        if ct == "text/plain":
+                            body = part.get_payload(decode=True).decode(errors="ignore")
+                            break
+                        elif ct == "text/html" and not body:
+                            body = part.get_payload(decode=True).decode(errors="ignore")
+                else:
+                    body = msg.get_payload(decode=True).decode(errors="ignore")
 
-                    print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
-                    match = re.search(r'\b\d{6}\b', body)
-                    if match:
-                        print(f"IMAP: найден код {match.group(0)}")
-                        return match.group(0)
+                print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
+                match = re.search(r'\b\d{6}\b', body)
+                if match:
+                    print(f"IMAP: найден свежий код {match.group(0)}")
+                    return match.group(0)
 
-        except Exception as e:
-            print(f"Ошибка IMAP: {e}")
-        return None
+    except Exception as e:
+        print(f"Ошибка IMAP: {e}")
+    return None
 
     # Ждём 15 секунд перед первой попыткой — Adobe медленно шлёт письма
     print("IMAP: ждём 15 секунд перед первой проверкой...")
