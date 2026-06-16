@@ -1,8 +1,7 @@
 """
-Podcast Bot v13.3
-- ИСПРАВЛЕН ввод 2FA кода: посимвольный ввод в 6 отдельных полей Adobe
-- ИСПРАВЛЕН IMAP: задержка 15 сек перед первой попыткой, поиск по нескольким адресам Adobe
-- ИСПРАВЛЕН IMAP: проверка последних 3 писем, а не только последнего
+Podcast Bot v13.4
+- ИСПРАВЛЕН IMAP: проверка свежести письма (не старше 10 минут)
+- ИСПРАВЛЕНЫ отступы в _fetch
 """
 
 import os
@@ -17,6 +16,7 @@ import email
 import html
 import datetime
 from pathlib import Path
+from email.utils import parsedate_to_datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -84,7 +84,6 @@ def get_delay_seconds(target_time_str: str) -> int:
         if not (0 <= h <= 23 and 0 <= m <= 59): return -1
     except:
         return -1
-
     target = now.replace(hour=h, minute=m, second=0, microsecond=0)
     if target < now:
         target += datetime.timedelta(days=1)
@@ -107,73 +106,70 @@ async def fetch_adobe_code_from_email() -> str:
         return None
 
     def _fetch():
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(EMAIL_USER, EMAIL_PASS)
-        mail.select("inbox")
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(EMAIL_USER, EMAIL_PASS)
+            mail.select("inbox")
 
-        mail_ids = []
-        for sender in ["message@adobe.com", "adobe@email.adobe.com", "noreply@adobe.com"]:
-            status, messages = mail.search(None, f'(FROM "{sender}")')
-            ids = messages[0].split()
-            if ids:
-                mail_ids = ids
-                print(f"IMAP: нашли письма от {sender}")
-                break
+            mail_ids = []
+            for sender in ["message@adobe.com", "adobe@email.adobe.com", "noreply@adobe.com"]:
+                status, messages = mail.search(None, f'(FROM "{sender}")')
+                ids = messages[0].split()
+                if ids:
+                    mail_ids = ids
+                    print(f"IMAP: нашли письма от {sender}")
+                    break
 
-        if not mail_ids:
-            print("IMAP: писем от Adobe не найдено")
-            return None
+            if not mail_ids:
+                print("IMAP: писем от Adobe не найдено")
+                return None
 
-        # Проверяем последние 3 письма, только свежие (не старше 10 минут)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        for mid in reversed(mail_ids[-3:]):
-            status, msg_data = mail.fetch(mid, '(RFC822)')
-            for response_part in msg_data:
-                if not isinstance(response_part, tuple):
-                    continue
-                msg = email.message_from_bytes(response_part[1])
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-                # Проверяем дату письма
-                date_str = msg.get("Date", "")
-                try:
-                    from email.utils import parsedate_to_datetime
-                    msg_date = parsedate_to_datetime(date_str)
-                    age_minutes = (now_utc - msg_date).total_seconds() / 60
-                    print(f"IMAP: письмо от {date_str}, возраст {age_minutes:.1f} мин")
-                    if age_minutes > 10:
-                        print(f"IMAP: письмо слишком старое ({age_minutes:.1f} мин), пропускаем")
+            for mid in reversed(mail_ids[-3:]):
+                status, msg_data = mail.fetch(mid, '(RFC822)')
+                for response_part in msg_data:
+                    if not isinstance(response_part, tuple):
                         continue
-                except Exception as e:
-                    print(f"IMAP: не смогли распарсить дату: {e}")
+                    msg = email.message_from_bytes(response_part[1])
 
-                body = ""
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        ct = part.get_content_type()
-                        if ct == "text/plain":
-                            body = part.get_payload(decode=True).decode(errors="ignore")
-                            break
-                        elif ct == "text/html" and not body:
-                            body = part.get_payload(decode=True).decode(errors="ignore")
-                else:
-                    body = msg.get_payload(decode=True).decode(errors="ignore")
+                    # Проверяем свежесть письма
+                    date_str = msg.get("Date", "")
+                    try:
+                        msg_date = parsedate_to_datetime(date_str)
+                        age_minutes = (now_utc - msg_date).total_seconds() / 60
+                        print(f"IMAP: письмо от {date_str}, возраст {age_minutes:.1f} мин")
+                        if age_minutes > 10:
+                            print(f"IMAP: письмо слишком старое ({age_minutes:.1f} мин), пропускаем")
+                            continue
+                    except Exception as e:
+                        print(f"IMAP: не смогли распарсить дату: {e}")
 
-                print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
-                match = re.search(r'\b\d{6}\b', body)
-                if match:
-                    print(f"IMAP: найден свежий код {match.group(0)}")
-                    return match.group(0)
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            ct = part.get_content_type()
+                            if ct == "text/plain":
+                                body = part.get_payload(decode=True).decode(errors="ignore")
+                                break
+                            elif ct == "text/html" and not body:
+                                body = part.get_payload(decode=True).decode(errors="ignore")
+                    else:
+                        body = msg.get_payload(decode=True).decode(errors="ignore")
 
-    except Exception as e:
-        print(f"Ошибка IMAP: {e}")
-    return None
+                    print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
+                    match = re.search(r'\b\d{6}\b', body)
+                    if match:
+                        print(f"IMAP: найден свежий код {match.group(0)}")
+                        return match.group(0)
 
-    # Ждём 15 секунд перед первой попыткой — Adobe медленно шлёт письма
+        except Exception as e:
+            print(f"Ошибка IMAP: {e}")
+        return None
+
     print("IMAP: ждём 15 секунд перед первой проверкой...")
     await asyncio.sleep(15)
 
-    # 18 попыток × 10 секунд = 3 минуты ожидания
     for attempt in range(18):
         print(f"IMAP: попытка {attempt + 1}/18...")
         code = await asyncio.to_thread(_fetch)
@@ -222,13 +218,8 @@ async def to_mp3(src: Path) -> Path:
 
 # ── Ввод 2FA кода в поля Adobe ─────────────────
 async def enter_adobe_code(page, final_code: str):
-    """
-    Adobe использует 6 отдельных input-полей для ввода кода.
-    Вбиваем каждую цифру отдельно.
-    """
     await asyncio.sleep(1)
 
-    # Пробуем найти 6 отдельных полей (maxlength=1 или autocomplete=one-time-code)
     selectors_to_try = [
         'input[maxlength="1"]',
         'input[autocomplete="one-time-code"]',
@@ -246,7 +237,6 @@ async def enter_adobe_code(page, final_code: str):
             break
 
     if code_inputs and await code_inputs.count() >= len(final_code):
-        # Посимвольный ввод в каждое поле
         for i, digit in enumerate(final_code):
             try:
                 field = code_inputs.nth(i)
@@ -258,17 +248,14 @@ async def enter_adobe_code(page, final_code: str):
                 print(f"2FA: ошибка ввода цифры {i}: {e}")
         print(f"2FA: код введён посимвольно ({len(final_code)} цифр)")
     else:
-        # Fallback: пробуем вбить весь код в первое найденное текстовое поле
         print("2FA: отдельные поля не найдены, пробуем fallback в одно поле...")
         try:
-            # Кликаем в первое видимое текстовое поле в форме верификации
             fallback_loc = page.locator('input[type="text"], input[type="number"]').first
             if await fallback_loc.count() > 0:
                 await fallback_loc.click()
                 await fallback_loc.fill(final_code)
                 print("2FA: код введён в одно поле (fallback)")
             else:
-                # Последний вариант — просто печатаем клавишами
                 await page.keyboard.type(final_code, delay=200)
                 print("2FA: код введён через keyboard.type (последний fallback)")
         except Exception as e:
@@ -277,7 +264,6 @@ async def enter_adobe_code(page, final_code: str):
 
     await asyncio.sleep(1)
 
-    # Ищем кнопку подтверждения и нажимаем
     confirm_btn = page.locator('button').filter(
         has_text=re.compile(r"continue|verify|submit|confirm|подтвердить", re.IGNORECASE)
     ).first
@@ -372,7 +358,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         step = "password"
                         break
 
-                    # Определяем поле 2FA: ищем отдельные поля или поле с "code" в контексте
                     has_single_inputs = await page.locator('input[maxlength="1"]').count() >= 2
                     has_otp_input = await page.locator('input[autocomplete="one-time-code"]').count() > 0
                     has_code_context = "code" in html_page.lower() and await page.locator('input[type="text"]').count() > 0
@@ -388,7 +373,7 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                     await asyncio.sleep(1)
 
                 if step == "code_2fa":
-                    await shot("/tmp/adobe_last.png", "📧 [V13.2] Проверяю Gmail на наличие кода...")
+                    await shot("/tmp/adobe_last.png", "📧 [V13.4] Проверяю Gmail на наличие кода...")
                     auto_code = await fetch_adobe_code_from_email()
 
                     if auto_code:
@@ -401,7 +386,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                         await asyncio.wait_for(ev.wait(), timeout=180)
                         final_code = adobe_2fa_state[user_id]["code"].strip()
 
-                    # ── ИСПРАВЛЕННЫЙ ВВОД КОДА ──
                     await enter_adobe_code(page, final_code)
 
                     for _ in range(30):
@@ -447,7 +431,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
 
             await ctx.storage_state(path=STATE_FILE)
 
-            # ЗАГРУЗКА
             file_input = page.locator('input[type="file"]').first
             await file_input.evaluate("node => node.style.display = 'block'")
             await file_input.set_input_files(str(mp3), timeout=15000)
@@ -460,7 +443,6 @@ async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
                 )
             except: pass
 
-            # Ждём Download
             for _ in range(36):
                 await asyncio.sleep(5)
                 if await page.evaluate(
@@ -593,13 +575,13 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if ALLOWED_USER_ID and uid != ALLOWED_USER_ID:
         return
-    msg = await update.message.reply_text("⏳ [V13.3] Начинаю...")
+    msg = await update.message.reply_text("⏳ [V13.4] Начинаю...")
     try:
         ogg = await download_voice(update, ctx)
-        await msg.edit_text("🔄 [V13.3] MP3...")
+        await msg.edit_text("🔄 [V13.4] MP3...")
         mp3 = await to_mp3(ogg)
 
-        await msg.edit_text("🎙️ [V13.3] Adobe Podcast Enhance...")
+        await msg.edit_text("🎙️ [V13.4] Adobe Podcast Enhance...")
         async def notify(path, caption):
             try:
                 if path and os.path.exists(path):
@@ -611,10 +593,10 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         studio = await enhance_audio(mp3, uid, notify)
 
-        await msg.edit_text("📝 [V13.3] Whisper транскрипция...")
+        await msg.edit_text("📝 [V13.4] Whisper транскрипция...")
         text = await transcribe(studio)
 
-        await msg.edit_text("✍️ [V13.3] GPT-4o заголовок...")
+        await msg.edit_text("✍️ [V13.4] GPT-4o заголовок...")
         title, desc = await generate_metadata(text)
 
         pending[uid] = {"mp3": studio, "title": title, "description": desc}
@@ -681,7 +663,7 @@ async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = pending.get(uid)
     if not data:
         return await q.edit_message_text("❌ Сессия устарела.")
-    await q.edit_message_text("⏳ [V13.3] Загружаю в mave...")
+    await q.edit_message_text("⏳ [V13.4] Загружаю в mave...")
     try:
         await upload_to_mave(data["mp3"], data["title"], data["description"])
         try:
@@ -847,7 +829,7 @@ async def btn_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Запуск ─────────────────────────────────────
 def main():
-    print("🚀 [V13.3] Бот запускается...")
+    print("🚀 [V13.4] Бот запускается...")
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo, block=False))
