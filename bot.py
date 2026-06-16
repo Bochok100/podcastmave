@@ -1,8 +1,7 @@
 """
-Podcast Bot v13.5
-- ЗАВЕРШЕНЫ: Диалоги изменения заголовка, описания и постов канала
-- ИСПРАВЛЕНЫ: Конфликты текстовых хендлеров и утечки контекстов Playwright
-- ДОБАВЛЕНО: Принудительное удаление временных файлов ogg/mp3
+Podcast Bot v13.4
+- ИСПРАВЛЕН IMAP: проверка свежести письма (не старше 10 минут)
+- ИСПРАВЛЕНЫ отступы в _fetch
 """
 import os
 import asyncio
@@ -20,7 +19,8 @@ from email.utils import parsedate_to_datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes
+    ConversationHandler, MessageHandler as MH,
+    filters, ContextTypes,
 )
 from telegram.constants import ParseMode
 import openai
@@ -41,9 +41,7 @@ ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 STATE_FILE = "adobe_state.json"
 COVER_FILE = "cover.jpg"
 
-# Состояния для ConversationHandler
 EDIT_TITLE, EDIT_DESC, EDIT_POST = range(3)
-
 pending = {}
 adobe_2fa_state = {}
 
@@ -68,7 +66,7 @@ POST_TEMPLATE = """<b>НОВЫЙ ВЫПУСК УЖЕ НА ПЛОЩАДКАХ:
 🎵 <a href="https://open.spotify.com/show/34qEduYapGFILe2jyH1L0h?si=NQ9Lz4hXT0W-8pgOfY5vvg">SPOTIFY</a>
 🎵 <a href="https://podcasts.apple.com/us/podcast/vasiliy-crypto-%D0%BD%D0%B5-%D0%B1%D1%83%D0%B4%D1%8C-%D1%82%D0%BE%D0%BB%D0%BF%D0%BE%D0%B9/id1865729420">Apple Podcasts</a></b>"""
 
-# ── Планировщик (Бразилия UTC-3) ───────────────
+# ── Planer (Brazil UTC-3) ──────────────────────
 def get_delay_seconds(target_time_str: str) -> int:
     tz_br = datetime.timezone(datetime.timedelta(hours=-3))
     now = datetime.datetime.now(tz_br)
@@ -93,7 +91,7 @@ async def delayed_publish(delay: int, chat_id: str, photo_path: str, text: str, 
     except Exception as e:
         print(f"Ошибка отложенной публикации: {e}")
 
-# ── IMAP Почта ─────────────────────────────────
+# ── IMAP Mail ──────────────────────────────────
 async def fetch_adobe_code_from_email() -> str:
     if not EMAIL_USER or not EMAIL_PASS:
         return None
@@ -113,7 +111,6 @@ async def fetch_adobe_code_from_email() -> str:
             if not mail_ids:
                 print("IMAP: писем от Adobe не найдено")
                 return None
-            
             now_utc = datetime.datetime.now(datetime.timezone.utc)
             for mid in reversed(mail_ids[-3:]):
                 status, msg_data = mail.fetch(mid, '(RFC822)')
@@ -121,6 +118,7 @@ async def fetch_adobe_code_from_email() -> str:
                     if not isinstance(response_part, tuple):
                         continue
                     msg = email.message_from_bytes(response_part[1])
+                    # Проверяем свежесть письма
                     date_str = msg.get("Date", "")
                     try:
                         msg_date = parsedate_to_datetime(date_str)
@@ -131,7 +129,6 @@ async def fetch_adobe_code_from_email() -> str:
                             continue
                     except Exception as e:
                         print(f"IMAP: не смогли распарсить дату: {e}")
-                    
                     body = ""
                     if msg.is_multipart():
                         for part in msg.walk():
@@ -143,7 +140,7 @@ async def fetch_adobe_code_from_email() -> str:
                                 body = part.get_payload(decode=True).decode(errors="ignore")
                     else:
                         body = msg.get_payload(decode=True).decode(errors="ignore")
-                    
+                    print(f"IMAP: тело письма (первые 300 символов): {body[:300]}")
                     match = re.search(r'\b\d{6}\b', body)
                     if match:
                         print(f"IMAP: найден свежий код {match.group(0)}")
@@ -151,17 +148,17 @@ async def fetch_adobe_code_from_email() -> str:
         except Exception as e:
             print(f"Ошибка IMAP: {e}")
         return None
-
     print("IMAP: ждём 15 секунд перед первой проверкой...")
     await asyncio.sleep(15)
     for attempt in range(18):
         print(f"IMAP: попытка {attempt + 1}/18...")
         code = await asyncio.to_thread(_fetch)
-        if code: return code
+        if code:
+            return code
         await asyncio.sleep(10)
     return None
 
-# ── Утилиты ────────────────────────────────────
+# ── Utilities ──────────────────────────────────
 async def run_dummy_server():
     async def handle_client(reader, writer):
         try:
@@ -183,498 +180,3 @@ async def download_voice(update, context) -> Path:
     fd, path = tempfile.mkstemp(suffix=".ogg")
     os.close(fd)
     await f.download_to_drive(path)
-    return Path(path)
-
-async def to_mp3(src: Path) -> Path:
-    dst = src.with_suffix(".mp3")
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", str(src),
-        "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1",
-        str(dst),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    await asyncio.wait_for(proc.communicate(), timeout=120)
-    if not dst.exists() or dst.stat().st_size < 1000:
-        raise RuntimeError("Ошибка ffmpeg")
-    try: src.unlink()
-    except: pass
-    return dst
-
-# ── Ввод 2FA кода в поля Adobe ─────────────────
-async def enter_adobe_code(page, final_code: str):
-    await asyncio.sleep(1)
-    selectors_to_try = [
-        'input[maxlength="1"]',
-        'input[autocomplete="one-time-code"]',
-        'input[type="text"][maxlength="1"]',
-        'input[type="number"][maxlength="1"]',
-    ]
-    code_inputs = None
-    for selector in selectors_to_try:
-        loc = page.locator(selector)
-        count = await loc.count()
-        if count >= 2:
-            code_inputs = loc
-            print(f"2FA: нашли {count} полей по селектору '{selector}'")
-            break
-            
-    if code_inputs and await code_inputs.count() >= len(final_code):
-        for i, digit in enumerate(final_code):
-            try:
-                field = code_inputs.nth(i)
-                await field.click()
-                await asyncio.sleep(0.1)
-                await field.fill(digit)
-                await asyncio.sleep(0.15)
-            except Exception as e:
-                print(f"2FA: ошибка ввода цифры {i}: {e}")
-    else:
-        try:
-            fallback_loc = page.locator('input[type="text"], input[type="number"]').first
-            if await fallback_loc.count() > 0:
-                await fallback_loc.click()
-                await fallback_loc.fill(final_code)
-            else:
-                await page.keyboard.type(final_code, delay=200)
-        except Exception as e:
-            print(f"2FA: ошибка fallback ввода: {e}")
-            await page.keyboard.type(final_code, delay=200)
-    await asyncio.sleep(1)
-    confirm_btn = page.locator('button').filter(
-        has_text=re.compile(r"continue|verify|submit|confirm|подтвердить", re.IGNORECASE)
-    ).first
-    if await confirm_btn.count() > 0 and await confirm_btn.is_visible():
-        await confirm_btn.click()
-    else:
-        await page.keyboard.press("Enter")
-
-# ── Adobe Podcast ──────────────────────────────
-async def enhance_audio(mp3: Path, user_id: int, notify) -> Path:
-    adobe = mp3.parent / (mp3.stem + "_adobe.mp3")
-    out   = mp3.parent / (mp3.stem + "_studio.mp3")
-    async def shot(path, caption):
-        try:
-            await page.screenshot(path=path, timeout=10000)
-            await notify(path, caption)
-        except: pass
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--renderer-process-limit=1", "--disable-blink-features=AutomationControlled"]
-        )
-        context_args = {
-            "viewport": {"width": 1366, "height": 768},
-            "locale": "en-US",
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        if os.path.exists(STATE_FILE):
-            context_args["storage_state"] = STATE_FILE
-            
-        ctx = await browser.new_context(**context_args)
-        page = await ctx.new_page()
-        try:
-            await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
-            await asyncio.sleep(4)
-            is_logged_in = True
-            try:
-                sign_btn = page.locator('a, button, span').filter(
-                    has_text=re.compile(r"^sign in$|^entrar$|^log in$", re.IGNORECASE)
-                ).first
-                if await sign_btn.count() > 0 and await sign_btn.is_visible():
-                    is_logged_in = False
-            except: pass
-            
-            if not is_logged_in:
-                try: await sign_btn.click(force=True)
-                except: pass
-                for _ in range(30):
-                    await asyncio.sleep(1)
-                    if "auth" in page.url or "login" in page.url: break
-                for _ in range(20):
-                    el = page.locator('input[type="email"], input[name="username"]').first
-                    if await el.count() > 0 and await el.is_visible():
-                        await el.focus()
-                        await page.keyboard.press("Control+A")
-                        await page.keyboard.press("Backspace")
-                        await page.keyboard.type(ADOBE_EMAIL.strip(), delay=100)
-                        await page.keyboard.press("Enter")
-                        break
-                    await asyncio.sleep(1)
-                await asyncio.sleep(5)
-                
-                step = "unknown"
-                for _ in range(60):
-                    html_page = await page.content()
-                    if "verify your identity" in html_page.lower():
-                        cb = page.locator('button').filter(has_text=re.compile(r"^Continue$", re.IGNORECASE)).first
-                        if await cb.count() > 0:
-                            await cb.click(force=True)
-                            await asyncio.sleep(4)
-                            continue
-                    if await page.locator('input[type="password"]').count() > 0:
-                        step = "password"
-                        break
-                    has_single_inputs = await page.locator('input[maxlength="1"]').count() >= 2
-                    has_otp_input = await page.locator('input[autocomplete="one-time-code"]').count() > 0
-                    if has_single_inputs or has_otp_input or ("code" in html_page.lower() and await page.locator('input[type="text"]').count() > 0):
-                        step = "code_2fa"
-                        break
-                    if "enhance" in page.url and "auth" not in page.url:
-                        step = "done"
-                        break
-                    await asyncio.sleep(1)
-                    
-                if step == "code_2fa":
-                    await shot("/tmp/adobe_last.png", "📧 Проверяю Gmail на наличие кода...")
-                    auto_code = await fetch_adobe_code_from_email()
-                    if auto_code:
-                        await notify(None, f"✅ Нашел код в почте: {auto_code}")
-                        final_code = auto_code
-                    else:
-                        await notify(None, "⚠️ Письмо не пришло автоматически. Введи код из почты вручную:")
-                        ev = asyncio.Event()
-                        adobe_2fa_state[user_id] = {"event": ev, "code": ""}
-                        await asyncio.wait_for(ev.wait(), timeout=180)
-                        final_code = adobe_2fa_state[user_id]["code"].strip()
-                    
-                    await enter_adobe_code(page, final_code)
-                    for i in range(60):
-                        await asyncio.sleep(1)
-                        if "enhance" in page.url and "auth" not in page.url:
-                            step = "done"
-                            break
-                        if await page.locator('input[type="password"]').count() > 0:
-                            step = "password"
-                            break
-                        for btn_text in ["Continue", "Done", "Skip", "OK"]:
-                            try:
-                                btn = page.locator('button').filter(has_text=re.compile(btn_text, re.IGNORECASE)).first
-                                if await btn.count() > 0 and await btn.is_visible():
-                                    await btn.click()
-                                    break
-                            except: pass
-                if step == "password":
-                    for _ in range(15):
-                        el = page.locator('input[type="password"]').first
-                        if await el.count() > 0:
-                            await el.focus()
-                            await page.keyboard.type(ADOBE_PASSWORD.strip(), delay=100)
-                            await page.keyboard.press("Enter")
-                            break
-                        await asyncio.sleep(1)
-                    await asyncio.sleep(8)
-                for _ in range(15):
-                    if "enhance" in page.url and "auth" not in page.url: break
-                    await asyncio.sleep(1)
-                if "enhance" not in page.url:
-                    await page.goto("https://podcast.adobe.com/enhance", timeout=60000)
-                    await asyncio.sleep(5)
-            
-            for _ in range(25):
-                if await page.locator('input[type="file"]').count() > 0: break
-                await asyncio.sleep(1)
-                
-            await ctx.storage_state(path=STATE_FILE)
-            file_input = page.locator('input[type="file"]').first
-            await file_input.evaluate("node => node.style.display = 'block'")
-            await file_input.set_input_files(str(mp3), timeout=15000)
-            await asyncio.sleep(3)
-            
-            for _ in range(36):
-                await asyncio.sleep(5)
-                if await page.evaluate("() => { const el = [...document.querySelectorAll('button, a')].find(e => /^Download$/i.test(e.innerText?.trim())); return el && el.offsetParent !== null; }"):
-                    break
-                    
-            async with page.expect_download(timeout=120000) as dl_info:
-                await page.evaluate("() => { [...document.querySelectorAll('button, a')].find(e => /^Download$/i.test(e.innerText?.trim())).click(); }")
-            await dl_info.value.save_as(str(adobe))
-            
-            r = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y", "-i", str(adobe), "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                "-codec:a", "libmp3lame", "-b:a", "128k", "-ar", "44100", "-ac", "1", str(out),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            await asyncio.wait_for(r.communicate(), timeout=120)
-            try: mp3.unlink(); adobe.unlink()
-            except: pass
-            return out if out.exists() else adobe
-        finally:
-            await ctx.close()
-            await browser.close()
-
-# ── mave.digital ───────────────────────────────
-async def upload_to_mave(mp3: Path, title: str, desc: str) -> bool:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
-        ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, locale="ru-RU")
-        page = await ctx.new_page()
-        try:
-            await page.goto("https://app.mave.digital/login")
-            await page.fill('input[type="email"]', MAVE_EMAIL)
-            await page.fill('input[type="password"]', MAVE_PASSWORD)
-            await page.click('button[type="submit"]')
-            await asyncio.sleep(4)
-            await page.evaluate("document.querySelectorAll('[id^=\"q-portal\"], .q-overlay').forEach(e=>e.remove());")
-            await page.locator('text=Добавить выпуск').first.click()
-            await asyncio.sleep(3)
-            await page.set_input_files('input[type="file"]', str(mp3))
-            await asyncio.sleep(2)
-            
-            for _ in range(30):
-                await asyncio.sleep(5)
-                if any(x in await page.content() for x in ["Название выпуска", "upload-progress-done"]): break
-            try:
-                title_loc = page.get_by_placeholder(re.compile(r"название", re.IGNORECASE)).first
-                if await title_loc.count() > 0: await title_loc.fill(title)
-            except: pass
-            try:
-                desc_loc = page.locator('.ProseMirror, textarea[name="description"]').first
-                if await desc_loc.count() > 0: await desc_loc.fill(desc)
-            except: pass
-            for txt in ["Опубликовать", "Сохранить"]:
-                try:
-                    btn = page.locator(f'button:has-text("{txt}")').first
-                    if await btn.count() > 0:
-                        await btn.click()
-                        break
-                except: pass
-            await asyncio.sleep(5)
-            return True
-        finally:
-            await browser.close()
-
-# ── Транскрипция и GPT ─────────────────────────
-async def transcribe(mp3: Path) -> str:
-    client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
-    with open(mp3, "rb") as f:
-        res = await client.audio.transcriptions.create(model="whisper-1", file=f, language="ru")
-    return res.text
-
-async def generate_metadata(transcript: str) -> tuple[str, str]:
-    client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
-    resp = await client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": STYLE_PROMPT + transcript}],
-        max_tokens=512,
-        temperature=0.7
-    )
-    title = desc = ""
-    for line in resp.choices[0].message.content.splitlines():
-        c = line.strip().replace("**", "")
-        if c.upper().startswith("ЗАГОЛОВОК:"): title = c[10:].strip()
-        elif c.upper().startswith("ОПИСАНИЕ:"): desc = c[9:].strip()
-    return title, desc
-
-# ── Telegram handlers ──────────────────────────
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and update.effective_user.id != ALLOWED_USER_ID: return
-    file = await update.message.photo[-1].get_file()
-    await file.download_to_drive(COVER_FILE)
-    await update.message.reply_text("✅ Обложка сохранена!")
-
-async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if ALLOWED_USER_ID and uid != ALLOWED_USER_ID: return
-    msg = await update.message.reply_text("⏳ Начинаю обработку...")
-    try:
-        ogg = await download_voice(update, ctx)
-        await msg.edit_text("🔄 Конвертация в MP3...")
-        mp3 = await to_mp3(ogg)
-        await msg.edit_text("🎙️ Улучшение звука через Adobe Podcast...")
-        
-        async def notify(path, caption):
-            try:
-                if path and os.path.exists(path):
-                    with open(path, "rb") as f: await update.message.reply_photo(photo=f, caption=caption)
-                elif caption: await update.message.reply_text(caption)
-            except: pass
-            
-        studio = await enhance_audio(mp3, uid, notify)
-        await msg.edit_text("📝 Транскрипция через Whisper...")
-        text = await transcribe(studio)
-        await msg.edit_text("✍️ Генерация описания через GPT-4o...")
-        title, desc = await generate_metadata(text)
-        
-        pending[uid] = {"mp3": studio, "title": title, "description": desc}
-        await msg.delete()
-        
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Опубликовать в mave", callback_data="publish"),
-             InlineKeyboardButton("✏️ Изменить текст", callback_data="edit")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
-        ])
-        with open(studio, "rb") as f:
-            await update.message.reply_document(document=f, filename=f"{title[:40]}.mp3")
-        await update.message.reply_text(
-            f"🎙 *Выпуск готов*\n\n*Заголовок:*\n{title}\n\n*Описание:*\n{desc}",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка обработки: {str(e)}")
-    gc.collect()
-
-async def handle_global_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    text = update.message.text.strip()
-    if uid in adobe_2fa_state and adobe_2fa_state[uid]["event"] and not adobe_2fa_state[uid]["event"].is_set():
-        adobe_2fa_state[uid]["code"] = text
-        adobe_2fa_state[uid]["event"].set()
-        await update.message.reply_text("✅ Код принят! Передаю в Adobe...")
-        return
-        
-    if uid in pending and pending[uid].get("wait_time"):
-        delay = get_delay_seconds(text)
-        if delay < 0:
-            await update.message.reply_text("❌ Неверный формат времени. Напиши ЧЧ:ММ:")
-            return
-        pending[uid]["wait_time"] = False
-        data = pending[uid]
-        asyncio.create_task(delayed_publish(delay, CHANNEL_ID, COVER_FILE, data["post_text"], ctx.bot))
-        target_time = (datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))) + datetime.timedelta(seconds=delay)).strftime("%H:%M")
-        await update.message.reply_text(f"✅ Пост успешно запланирован на {target_time} (Бразилия).")
-        pending.pop(uid, None)
-
-# ── Callback Блок Управления ───────────────────
-async def btn_publish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id
-    data = pending.get(uid)
-    if not data: return await q.edit_message_text("❌ Сессия устарела.")
-    await q.edit_message_text("⏳ Загружаю выпуск на Mave...")
-    try:
-        await upload_to_mave(data["mp3"], data["title"], data["description"])
-        try: Path(data["mp3"]).unlink()
-        except: pass
-        
-        post_text = POST_TEMPLATE.format(title=html.escape(data["title"]))
-        pending[uid]["post_text"] = post_text
-        
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="publish_now")],
-            [InlineKeyboardButton("🕒 Запланировать", callback_data="schedule")],
-            [InlineKeyboardButton("✏️ Изменить текст поста", callback_data="edit_post")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_post")]
-        ])
-        await q.message.delete()
-        if os.path.exists(COVER_FILE):
-            with open(COVER_FILE, "rb") as img:
-                await q.message.reply_photo(photo=img, caption=f"✅ **Успешно загружено в Mave!**\n\nЧерновик поста:\n\n{post_text}", parse_mode=ParseMode.HTML, reply_markup=kb)
-        else:
-            await q.message.reply_text(f"✅ **Успешно загружено в Mave!**\n\nЧерновик поста:\n\n{post_text}", parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as e:
-        await q.message.reply_text(f"❌ Ошибка Mave: {e}")
-
-async def btn_publish_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = pending.get(q.from_user.id)
-    if not CHANNEL_ID: return await q.message.reply_text("❌ CHANNEL_ID не настроен!")
-    try:
-        if os.path.exists(COVER_FILE):
-            with open(COVER_FILE, "rb") as img:
-                await ctx.bot.send_photo(chat_id=CHANNEL_ID, photo=img, caption=data['post_text'], parse_mode=ParseMode.HTML)
-        else:
-            await ctx.bot.send_message(chat_id=CHANNEL_ID, text=data['post_text'], parse_mode=ParseMode.HTML)
-        await q.message.reply_text("🚀 Пост опубликован в канале!")
-        pending.pop(q.from_user.id, None)
-    except Exception as e:
-        await q.message.reply_text(f"❌ Ошибка отправки: {e}")
-
-async def btn_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    pending[q.from_user.id]["wait_time"] = True
-    await q.message.reply_text("🕒 Укажи время публикации по Бразилии (ЧЧ:ММ, например 15:40):")
-
-# ── Управление Стейтами (Редактирование) ───────
-async def btn_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    uid = q.from_user.id
-    if uid not in pending: return ConversationHandler.END
-    await q.message.reply_text(f"✏️ **Текущий заголовок:**\n{pending[uid]['title']}\n\nВведите новый заголовок или отправьте `/skip` для пропуска:")
-    return EDIT_TITLE
-
-async def save_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if update.message.text != "/skip":
-        pending[uid]["title"] = update.message.text.strip()
-    await update.message.reply_text(f"✏️ **Текущее описание:**\n{pending[uid]['description']}\n\nВведите новое описание или отправьте `/skip`:")
-    return EDIT_DESC
-
-async def save_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if update.message.text != "/skip":
-        pending[uid]["description"] = update.message.text.strip()
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Опубликовать в mave", callback_data="publish")],
-        [InlineKeyboardButton("✏️ Изменить текст", callback_data="edit")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
-    ])
-    await update.message.reply_text(
-        f"🎙 **Данные обновлены!**\n\n*Заголовок:*\n{pending[uid]['title']}\n\n*Описание:*\n{pending[uid]['description']}",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=kb
-    )
-    return ConversationHandler.END
-
-async def btn_edit_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    await q.message.reply_text("✏️ Отправьте совершенно новый текст для поста в канал (или `/skip`):")
-    return EDIT_POST
-
-async def save_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if update.message.text != "/skip":
-        pending[uid]["post_text"] = update.message.text.strip()
-        
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Опубликовать сейчас", callback_data="publish_now")],
-        [InlineKeyboardButton("🕒 Запланировать", callback_data="schedule")],
-        [InlineKeyboardButton("✏️ Изменить текст", callback_data="edit_post")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_post")]
-    ])
-    await update.message.reply_text(f"📝 **Черновик поста обновлен:**\n\n{pending[uid]['post_text']}", parse_mode=ParseMode.HTML, reply_markup=kb)
-    return ConversationHandler.END
-
-async def cancel_conv(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛑 Редактирование отменено.")
-    return ConversationHandler.END
-
-async def btn_cancel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    pending.pop(q.from_user.id, None)
-    await q.edit_message_reply_markup(reply_markup=None)
-    await q.message.reply_text("✅ Сессия закрыта. Выпуск сохранен только в медиатеке Mave.")
-
-# ── Мейнлуп ────────────────────────────────────
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    
-    # Стейт-машина диалогов редактирования
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(btn_edit, pattern="^edit$"),
-            CallbackQueryHandler(btn_edit_post, pattern="^edit_post$")
-        ],
-        states={
-            EDIT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_title)],
-            EDIT_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_desc)],
-            EDIT_POST: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_post)]
-        },
-        fallbacks=[MessageHandler(filters.COMMAND, cancel_conv)],
-        per_message=False
-    )
-    
-    app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(CallbackQueryHandler(btn_publish, pattern="^publish$"))
-    app.add_handler(CallbackQueryHandler(btn_publish_now, pattern="^publish_now$"))
-    app.add_handler(CallbackQueryHandler(btn_schedule, pattern="^schedule$"))
-    app.add_handler(CallbackQueryHandler(btn_cancel_post, pattern="^cancel(_post)?$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_global_text))
-    
-    print("🚀 Робот Podcast Bot v13.5 успешно запущен...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
