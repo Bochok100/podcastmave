@@ -1,0 +1,6 @@
+adobe_data/
+adobe_state.json
+cover.jpg
+__pycache__/
+*.pyc
+.venv/

@@ -30,6 +30,10 @@ jobs:
           password: ${{ secrets.SERVER_PASS }}
           script: |
             cd /root/podcast_bot
+            mkdir -p /root/podcast_bot/adobe_data
             docker build -t podcast_bot .
             docker rm -f my_adobe_bot || true
-            docker run -d --name my_adobe_bot --restart unless-stopped --env-file .env podcast_bot
+            docker run -d --name my_adobe_bot --restart unless-stopped \
+              --env-file .env \
+              -v /root/podcast_bot/adobe_data:/app/adobe_data \
+              podcast_bot
