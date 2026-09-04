@@ -1,0 +1,8 @@
+.git
+adobe_data
+adobe_state.json
+cover.jpg
+__pycache__
+*.pyc
+.venv
+test_login_helpers.py
